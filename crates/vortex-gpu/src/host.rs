@@ -704,6 +704,130 @@ mod tests {
         }
     }
 
+    /// Run both comparison kernels on a software D3D12 device, not
+    /// merely through the compiler. Synthetic buffers exercise skewed
+    /// pages, unchanged pages, repeated comparisons and hash updates.
+    #[test]
+    fn card_compare_dispatch_matches_expected_flags_on_warp() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        const SIZE: usize = 2 * 65536;
+        const PIECES: u32 = 3;
+        const RESULT_BYTES: u64 = 5 * PIECES as u64 * 4;
+        // SAFETY: test-owned D3D12 resources; all root addresses and
+        // mapped ranges fit their allocations. No CPU access while a
+        // submitted command list uses these resources.
+        unsafe {
+            let adapter = warp_adapter().expect("software WARP adapter");
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+            let device = device.unwrap();
+            let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            }).unwrap();
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let buffer = |size, kind, state, flags| -> ID3D12Resource {
+                let mut resource = None;
+                device.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: size,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        Flags: flags,
+                        ..Default::default()
+                    },
+                    state, None, &mut resource,
+                ).unwrap();
+                resource.unwrap()
+            };
+            let input = |changed: bool| {
+                let resource = buffer(SIZE as u64, D3D12_HEAP_TYPE_UPLOAD,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE);
+                let mut data = std::ptr::null_mut();
+                resource.Map(0, None, Some(&mut data)).unwrap();
+                let bytes = std::slice::from_raw_parts_mut(data.cast::<u8>(), SIZE);
+                bytes.fill(0);
+                if changed {
+                    bytes[7] = 0x5a;
+                    bytes[SIZE - 1] = 0xc3;
+                }
+                resource.Unmap(0, None);
+                resource
+            };
+            let (a, b) = (input(false), input(true));
+            for (i, (source, parallel)) in [(CARD_COMPARE, false), (CARD_COMPARE_PARALLEL, true)].into_iter().enumerate() {
+                let mut code: Option<ID3DBlob> = None;
+                D3DCompile(source.as_ptr().cast(), source.len(),
+                    windows::core::s!("synthetic compare dispatch"), None, None,
+                    windows::core::s!("main"), windows::core::s!("cs_5_1"),
+                    0, 0, &mut code, None).unwrap();
+                let code = code.unwrap();
+                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).unwrap();
+                let pso: ID3D12PipelineState = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                }).unwrap();
+                let hashes = buffer(u64::from(PIECES) * if parallel { 1024 } else { 16 },
+                    D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+                let flags = buffer(RESULT_BYTES, D3D12_HEAP_TYPE_DEFAULT,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+                let readback = buffer(RESULT_BYTES, D3D12_HEAP_TYPE_READBACK,
+                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+                let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &allocator, None).unwrap();
+                list.SetComputeRootSignature(&root);
+                list.SetPipelineState(&pso);
+                list.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
+                list.SetComputeRootUnorderedAccessView(3, flags.GetGPUVirtualAddress());
+                for (pass, (input, mode)) in [(&a, 0u32), (&a, 1), (&b, 1), (&b, 2), (&b, 1), (&a, 1)].into_iter().enumerate() {
+                    let constants = [0, 16, SIZE as u32, PIECES, pass.saturating_sub(1) as u32 * PIECES * 4, mode];
+                    list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                    list.SetComputeRootShaderResourceView(1, input.GetGPUVirtualAddress());
+                    list.Dispatch(card_compare_groups(PIECES, parallel), 1, 1);
+                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                                pResource: std::mem::ManuallyDrop::new(None),
+                            }),
+                        },
+                    }]);
+                }
+                list.ResourceBarrier(&[transition(&flags, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.CopyBufferRegion(&readback, 0, &flags, 0, RESULT_BYTES);
+                list.Close().unwrap();
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                let value = i as u64 + 1;
+                queue.Signal(&fence, value).unwrap();
+                let event = CreateEventW(None, false, false, None).unwrap();
+                fence.SetEventOnCompletion(value, event).unwrap();
+                let waited = WaitForSingleObject(event, 30_000);
+                CloseHandle(event).unwrap();
+                assert_eq!(waited, WAIT_OBJECT_0, "WARP compare timed out");
+                let mut data = std::ptr::null_mut();
+                readback.Map(0, None, Some(&mut data)).unwrap();
+                let actual = std::slice::from_raw_parts(data.cast::<u32>(), RESULT_BYTES as usize / 4).to_vec();
+                readback.Unmap(0, None);
+                assert_eq!(actual, [0,0,0, 1,0,1, 1,0,1, 0,0,0, 1,0,1], "parallel={parallel}");
+            }
+        }
+    }
+
     #[test]
     fn coalesced_fetches_preserve_every_source_and_destination_byte() {
         let pieces = [(0, 0, 16, 0), (0, 16, 32, 16), (1, 32, 48, 32),
