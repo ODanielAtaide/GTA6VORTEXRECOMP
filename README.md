@@ -64,15 +64,4 @@ The runtime, loader, graphics backend and shader compiler are written in **Rust*
 
 **Vortex maintainer and project lead:** [@ODanielAtaide](https://github.com/ODanielAtaide). The project-specific work and inherited upstream contributions are documented separately in [AUTHORS.md](AUTHORS.md). GitHub's automatic contributor graph also includes authors of the imported Git history; their appearance does not establish direct participation in Vortex.
 
-### Multi-model AI-assisted development
-
-According to the maintainer, the development workflow has involved multiple AI systems, including:
-
-- **OpenAI ChatGPT (GPT family)** — code assistance, technical analysis, tests, documentation and profiling.
-- **Anthropic Claude (Claude family)** — AI-assisted development, including the separately credited upstream Claude Code work.
-- **Meta Llama (locally hosted LLMs)** — part of the maintainer's reported multi-model workflow.
-- **Other local large language models** — additional AI assistance; specific models and versions have not been documented.
-
-The maintainer directs the project, reviews changes and runs the Windows builds and hardware validation. The exact scope of assistance from each model has not been independently audited. AI tools are not human contributors or official project partners. All original authorship and licensing remain intact. See [AUTHORS.md](AUTHORS.md) and [upstream credits](docs/UPSTREAM_CREDITS.md).
-
-This independent research project is not affiliated with or endorsed by Microsoft, Xbox, Rockstar Games, Take-Two Interactive or OpenAI. Do not upload unauthorized proprietary material or distribute commercial game files. See [LICENSE](LICENSE) and the separate [BCPack provenance](docs/BCPACK_PROVENANCE.md).
+This independent research project is not affiliated with or endorsed by Microsoft, Xbox, Rockstar Games or Take-Two Interactive. Do not upload unauthorized proprietary material or distribute commercial game files. See [LICENSE](LICENSE) and the separate [BCPack provenance](docs/BCPACK_PROVENANCE.md).
