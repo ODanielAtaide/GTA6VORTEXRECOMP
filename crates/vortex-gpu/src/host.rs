@@ -2018,8 +2018,9 @@ static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atom
 /// `completed`: everything ahead of the first flight it has not run. A
 /// later flight never lands before an earlier one, and what follows a
 /// flight (its bottom-of-pipe writes, signals) never before the flight.
-fn landable(line: &[Option<u64>], completed: u64) -> usize {
-    line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len())
+fn landable(mut fences: impl ExactSizeIterator<Item = Option<u64>>, completed: u64) -> usize {
+    let len = fences.len();
+    fences.position(|f| f.is_some_and(|f| f > completed)).unwrap_or(len)
 }
 
 /// For one plan of copies in the card's memory, with [`relay`]: `flags`
@@ -2045,21 +2046,38 @@ mod relay_tests {
     fn flights_land_in_the_order_they_were_sent() {
         // Flight (fence 5), its write, a signal, flight (fence 6), its write.
         let line = [Some(5), None, None, Some(6), None];
-        assert_eq!(landable(&line, 4), 0);
-        assert_eq!(landable(&line, 5), 3);
-        assert_eq!(landable(&line, 6), 5);
-        assert_eq!(landable(&line, u64::MAX), 5);
+        assert_eq!(landable(line.iter().copied(), 4), 0);
+        assert_eq!(landable(line.iter().copied(), 5), 3);
+        assert_eq!(landable(line.iter().copied(), 6), 5);
+        assert_eq!(landable(line.iter().copied(), u64::MAX), 5);
         // Signals with no flight ahead land at once; behind one they wait.
-        assert_eq!(landable(&[None, None], 0), 2);
+        assert_eq!(landable([None, None].into_iter(), 0), 2);
         assert_eq!(landable(&[None, Some(9), None], 8), 1);
-        assert_eq!(landable(&[], 3), 0);
+        assert_eq!(landable(std::iter::empty(), 3), 0);
         // After the first three landed, the rest when its turn comes.
-        assert_eq!(landable(&line[3..], 5), 0);
-        assert_eq!(landable(&line[3..], 6), 2);
+        assert_eq!(landable(line[3..].iter().copied(), 5), 0);
+        assert_eq!(landable(line[3..].iter().copied(), 6), 2);
     }
 
     /// A piece flagged under one range of a plan is fetched under every
     /// range that holds a part of it; pieces of other copies are not.
+    #[test]
+    fn hazard_summary_preserves_first_blocking_operation() {
+        use super::{ReadHazard, WHY_READ, WHY_RUN, blocked_by};
+        let hazards = [
+            ReadHazard::Copy(10, 30, 5),
+            ReadHazard::Fill(50, 4),
+            ReadHazard::Texture(90, 8),
+            ReadHazard::Unknown,
+        ];
+        assert_eq!(blocked_by(&[], &hazards, false), None);
+        for range in [(12, 14), (32, 33), (51, 52), (95, 99)] {
+            assert_eq!(blocked_by(&[range], &hazards, false), Some(WHY_READ));
+        }
+        assert_eq!(blocked_by(&[(35, 50)], &hazards, false), Some(WHY_RUN));
+        assert_eq!(blocked_by(&[(35, 50)], &hazards[..3], false), None);
+    }
+
     #[test]
     fn a_piece_flagged_under_one_range_is_fetched_under_all() {
         let (a, b) = (0x1000usize, 0x2000usize);
@@ -2216,14 +2234,18 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
     ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for &(from, to) in ranges.iter() {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    // Compact the sorted ranges in the existing allocation.
+    let mut count = 0;
+    for i in 0..ranges.len() {
+        let (from, to) = ranges[i];
+        if count > 0 && from <= ranges[count - 1].1 {
+            ranges[count - 1].1 = ranges[count - 1].1.max(to);
+        } else {
+            ranges[count] = (from, to);
+            count += 1;
         }
     }
-    *ranges = out;
+    ranges.truncate(count);
 }
 
 /// Whether anything is in the air.
@@ -2241,7 +2263,7 @@ fn flying() -> bool {
 /// CPU (the title's buffer copies, fills of upload memory, textures) and
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
-fn late_blocked(runs: &[&HostList]) -> Option<usize> {
+fn late_blocked(runs: &[&HostList]) -> Option<(usize, Vec<ReadHazard>)> {
     let written = {
         let line = line();
         if line.written.is_empty() {
@@ -2249,48 +2271,61 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         }
         line.written.clone()
     };
-    blocked_by(&written, runs, true)
+    let hazards = read_hazards(runs);
+    blocked_by(&written, &hazards, true).map(|why| (why, hazards))
 }
 
-/// [`late_blocked`] against `written`, the title memory flights' shaders
-/// may write (in order, joined); `count` whether the kind of read is
-/// counted for the frame line.
-fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
-    if written.is_empty() {
-        return None;
-    }
+/// Only the operations relevant to CPU-visible memory dependencies.
+/// Build this summary outside the line lock, once per blocked submission.
+enum ReadHazard {
+    Copy(usize, usize, usize),
+    Fill(usize, usize),
+    Texture(usize, usize),
+    Unknown,
+}
+
+fn read_hazards(runs: &[&HostList]) -> Vec<ReadHazard> {
+    let mut hazards = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
             match step {
-                &Step::Copy(dst, src, len) => {
-                    if touches(written, src, src + len) || touches(written, dst, dst + len) {
-                        if count {
-                            LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
-                        }
-                        return Some(WHY_READ);
-                    }
-                }
-                &Step::Fill(_, src, len) => {
-                    if touches(written, src, src + len) {
-                        if count {
-                            LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
-                        }
-                        return Some(WHY_READ);
-                    }
-                }
+                &Step::Copy(dst, src, len) => hazards.push(ReadHazard::Copy(dst, src, len)),
+                &Step::Fill(_, src, len) => hazards.push(ReadHazard::Fill(src, len)),
                 Step::Texture(staging) => {
                     let (at, len) = staging.memory();
-                    if touches(written, at, at + len) {
-                        if count {
-                            LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
-                        }
-                        return Some(WHY_READ);
-                    }
+                    hazards.push(ReadHazard::Texture(at, len));
                 }
-                Step::Run(_) => return Some(WHY_RUN),
+                Step::Run(_) => {
+                    hazards.push(ReadHazard::Unknown);
+                    // No later step can precede this conservative barrier.
+                    return hazards;
+                }
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
             }
         }
+    }
+    hazards
+}
+
+/// Check the same ordered hazards on each wake without reacquiring
+/// command-list locks or walking unrelated GPU recording commands.
+fn blocked_by(written: &[(usize, usize)], hazards: &[ReadHazard], count: bool) -> Option<usize> {
+    if written.is_empty() {
+        return None;
+    }
+    let hit = |at: usize, len: usize| touches(written, at, at.saturating_add(len));
+    for hazard in hazards {
+        let stat = match *hazard {
+            ReadHazard::Copy(dst, src, len) if hit(src, len) || hit(dst, len) => 15,
+            ReadHazard::Fill(src, len) if hit(src, len) => 16,
+            ReadHazard::Texture(at, len) if hit(at, len) => 17,
+            ReadHazard::Unknown => return Some(WHY_RUN),
+            _ => continue,
+        };
+        if count {
+            LATE_STATS[stat].fetch_add(1, Ordering::Relaxed);
+        }
+        return Some(WHY_READ);
     }
     None
 }
@@ -2565,20 +2600,16 @@ fn relay_worker() {
                     line = RELAY_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
                     continue;
                 }
-                let fences: Vec<Option<u64>> = line
-                    .line
-                    .iter()
-                    .map(|l| match l {
-                        Late::Run(flight) => Some(flight.fence),
-                        _ => None,
-                    })
-                    .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
-                let n = landable(&fences, completed);
+                let n = landable(line.line.iter().map(|item| match item {
+                    Late::Run(flight) => Some(flight.fence),
+                    _ => None,
+                }), completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
-                    break Err(fences[0].unwrap_or(0));
+                    let Late::Run(flight) = &line.line[0] else { unreachable!() };
+                    break Err(flight.fence);
                 }
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
@@ -4109,11 +4140,11 @@ impl Host {
         // what they write.
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
-        } else if let Some(why) = late_blocked(runs) {
+        } else if let Some((why, hazards)) = late_blocked(runs) {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                relay_wait(why, |line| blocked_by(&line.written, &hazards, false).is_none());
             } else {
                 self.settle(&mut submitted, why);
             }
