@@ -176,11 +176,13 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
-        if p.made.get().is_none() && p.queue_state.load(Ordering::Relaxed) == NOT_QUEUED {
-            super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-            start(p, EARLY);
-        }
+    if !p.shaders.is_empty()
+        && p.made.get().is_none()
+        && p.queue_state.load(Ordering::Relaxed) == NOT_QUEUED
+        && super::library::wanted_early(&p.key)
+    {
+        super::library::EARLY.fetch_add(1, Ordering::Relaxed);
+        start(p, EARLY);
     }
 }
 
@@ -197,6 +199,22 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VORTEX_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// Reserve the remaining budget for a frame, ignoring stale requests
+/// arriving from recording threads belonging to an older frame.
+fn reserve_budget(spent: &mut (u64, Duration), frame: u64, budget: Duration, shared: bool) -> Duration {
+    if spent.0 != frame {
+        if spent.0 != u64::MAX && frame < spent.0 {
+            return Duration::ZERO;
+        }
+        *spent = (frame, Duration::ZERO);
+    }
+    let left = budget.saturating_sub(spent.1);
+    if shared {
+        spent.1 += left;
+    }
+    left
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let budget = wait_budget();
@@ -209,19 +227,7 @@ fn wait(p: &Pending, frame: u64) {
     let shared = shared_budget();
     let left = {
         let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
-        if spent.0 != frame {
-            // A recording thread may arrive late with an older frame.
-            // Never reset the current frame's reservations backwards.
-            if spent.0 != u64::MAX && frame < spent.0 {
-                return;
-            }
-            *spent = (frame, Duration::ZERO);
-        }
-        let left = budget.saturating_sub(spent.1);
-        if shared {
-            spent.1 += left;
-        }
-        left
+        reserve_budget(&mut spent, frame, budget, shared)
     };
     if left.is_zero() {
         return;
@@ -404,6 +410,17 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn stale_frame_cannot_reset_newer_pipeline_wait_reservations() {
+        let budget = Duration::from_millis(500);
+        let mut spent = (u64::MAX, Duration::ZERO);
+        assert_eq!(reserve_budget(&mut spent, 12, budget, true), budget);
+        assert_eq!(reserve_budget(&mut spent, 11, budget, true), Duration::ZERO);
+        assert_eq!(spent, (12, budget));
+        assert_eq!(reserve_budget(&mut spent, 12, budget, true), Duration::ZERO);
+        assert_eq!(reserve_budget(&mut spent, 13, budget, true), budget);
     }
 
     #[test]
