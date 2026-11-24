@@ -704,6 +704,23 @@ mod tests {
     }
 
     #[test]
+    fn coalesced_fetches_preserve_every_source_and_destination_byte() {
+        let pieces = [(0, 0, 16, 0), (0, 16, 32, 16), (1, 32, 48, 32),
+            (1, 48, 64, 64), (1, 72, 80, 80), (1, 80, 88, 88)];
+        let runs = fetch_runs(pieces, |a, b| a == b);
+        let expand = |p: &[(usize, usize, usize, u64)]| {
+            p.iter().flat_map(|&(key, lo, hi, at)| {
+                (lo..hi).map(move |offset| (key, offset, at + (offset - lo) as u64))
+            }).collect::<Vec<_>>()
+        };
+        assert_eq!(expand(&pieces), expand(&runs));
+        assert_eq!(runs.len(), 4);
+        // Dense synthetic 64 MiB readback: 1024 adjacent pieces become one.
+        let dense = (0..1024usize).map(|i| (0, i << 16, (i + 1) << 16, (i as u64) << 16));
+        assert_eq!(fetch_runs(dense, |a, b| a == b), [(0, 0, 64 << 20, 0)]);
+    }
+
+    #[test]
     fn batch_readback_avoids_small_or_single_range_submissions() {
         assert!(!batch_readback_worthwhile(0, 0));
         assert!(!batch_readback_worthwhile(8 << 20, 1));
@@ -2772,6 +2789,31 @@ impl DeclarationIndex {
     }
 }
 
+/// Merge only contiguous copies of the same source buffer, with
+/// contiguous destinations. Original piece metadata and CPU merge order
+/// are unchanged; this affects only the GPU copy command stream.
+fn fetch_runs(
+    pieces: impl IntoIterator<Item = (usize, usize, usize, u64)>,
+    same_buffer: impl Fn(usize, usize) -> bool,
+) -> Vec<(usize, usize, usize, u64)> {
+    let mut runs: Vec<(usize, usize, usize, u64)> = Vec::new();
+    for (key, lo, hi, at) in pieces {
+        if lo >= hi {
+            continue;
+        }
+        if let Some(last) = runs.last_mut()
+            && same_buffer(last.0, key)
+            && last.2 == lo
+            && last.3.checked_add((last.2 - last.1) as u64) == Some(at)
+        {
+            last.2 = hi;
+        } else {
+            runs.push((key, lo, hi, at));
+        }
+    }
+    runs
+}
+
 /// After `list` has run: the texels its read-backs copied into host
 /// buffers of ours go to the title's memory (`HostList::defer_read_back`).
 ///
@@ -3423,8 +3465,12 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in &pieces {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                let runs = fetch_runs(
+                    pieces.iter().enumerate().map(|(i, (_, lo, hi, at))| (i, *lo, *hi, *at)),
+                    |a, b| std::sync::Arc::ptr_eq(&pieces[a].0, &pieces[b].0),
+                );
+                for (i, lo, hi, at) in runs {
+                    list.CopyBufferRegion(&buffer, at, &pieces[i].0.buffer, lo as u64, (hi - lo) as u64);
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -3643,7 +3689,10 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for &(i, lo, hi, at) in &pieces {
+                    let runs = fetch_runs(pieces.iter().copied(), |a, b| {
+                        std::sync::Arc::ptr_eq(&plan.ranges[a].shadow, &plan.ranges[b].shadow)
+                    });
+                    for (i, lo, hi, at) in runs {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
@@ -5192,6 +5241,11 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
+            // A refresh only records a pending buffer update. Everything
+            // else may observe or change memory and is an ordering boundary.
+            if !matches!(step, Step::Texture(_) | Step::Refresh(..)) {
+                batch.flush_textures();
+            }
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -5260,7 +5314,11 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if batch_textures_enabled() {
+                            batch.texture_jobs.push(staging.clone());
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
@@ -5268,6 +5326,9 @@ impl HostList {
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+        // Do not carry outstanding texture work across command-list
+        // preparation or prelude creation.
+        batch.flush_textures();
     }
 }
 
@@ -5306,9 +5367,46 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Distinct texture staging buffers to refresh before the next ordered
+    /// step. Each refresh takes its own staging lock and thread-local scratch.
+    texture_jobs: Vec<std::sync::Arc<crate::texture::Staging>>,
+}
+
+/// Experimental: parallelize independent staging refreshes. Keep the
+/// synchronous mode as the default pending physical GPU validation.
+fn batch_textures_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VORTEX_BATCH_TEXTURES").is_some_and(|v| v == "1")
+            && std::thread::available_parallelism().is_ok_and(|n| n.get() >= 4)
+    })
+}
+
+fn texture_batch_worthwhile(count: usize, bytes: usize) -> bool {
+    count >= 4 && bytes >= 4 << 20
 }
 
 impl Batch {
+    fn flush_textures(&mut self) {
+        if self.texture_jobs.is_empty() {
+            return;
+        }
+        let bytes = self.texture_jobs.iter().fold(0usize, |sum, staging| {
+            sum.saturating_add(staging.memory().1)
+        });
+        if texture_batch_worthwhile(self.texture_jobs.len(), bytes) {
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = self.texture_jobs.drain(..)
+                .map(|staging| Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>)
+                .collect();
+            // All workers finish before the next ordered step starts.
+            crate::shadow::wide_run(jobs);
+        } else {
+            for staging in self.texture_jobs.drain(..) {
+                staging.refresh();
+            }
+        }
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
@@ -5363,6 +5461,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        self.flush_textures();
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -6527,6 +6626,14 @@ mod spare {
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
     use std::sync::Arc;
+
+    #[test]
+    fn parallel_texture_batches_require_enough_work() {
+        use super::texture_batch_worthwhile;
+        assert!(!texture_batch_worthwhile(3, 64 << 20));
+        assert!(!texture_batch_worthwhile(32, (4 << 20) - 1));
+        assert!(texture_batch_worthwhile(4, 4 << 20));
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {
