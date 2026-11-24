@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: false
 
 env:
@@ -24,6 +24,8 @@ jobs:
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: Cache regression tests
+        run: cargo test --locked -p victory-pipeline
       - name: Texture regression tests
         run: cargo test --locked -p victory-formats texture::tests
       - name: Clippy
