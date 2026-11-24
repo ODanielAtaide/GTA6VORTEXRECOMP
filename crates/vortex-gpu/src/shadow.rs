@@ -651,6 +651,21 @@ mod relay_tests {
     }
 
     #[test]
+    fn overlapping_snapshot_ranges_cover_only_new_bytes() {
+        let declarations = [(8usize, 32usize), (0, 12), (48, 64), (28, 52), (16, 20), (2, 63), (64, 80)];
+        let mut pending = Vec::new();
+        let mut covered = [false; 80];
+        for (from, to) in declarations {
+            let parts = outside(from, to, pending.clone());
+            let actual: Vec<usize> = parts.into_iter().flat_map(|(a, b)| a..b).collect();
+            let expected: Vec<usize> = (from..to).filter(|&i| !covered[i]).collect();
+            assert_eq!(actual, expected);
+            covered[from..to].fill(true);
+            pending.push((from, to));
+        }
+    }
+
+    #[test]
     fn ranges_are_cut_out() {
         assert_eq!(outside(10, 50, vec![]), vec![(10, 50)]);
         assert_eq!(outside(10, 50, vec![(0, 10), (50, 60)]), vec![(10, 50)]);
@@ -1785,25 +1800,18 @@ impl Shadow {
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
-        let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
+        let (from, to) = self.inside(address, len);
+        // Subtract the union once rather than rebuilding the parts vector
+        // for every pending declaration, including unrelated ranges.
+        let overlaps = pending.iter().filter_map(|&(a, e)| {
             let (a, e) = self.inside(a, e - a);
-            let mut rest = Vec::with_capacity(parts.len() + 1);
-            for (from, to) in parts {
-                if e <= from || a >= to {
-                    rest.push((from, to));
-                    continue;
-                }
-                if from < a {
-                    rest.push((from, a));
-                }
-                if e < to {
-                    rest.push((e, to));
-                }
-            }
-            parts = rest;
-        }
+            (a < e && a < to && e > from).then_some((a, e))
+        }).collect();
+        let parts = outside(from, to, overlaps);
         pending.push(range);
+        if parts.is_empty() {
+            return;
+        }
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -1914,7 +1922,9 @@ impl Shadow {
             for &(at, n) in &differing {
                 self.changed(at, at + n);
             }
-            let mut title = vec![0u8; PIECE];
+            // Allocate scratch only for pieces actually changed by the GPU.
+            // Most compared ranges contain no shader writes at all.
+            let mut title = Vec::new();
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
@@ -1930,7 +1940,8 @@ impl Shadow {
                 let last = last_difference(host, old).unwrap_or(first);
                 let (at, n) = (at + first, last + 1 - first);
                 let (host, old) = (&mut host[first..=last], &old[first..=last]);
-                let title = &mut title[..n];
+                title.resize(n, 0);
+                let title = &mut title[..];
                 if !crate::host::read_into((start + at) as *const u8, title) {
                     continue;
                 }
