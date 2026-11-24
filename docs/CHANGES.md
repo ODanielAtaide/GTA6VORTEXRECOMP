@@ -13,3 +13,7 @@ Reject undersized/truncated TLS directories, callback arrays without a null term
 ## Vortex branding and optional performance profile
 
 Public CLI package and executable renamed to `vortex`; window branding renamed to Vortex. Internal crates and existing environment/configuration interfaces remain stable. Credits and license retained. Added an opt-in ThinLTO CPU build profile and 30 FPS window-budget telemetry. Neither implies a measured runtime speedup.
+
+## Packed linear texture copy
+
+For linear subresources with equal, tightly packed source and destination row pitches, coalesce all active rows into one copy per depth slice. Padded and tiled layouts use the original path. Added three synthetic regression tests. This reduces copy invocations for the eligible case; a frame-rate benefit is not yet measured.

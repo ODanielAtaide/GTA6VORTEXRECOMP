@@ -654,6 +654,18 @@ impl Layout {
             return Err(Error::TooSmall);
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
+        // Both sides have tightly packed rows: copy one active plane rather
+        // than issuing a separate copy for each row. Keep depth slices
+        // separate because their strides and mip padding may differ.
+        if linear && row_pitch == bytes && m.pitch == m.width {
+            let plane_bytes = bytes.checked_mul(m.height as usize).ok_or(Error::TooSmall)?;
+            for z in 0..depth {
+                let (slice, _) = self.split(first + z);
+                let base = u64::from(slice) * self.slice_size + m.offset;
+                copy(base as usize, z as usize * depth_pitch, plane_bytes);
+            }
+            return Ok(());
+        }
         // The row and depth contribute one common base to every column, so
         // the same contiguous runs repeat on every row, including mip tails.
         let mut runs = Vec::new();
@@ -1032,6 +1044,66 @@ mod tests {
         assert_eq!(t.planes[1].offset, t.planes[0].layout.size);
         assert_eq!(t.planes[1].layout.size, 2048 * 1280);
         assert!(!t.planes[0].layout.addressable());
+    }
+
+    #[test]
+    fn packed_linear_rows_use_one_copy_per_plane() {
+        let layout = Layout::new(&desc(64, 8, 1, 4, Swizzle::LINEAR)).unwrap();
+        let mut runs = Vec::new();
+        layout.walk(layout.size as usize, 0, 0, 2048, 256, 0, |t, l, n| {
+            runs.push((t, l, n));
+        }).unwrap();
+        assert_eq!(runs, vec![(0, 0, 2048)]);
+        let input: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
+        let mut tiled = vec![0; layout.size as usize];
+        let mut output = vec![0; input.len()];
+        layout.tile(&mut tiled, 0, 0, &input, 256, 0).unwrap();
+        layout.detile(&tiled, 0, 0, &mut output, 256, 0).unwrap();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn linear_volume_keeps_independent_slice_strides() {
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex3d,
+            depth: 3,
+            ..desc(64, 4, 2, 4, Swizzle::LINEAR)
+        }).unwrap();
+        let row = 256;
+        let plane = row * 4;
+        let stride = plane + 19;
+        let input: Vec<u8> = (0..stride * 3).map(|i| (i % 251) as u8).collect();
+        let mut tiled = vec![0xcc; layout.size as usize];
+        let mut output = vec![0xcc; input.len()];
+        layout.tile(&mut tiled, 0, 0, &input, row, stride).unwrap();
+        layout.detile(&tiled, 0, 0, &mut output, row, stride).unwrap();
+        for z in 0..3 {
+            let start = z * stride;
+            assert_eq!(&input[start..start + plane], &output[start..start + plane]);
+            assert!(output[start + plane..start + stride].iter().all(|&b| b == 0xcc));
+        }
+        let mut runs = Vec::new();
+        layout.walk(layout.size as usize, 0, 0, input.len(), row, stride, |t, l, n| {
+            runs.push((t, l, n));
+        }).unwrap();
+        assert_eq!(runs.len(), 3);
+        for (z, &(t, l, n)) in runs.iter().enumerate() {
+            assert_eq!(t, layout.offset(0, 0, 0, z as u32).unwrap() as usize);
+            assert_eq!((l, n), (z * stride, plane));
+        }
+    }
+
+    #[test]
+    fn linear_copy_with_row_padding_stays_rowwise() {
+        for (width, row) in [(63, 252), (64, 260)] {
+            let layout = Layout::new(&desc(width, 4, 1, 4, Swizzle::LINEAR)).unwrap();
+            let mut runs = Vec::new();
+            layout.walk(layout.size as usize, 0, 0, row * 4, row, 0, |t, l, n| {
+                runs.push((t, l, n));
+            }).unwrap();
+            assert_eq!(runs.len(), 4);
+            assert!(runs.iter().all(|run| run.2 == width as usize * 4));
+        }
     }
 
     #[test]
