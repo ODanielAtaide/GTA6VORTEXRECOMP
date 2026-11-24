@@ -619,7 +619,7 @@ pub(crate) fn save(now: bool) {
     };
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -631,76 +631,75 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
+    // The prewarm catalogue belongs to the runtime, not the driver.
+    // Publish it independently, even when the driver lacks a library or
+    // a large library fails to serialize. Its own dirty bit is retried.
+    if USED_CHANGED.swap(false, Ordering::AcqRel) {
+        let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+        match publish_early(dir, used) {
+            Ok(early) => tracing::info!(early, "pipeline prewarm catalogue saved"),
+            Err(e) => {
+                USED_CHANGED.store(true, Ordering::Release);
+                tracing::warn!(error = %e, "pipeline prewarm catalogue not saved");
+            }
+        }
+    }
+
+    let Some(library) = library() else { return };
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
-    // The bytes of the library written to `tmp`; 0 when no pipeline was
-    // added: the library on disk is then what it was, and only the early
-    // list is written (a title pipeline first drawn with wrote all 1,352 MB
-    // of the library again: run 60's second save).
     let (bytes, saved_count) = {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
-        if !used_changed && added == 0 {
+        if added == 0 {
             return;
         }
-        if added == 0 {
-            (0, 0)
-        } else {
-            // SAFETY: a plain query.
-            let size = unsafe { library.library.GetSerializedSize() };
-            let _call = call("serialise", "the whole library");
-            if let Err(e) = serialise(&library.library, &tmp, size) {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
-                if used_changed {
-                    USED_CHANGED.store(true, Ordering::Relaxed);
-                }
-                let _ = std::fs::remove_file(&tmp);
-                return;
-            }
-            library.added.store(0, Ordering::Relaxed);
-            (size, added)
+        // SAFETY: a plain query.
+        let size = unsafe { library.library.GetSerializedSize() };
+        let _call = call("serialise", "the whole library");
+        if let Err(e) = serialise(&library.library, &tmp, size) {
+            tracing::warn!(error = %e, "host pipeline library not serialised");
+            let _ = std::fs::remove_file(&tmp);
+            return;
         }
+        library.added.store(0, Ordering::Relaxed);
+        (size, added)
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
-    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
-    if library_written.is_err() {
-        // Keep the failed batch dirty without overwriting additions made
-        // after serialization released its exclusive lock.
+    if let Err(e) = replace_library(dir, &tmp) {
+        // Preserve additions made after the serialization lock was released.
         library.added.fetch_add(saved_count, Ordering::Relaxed);
+        tracing::warn!(error = %e, "host pipeline library not saved");
+        return;
     }
-    if bytes > 0 && library_written.is_ok() {
-        SAVED.store(bytes as u64, Ordering::Relaxed);
-        // In place unless the system refused and the new one waits beside it.
-        let in_place = !dir.join(NEXT_FILE).exists();
-        if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
-            REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
-            REPLACED[0].fetch_add(1, Ordering::Relaxed);
-        }
-        crate::host::trail(|| {
-            format!(
-                "pipeline library: saved {bytes} bytes, {}",
-                if in_place { "renamed over the library's file" } else { "left beside the library's file for the next start" }
-            )
-        });
+    SAVED.store(bytes as u64, Ordering::Relaxed);
+    let in_place = !dir.join(NEXT_FILE).exists();
+    if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
+        REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
+        REPLACED[0].fetch_add(1, Ordering::Relaxed);
     }
-    let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
-    match written {
-        Ok(()) => tracing::info!(
-            bytes,
-            early = used.len(),
-            made = MADE.load(Ordering::Relaxed),
-            loaded = LOADED.load(Ordering::Relaxed),
-            started_early = EARLY.load(Ordering::Relaxed),
-            "host pipeline library saved"
-        ),
-        Err(e) => {
-            USED_CHANGED.store(true, Ordering::Relaxed);
-            tracing::warn!(error = %e, "host pipeline library not saved");
-        }
-    }
+    crate::host::trail(|| {
+        format!(
+            "pipeline library: saved {bytes} bytes, {}",
+            if in_place { "renamed over the library's file" } else { "left beside the library's file for the next start" }
+        )
+    });
+    tracing::info!(
+        bytes,
+        made = MADE.load(Ordering::Relaxed),
+        loaded = LOADED.load(Ordering::Relaxed),
+        started_early = EARLY.load(Ordering::Relaxed),
+        "host pipeline library saved"
+    );
+}
+
+/// Stable, bounded, deduplicated catalogue independent of driver blobs.
+fn publish_early(dir: &std::path::Path, mut keys: Vec<String>) -> std::io::Result<usize> {
+    keys.sort_unstable();
+    keys.dedup();
+    keys.truncate(EARLY_MAX);
+    write_atomically(&dir.join(EARLY_FILE), keys.join("\n").as_bytes())?;
+    Ok(keys.len())
 }
 
 /// Writes the library's `size` serialised bytes to the file `tmp`: through
@@ -775,6 +774,17 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalogue_can_be_published_without_a_driver_library() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(publish_early(dir.path(), vec!["b".into(), "a".into(), "b".into()]).unwrap(), 2);
+        assert_eq!(std::fs::read_to_string(dir.path().join(EARLY_FILE)).unwrap(), "a\nb");
+        assert!(!dir.path().join(LIBRARY_FILE).exists());
+        assert_eq!(publish_early(dir.path(), vec!["c".into()]).unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(dir.path().join(EARLY_FILE)).unwrap(), "c");
+        assert!(publish_early(&dir.path().join("missing"), vec!["x".into()]).is_err());
+    }
 
     #[test]
     fn identical_pipeline_names_share_a_lock_but_distinct_names_do_not() {
