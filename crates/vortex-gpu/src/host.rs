@@ -2052,7 +2052,7 @@ mod relay_tests {
         assert_eq!(landable(line.iter().copied(), u64::MAX), 5);
         // Signals with no flight ahead land at once; behind one they wait.
         assert_eq!(landable([None, None].into_iter(), 0), 2);
-        assert_eq!(landable(&[None, Some(9), None], 8), 1);
+        assert_eq!(landable([None, Some(9), None].into_iter(), 8), 1);
         assert_eq!(landable(std::iter::empty(), 3), 0);
         // After the first three landed, the rest when its turn comes.
         assert_eq!(landable(line[3..].iter().copied(), 5), 0);
