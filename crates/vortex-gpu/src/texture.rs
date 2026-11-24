@@ -692,6 +692,9 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                // The snapshot is private to this thread. Hashing and
+                // detiling it no longer require stable title mappings.
+                drop(_mapped);
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -712,6 +715,8 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
+                // with_title has already copied the bytes into scratch.
+                drop(_mapped);
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
