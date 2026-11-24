@@ -704,6 +704,17 @@ mod tests {
     }
 
     #[test]
+    fn declarations_keep_first_seen_order_and_deduplicate_exact_ranges() {
+        let mut index = DeclarationIndex::default();
+        assert_eq!(index.insert(900, (0, 12)), Some(0));
+        assert_eq!(index.insert(100, (0, 12)), Some(1));
+        assert_eq!(index.insert(900, (0, 12)), None);
+        assert_eq!(index.insert(900, (8, 20)), Some(0));
+        assert_eq!(index.insert(200, (8, 20)), Some(2));
+        assert_eq!(index.insert(100, (8, 20)), Some(1));
+    }
+
+    #[test]
     fn card_compare_groups_match_the_shader_layouts() {
         for pieces in [1u32, 63, 64, 65, 16385] {
             assert_eq!(card_compare_groups(pieces, true), pieces);
@@ -1527,7 +1538,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 "#;
 
 /// Experimental card-side compare: one group per 64 KiB piece, with
-/// independent 1 KiB stripes hashed by its 64 lanes. Keep every stripe's
+/// independent interleaved 1 KiB streams hashed by its 64 lanes. Keep every lane's
 /// 128-bit fingerprint rather than compressing the group into one hash.
 /// The result interface remains one dirty flag per original piece.
 const CARD_COMPARE_PARALLEL: &str = r#"
@@ -2715,22 +2726,41 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
+    let mut seen = DeclarationIndex::default();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::GpuWrite(shadow, address, len) = step {
                 let range = (*address, *address + *len);
-                match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges)) => {
-                        if !ranges.contains(&range) {
-                            ranges.push(range);
-                        }
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                if let Some(index) = seen.insert(key, range) {
+                    if index == back.len() {
+                        back.push((shadow.clone(), vec![range]));
+                    } else {
+                        back[index].1.push(range);
                     }
-                    None => back.push((shadow.clone(), vec![range])),
                 }
             }
         }
     }
     back
+}
+
+/// Preserve first-seen copy and range order while avoiding repeated linear
+/// searches over all declarations in a command submission.
+#[derive(Default)]
+struct DeclarationIndex {
+    copies: std::collections::HashMap<usize, usize>,
+    ranges: std::collections::HashSet<(usize, usize, usize)>,
+}
+
+impl DeclarationIndex {
+    fn insert(&mut self, copy: usize, (start, end): (usize, usize)) -> Option<usize> {
+        if !self.ranges.insert((copy, start, end)) {
+            return None;
+        }
+        let next = self.copies.len();
+        Some(*self.copies.entry(copy).or_insert(next))
+    }
 }
 
 /// After `list` has run: the texels its read-backs copied into host
@@ -3070,30 +3100,13 @@ impl Host {
     /// `flown`: the submission is sent ahead with [`relay`]. Its compare
     /// then stores the hashes it makes (see [`flagged_pieces`] and
     /// `relay`).
-    fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
+    fn card_before(&self, back: &[Declared], flown: bool) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
         }
-        // The ranges this submission's shaders may write, per copy.
-        let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && shadow.carded()
-                {
-                    let range = (*address, *address + *len);
-                    match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges)) => {
-                            if !ranges.contains(&range) {
-                                ranges.push(range);
-                            }
-                        }
-                        None => declared.push((shadow.clone(), vec![range])),
-                    }
-                }
-            }
-        }
+        // Reuse the same declarations that will drive CPU copy-back.
+        let declared = back.iter().filter(|(shadow, _)| shadow.carded());
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -3105,7 +3118,7 @@ impl Host {
             None => 0,
         };
         let mut dirty = crate::shadow::card_dirty(sent_as);
-        if declared.is_empty() && dirty.is_empty() {
+        if declared.clone().next().is_none() && dirty.is_empty() {
             return None;
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3113,7 +3126,7 @@ impl Host {
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
-        for (shadow, _) in &declared {
+        for (shadow, _) in declared.clone() {
             if shadow.card_make_before(|size| {
                 let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
                 name(&before, || "title buffer on the card, hashes of its pieces".into());
@@ -3203,7 +3216,7 @@ impl Host {
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let mut at = work.taken;
-        for (shadow, ranges) in &declared {
+        for (shadow, ranges) in declared {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
             let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -4077,7 +4090,8 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
-        let card = self.card_before(runs, flown);
+        let back = declared_writes(runs);
+        let card = self.card_before(&back, flown);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -4093,7 +4107,6 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
-            let back = declared_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
@@ -4212,7 +4225,6 @@ impl Host {
         if let Some(card) = &card {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
-        let back = declared_writes(runs);
         hand_back(&back);
         if let Some(card) = card {
             self.card_done(card);

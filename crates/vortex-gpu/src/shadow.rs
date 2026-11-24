@@ -260,7 +260,7 @@ static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 /// be there ([`window_card_most`]).
 fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     let most = window_card_most();
-    if most == 0 || !cards() {
+    if most == 0 || !cards() || size >= 1 << 30 {
         return None;
     }
     let host = host()?;
