@@ -227,16 +227,31 @@ const _: () = assert!(size_of::<Mode>() == 32);
 fn display_size() -> (u32, u32) {
     static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
-        let asked = std::env::var("VORTEX_DISPLAY_MODE").ok().and_then(|v| {
-            let (w, h) = v.trim().split_once(['x', 'X'])?;
-            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
-        });
-        let size = match asked {
-            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
-            _ => (3840, 2160),
-        };
+        let mode = std::env::var("VORTEX_DISPLAY_MODE").ok();
+        let profile = std::env::var("VORTEX_DISPLAY_PROFILE").ok();
+        let size = select_display_size(mode.as_deref(), profile.as_deref());
+        if mode.as_deref().is_some_and(|v| parse_display_size(v).is_none()) {
+            tracing::warn!("invalid VORTEX_DISPLAY_MODE; using display profile or default");
+        }
         tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
         size
+    })
+}
+
+fn parse_display_size(value: &str) -> Option<(u32, u32)> {
+    let (w, h) = value.trim().split_once(['x', 'X'])?;
+    let (w, h) = (w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?);
+    ((640..=7680).contains(&w) && (360..=4320).contains(&h)).then_some((w, h))
+}
+
+/// These presets report a display mode only; they never resize title
+/// resources or override its internal render dimensions.
+fn select_display_size(mode: Option<&str>, profile: Option<&str>) -> (u32, u32) {
+    mode.and_then(parse_display_size).unwrap_or_else(|| match profile {
+        Some("ultra") => (960, 540),
+        Some("performance") => (1280, 720),
+        Some("quality") => (1920, 1080),
+        _ => (3840, 2160),
     })
 }
 
@@ -296,6 +311,17 @@ mod tests {
     type Get = extern "system" fn(This, *mut This) -> HRESULT;
     type Indexed = extern "system" fn(This, u32, *mut This) -> HRESULT;
     type Describe = extern "system" fn(This, *mut AdapterDescription) -> HRESULT;
+
+    #[test]
+    fn reported_display_presets_preserve_explicit_overrides() {
+        assert_eq!(select_display_size(None, None), (3840, 2160));
+        assert_eq!(select_display_size(None, Some("ultra")), (960, 540));
+        assert_eq!(select_display_size(None, Some("performance")), (1280, 720));
+        assert_eq!(select_display_size(None, Some("quality")), (1920, 1080));
+        assert_eq!(select_display_size(Some(" 1600 X 900 "), Some("ultra")), (1600, 900));
+        assert_eq!(select_display_size(Some("0x0"), Some("performance")), (1280, 720));
+        assert_eq!(select_display_size(Some("garbage"), None), (3840, 2160));
+    }
 
     /// Minecraft's startup: device → DXGI device (newest first) → adapter →
     /// description, factory, first output.

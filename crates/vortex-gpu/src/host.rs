@@ -57,6 +57,7 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    gpu_upload_scratch: bool,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -578,6 +579,21 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             vortex_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
         }
+        let mut o6 = D3D12_FEATURE_DATA_D3D12_OPTIONS6::default();
+        let vrs_known = device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS6, (&raw mut o6).cast(), size_of_val(&o6) as u32,
+        ).is_ok();
+        let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+        let gpu_upload_supported = device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS16, (&raw mut o16).cast(), size_of_val(&o16) as u32,
+        ).is_ok() && o16.GPUUploadHeapSupported.as_bool();
+        let gpu_upload_scratch = gpu_upload_supported
+            && std::env::var_os("VORTEX_GPU_UPLOAD_SCRATCH").is_some_and(|v| v == "1");
+        tracing::info!(
+            vrs_known, vrs_tier = o6.VariableShadingRateTier.0,
+            gpu_upload_supported, gpu_upload_scratch,
+            "host graphics performance capabilities"
+        );
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -620,6 +636,7 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            gpu_upload_scratch,
         })
     }
 }
@@ -684,6 +701,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn gpu_upload_preserves_local_memory_headroom() {
+        let gib = 1u64 << 30;
+        assert!(!gpu_upload_room(0, 0, 1));
+        assert!(gpu_upload_room(8 * gib, 5 * gib, 4 << 20));
+        assert!(!gpu_upload_room(8 * gib, 6 * gib, 4 << 20));
+        assert!(!gpu_upload_room(8 * gib, 9 * gib, 4 << 20));
+        assert!(!gpu_upload_room(8 * gib, 0, u64::MAX));
+    }
 
     #[test]
     fn card_compare_variants_compile() {
@@ -1722,7 +1749,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
+    let (buffer, data) = host.scratch_upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -6109,11 +6136,36 @@ impl Host {
         }
     }
 
+    /// Only pooled scratch is eligible. Leave bulk transfers and
+    /// CPU-readable allocations on their existing path.
+    fn scratch_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if self.gpu_upload_scratch
+            && self.video_memory().is_some_and(|[budget, used, _, _]| gpu_upload_room(budget, used, size))
+            && let Ok(made) = self.make_upload_buffer(size, D3D12_HEAP_TYPE_GPU_UPLOAD)
+        {
+            MADE[0].fetch_add(1, Ordering::Relaxed);
+            MADE[1].fetch_add(size, Ordering::Relaxed);
+            tracing::debug!(size, "scratch allocated in GPU upload memory");
+            return Some(made);
+        }
+        self.upload_buffer(size)
+    }
+
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
+        match self.make_upload_buffer(size, D3D12_HEAP_TYPE_UPLOAD) {
+            Ok(made) => Some(made),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no upload buffer");
+                None
+            }
+        }
+    }
+
+    fn make_upload_buffer(&self, size: u64, kind: D3D12_HEAP_TYPE) -> windows::core::Result<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_UPLOAD,
+            Type: kind,
             ..Default::default()
         };
         let desc = D3D12_RESOURCE_DESC {
@@ -6147,14 +6199,18 @@ impl Host {
                     b.Map(0, None, Some(&mut data))
                 })
         };
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no upload buffer");
-                None
-            }
+        made?;
+        if data.is_null() {
+            return Err(windows::core::Error::empty());
         }
+        Ok((buffer.ok_or_else(windows::core::Error::empty)?, data.cast()))
     }
+}
+
+/// Keep at least a quarter of the local budget available, and never
+/// use this optional path when the budget is unknown.
+fn gpu_upload_room(budget: u64, used: u64, size: u64) -> bool {
+    budget != 0 && budget.saturating_sub(used).saturating_sub(size) >= (budget / 4).max(1)
 }
 
 /// The swap chain formats a presented texture can be copied into: its own
@@ -6470,7 +6526,10 @@ impl Host {
                     .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
             match resized {
-                Ok(()) => (p.width, p.height, p.format) = (width, height, format),
+                Ok(()) => {
+                    tracing::info!(width, height, format = format.0, "actual presentation surface resized");
+                    (p.width, p.height, p.format) = (width, height, format);
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, width, height, "swap chain not resized");
                     return None;
