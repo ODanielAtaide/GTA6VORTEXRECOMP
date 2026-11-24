@@ -9,3 +9,5 @@ The repository owner confirmed redistribution authorization before requesting th
 - Size: 77,982 bytes
 
 This subsequent addition supersedes the original source import's exclusion of the file. The binary is reproduced byte-for-byte; it is not a game executable. Compilation and runtime validation remain separate tasks.
+
+The binary now resides at the original root-relative path `crates/victory-formats/src/bcpack-tables.bin` after the workspace migration.

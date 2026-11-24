@@ -1,9 +1,9 @@
-# Editable upstream source
+# Source integration
 
-The import workflow fetches the public VIctory revision `16849898f3282c4a7189b1557289c194bc720052`, verifies each copied Git blob and creates an editable snapshot in `src-victory/`. It does not execute upstream code. Existing Vortex files and the pinned baseline submodule remain unchanged.
+The root workspace incorporates the public VIctory main revision `90228a7dc66010281fdcfad10ac00c3a252be2f3`. All 169 upstream paths are represented at their original paths. The root README, ignore rules, and asset policy contain Vortex-specific additions; the PE parser retains our two earlier patches. The two newer upstream commits are also integrated in the shader IR, pipeline host and translation tool.
 
-Upstream source: https://github.com/fxceless/victory-gta6
+Upstream: https://github.com/fxceless/victory-gta6
 
-The upstream license is GPL-3.0-or-later; original notices and the LICENSE are preserved. The upstream asset policy explicitly excludes `crates/victory-formats/src/bcpack-tables.bin` from that license. The snapshot intentionally omits that file and is not a complete buildable distribution. Do not add material without appropriate redistribution rights. This workflow is not intended to recover blocked or removed repositories; if the public source becomes unavailable, the import must fail.
+The merge-history workflow fetches the original full main ancestry and creates a merge commit preserving the integrated tree and previous Vortex commits. It does not force-push or modify the imported tree. History is verified by ancestry checks and must be confirmed by a successful workflow result.
 
-After a successful import, edit the Rust source under `src-victory/crates/` and record changes separately. The source snapshot is imported only once to avoid overwriting edits. Build and test status of the separately pinned baseline is independent of the snapshot. No commercial-game compatibility has been established.
+Original source notices and GPL-3.0-or-later license are retained. The BCPack binary is separately documented and is not GPL-licensed. No title assets or keys are included. The old submodule and nested source folder are superseded by the root workspace. Compilation and graphics correctness must be tested separately.

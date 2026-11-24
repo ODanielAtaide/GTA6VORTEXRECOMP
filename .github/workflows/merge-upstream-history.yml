@@ -1,0 +1,51 @@
+name: Merge original upstream history
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/merge-upstream-history.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: merge-upstream-history
+  cancel-in-progress: false
+
+jobs:
+  merge-history:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch and merge full public main ancestry
+        shell: bash
+        run: |
+          set -euo pipefail
+          upstream=90228a7dc66010281fdcfad10ac00c3a252be2f3
+          before=$(git rev-parse HEAD)
+          test "$(git rev-parse --is-shallow-repository)" = false
+          git fetch --no-tags https://github.com/fxceless/victory-gta6.git refs/heads/main
+          git merge-base --is-ancestor "$upstream" FETCH_HEAD
+          test "$(git rev-parse --is-shallow-repository)" = false
+          test -f Cargo.toml
+          test -d crates
+          test ! -e src-victory
+          if git merge-base --is-ancestor "$upstream" HEAD; then
+            echo "Pinned upstream history already present."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --allow-unrelated-histories --no-ff -s ours -m "Merge complete VIctory main history at 90228a7; preserve integrated Vortex tree" "$upstream"
+          git merge-base --is-ancestor "$upstream" HEAD
+          git merge-base --is-ancestor "$before" HEAD
+          git diff --exit-code "$before" HEAD
+          echo "Reachable upstream commits: $(git rev-list --count "$upstream")"
+          echo "Total reachable commits: $(git rev-list --count HEAD)"
+          git push origin HEAD:refs/heads/main
