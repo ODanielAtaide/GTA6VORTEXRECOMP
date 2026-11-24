@@ -1,0 +1,87 @@
+name: Import licensed upstream source
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/import-source.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: import-upstream-source
+  cancel-in-progress: false
+
+jobs:
+  source-snapshot:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Fetch public pinned source
+        uses: actions/checkout@v4
+        with:
+          repository: fxceless/victory-gta6
+          ref: 16849898f3282c4a7189b1557289c194bc720052
+          path: upstream-import
+          persist-credentials: false
+      - name: Create source-only snapshot and verify every included blob
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e src-victory
+          python3 - <<'PY'
+          import pathlib, subprocess
+          source = pathlib.Path("upstream-import")
+          target = pathlib.Path("src-victory")
+          excluded = "crates/victory-formats/src/bcpack-tables.bin"
+          expected = "16849898f3282c4a7189b1557289c194bc720052"
+          head = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+          assert head == expected
+          tree = subprocess.check_output(["git", "-C", str(source), "ls-tree", "-rz", "HEAD"])
+          copied = 0
+          for item in tree.split(b"\0"):
+              if not item:
+                  continue
+              header, rawpath = item.split(b"\t", 1)
+              mode, kind, oid = header.decode().split()
+              path = rawpath.decode("utf-8")
+              if path == excluded:
+                  continue
+              if kind != "blob" or mode not in {"100644", "100755"}:
+                  raise SystemExit(f"Unexpected Git entry: {path}")
+              relative = pathlib.PurePosixPath(path)
+              if relative.is_absolute() or ".." in relative.parts or ".git" in relative.parts:
+                  raise SystemExit(f"Unsafe path: {path}")
+              data = subprocess.check_output(["git", "-C", str(source), "cat-file", "blob", oid])
+              if b"\0" in data:
+                  raise SystemExit(f"Unexpected binary content: {path}")
+              data.decode("utf-8")
+              out = target / path
+              out.parent.mkdir(parents=True, exist_ok=True)
+              out.write_bytes(data)
+              out.chmod(0o755 if mode == "100755" else 0o644)
+              actual = subprocess.check_output(["git", "hash-object", "--no-filters", str(out)], text=True).strip()
+              if actual != oid:
+                  raise SystemExit(f"Hash mismatch: {path}")
+              copied += 1
+          if copied != 168 or not (target / "LICENSE").is_file():
+              raise SystemExit(f"Unexpected source count: {copied}")
+          print(f"Verified {copied} licensed source-tree files; omitted unlicensed binary")
+          PY
+          test ! -e src-victory/crates/victory-formats/src/bcpack-tables.bin
+      - name: Commit source snapshot without overwriting existing files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f -- src-victory
+          test "$(git diff --cached --name-only | wc -l)" -eq 168
+          git commit -m "Import GPL source snapshot from VIctory 16849898 (exclude unlicensed binary)"
+          git push origin HEAD:refs/heads/main
