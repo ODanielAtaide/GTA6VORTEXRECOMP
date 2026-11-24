@@ -1,0 +1,3 @@
+[submodule "vendor/victory"]
+	path = vendor/victory
+	url = https://github.com/fxceless/victory-gta6.git

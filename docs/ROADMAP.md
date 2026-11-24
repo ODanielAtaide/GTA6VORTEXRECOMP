@@ -1,8 +1,9 @@
-# Research milestones
+# Engineering milestones
 
-1. Validate the read-only PE header inspector with synthetic fixtures.
-2. Build original test programs using documented Windows interfaces.
-3. Establish reproducible CPU and GPU benchmarks using original workloads.
-4. Evaluate compatibility requirements only for authorized software.
+1. Pin public upstream and establish synthetic test baseline.
+2. Measure equivalent authorized workloads with controlled cache state.
+3. Isolate CPU preparation, GPU waiting, readback, and pipeline drops using upstream diagnostics.
+4. Reproduce each runtime defect with original synthetic workloads before patching.
+5. Validate graphics correctness and performance on real Windows hardware.
 
-No commercial-game compatibility claim is made. Each milestone requires reproducible test evidence.
+No unsupported performance or game compatibility claim is made.
