@@ -191,6 +191,26 @@ impl Spans {
 /// texture pass last took the ranges ([`remapped`]).
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
+/// Coalesce the exact union of half-open ranges before looking up affected
+/// views. The pass only needs the set of affected slots, not the event order.
+fn coalesce_remapped(ranges: &mut Vec<(u64, u64)>) {
+    ranges.sort_unstable();
+    let mut used = 0;
+    for i in 0..ranges.len() {
+        let (start, end) = ranges[i];
+        if start >= end {
+            continue;
+        }
+        if used > 0 && start <= ranges[used - 1].1 {
+            ranges[used - 1].1 = ranges[used - 1].1.max(end);
+        } else {
+            ranges[used] = (start, end);
+            used += 1;
+        }
+    }
+    ranges.truncate(used);
+}
+
 /// The lowest start and the highest end of any span of [`Spans`] so far
 /// (the start is `u64::MAX` until there is one): what the runtime does to
 /// memory outside is none of the texture pass's business.
@@ -329,28 +349,46 @@ impl TextureQueue {
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let mut again: Vec<(u64, u32, u64)> = Vec::new();
-        let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
+        if max == 0 {
+            return Vec::new();
+        }
+        let mut again = Vec::new();
+        let mut fresh = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
-            class.push((w.written, index, w.write));
+            class.push((index, w.write));
         }
-        // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        // The write number is unique. Select only the ends that will be
+        // served; sorting the entire backlog for a small budget is wasted work.
+        let newest_first = |a: &(u32, u64), b: &(u32, u64)| b.1.cmp(&a.1);
+        if again.len() > max {
+            again.select_nth_unstable_by(max, newest_first);
+            again.truncate(max);
+        }
         again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        let count = (max - again.len()).min(fresh.len());
+        if count == 0 {
+            return again;
+        }
+        let newest = count.div_ceil(2);
+        let oldest = count / 2;
+        let tail = fresh.len() - oldest;
+        if newest < fresh.len() {
+            fresh.select_nth_unstable_by(newest, newest_first);
+        }
+        if oldest > 0 && tail > newest {
+            fresh[newest..].select_nth_unstable_by(tail - newest, newest_first);
+        }
+        fresh[..newest].sort_unstable_by(newest_first);
+        fresh[tail..].sort_unstable_by(newest_first);
+        again.reserve(count);
+        for i in 0..newest {
+            again.push(fresh[i]);
+            if i < oldest {
+                again.push(fresh[fresh.len() - 1 - i]);
             }
         }
-        order.truncate(max);
-        order
+        again
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -832,10 +870,11 @@ impl HostHeap {
     /// whose pass runs first takes them (a title has one view heap).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
-        let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
         }
+        coalesce_remapped(&mut ranges);
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
@@ -2348,6 +2387,73 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// Compare the bounded selection to a fully sorted reference across
+    /// mixed retry/fresh entries, write orders, due dates and budgets.
+    #[test]
+    fn bounded_texture_queue_matches_full_sort() {
+        let mut q = TextureQueue::default();
+        for i in 0..4096u32 {
+            let index = (i * 2053) % 4096;
+            q.written(index, u64::from(i / 8), u64::from(i % 7), false);
+            let w = q.slots.get_mut(&index).unwrap();
+            if i % 5 == 0 {
+                w.looks = 1;
+            } else if i % 11 == 0 {
+                w.mapped = 4096;
+            }
+        }
+        for frame in [0, 1, 3, 6, 100] {
+            let mut retry = Vec::new();
+            let mut fresh = Vec::new();
+            for (&index, w) in &q.slots {
+                if w.due <= frame {
+                    if w.looks > 0 || w.mapped > 0 {
+                        retry.push((index, w.write));
+                    } else {
+                        fresh.push((index, w.write));
+                    }
+                }
+            }
+            retry.sort_unstable_by_key(|w| std::cmp::Reverse(w.1));
+            fresh.sort_unstable_by_key(|w| std::cmp::Reverse(w.1));
+            let (mut lo, mut hi) = (0, fresh.len());
+            while lo < hi {
+                retry.push(fresh[lo]);
+                lo += 1;
+                if lo < hi {
+                    hi -= 1;
+                    retry.push(fresh[hi]);
+                }
+            }
+            for budget in [0, 1, 2, 3, 31, 64, 255, 512, 1024, 2047, 4096, usize::MAX] {
+                assert_eq!(q.due(frame, budget), retry[..budget.min(retry.len())]);
+            }
+        }
+    }
+
+    #[test]
+    fn remapped_union_preserves_affected_slots() {
+        let mut spans = Spans::default();
+        for i in 0..100u32 {
+            let at = u64::from(i) * 16;
+            spans.note(i, at, at + 12, true);
+        }
+        let mut ranges = vec![(12, 20), (0, 4), (4, 8), (2, 6), (100, 111), (105, 128),
+                              (150, 160), (150, 160), (400, 408)];
+        let affected = |ranges: &[(u64, u64)]| {
+            let mut slots: Vec<_> = ranges.iter().flat_map(|&(a, b)| spans.slots_in(a, b)).collect();
+            slots.sort_unstable();
+            slots.dedup();
+            slots
+        };
+        let expected = affected(&ranges);
+        coalesce_remapped(&mut ranges);
+        assert_eq!(ranges, [(0, 8), (12, 20), (100, 128), (150, 160), (400, 408)]);
+        assert_eq!(affected(&ranges), expected);
+        coalesce_remapped(&mut ranges);
+        assert_eq!(affected(&ranges), expected);
     }
 
     /// A view written over memory that older views describe otherwise
