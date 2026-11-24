@@ -31,3 +31,9 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+      - name: Build Vortex executable
+        run: cargo build --release -p vortex --locked
+      - name: Verify Vortex CLI
+        run: .\target\release\vortex.exe --help
+      - name: Check performance profile
+        run: cargo check --profile performance -p vortex --locked

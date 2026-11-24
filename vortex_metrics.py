@@ -12,6 +12,7 @@ DETAIL = re.compile(r"dropped (\d+(?:\.\d+)?) without a host pipeline")
 
 def summarize(lines):
     fps, ms, drops = [], [], []
+    budget_ms = 1000.0 / 30.0
     for raw in lines:
         line = ANSI.sub("", raw)
         match = FRAME.search(line)
@@ -31,6 +32,10 @@ def summarize(lines):
         raise ValueError("No valid frame-window samples")
     return {
         "sample_count": len(fps),
+        "target_fps": 30,
+        "target_ms_per_frame": round(budget_ms, 4),
+        "windows_meeting_30_fps": sum(value >= 30.0 for value in fps),
+        "median_frame_budget_multiple": round(statistics.median(ms) / budget_ms, 4),
         "median_window_fps": statistics.median(fps),
         "median_window_ms_per_frame": statistics.median(ms),
         "minimum_window_fps": min(fps),

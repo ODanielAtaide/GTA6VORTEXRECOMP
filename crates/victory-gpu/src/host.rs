@@ -5837,7 +5837,7 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let text = format!(" | Vortex {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -6314,7 +6314,7 @@ extern "system" fn window_proc(
 }
 
 fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
-    const CLASS: PCWSTR = w!("VIctory");
+    const CLASS: PCWSTR = w!("Vortex");
     // SAFETY: registers our class once and creates a window of it.
     unsafe {
         let instance = GetModuleHandleW(None)?;
@@ -6337,7 +6337,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
-            w!("VIctory"),
+            w!("Vortex"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
