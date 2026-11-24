@@ -40,7 +40,7 @@ struct Journal {
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
-    ahead: Vec<(usize, usize)>,
+    ahead: Ahead,
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` stays, until
@@ -52,10 +52,48 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
-    ahead: Vec::new(),
+    ahead: Ahead(BTreeMap::new()),
     ahead_asked: 0,
     kept: false,
 });
+
+/// Index successful write-watch queries by disjoint, merged page spans.
+/// Membership is logarithmic instead of scanning every previous query
+/// for every buffer refresh. Adjacent spans are safe to join because
+/// their union is entirely covered by successful queries.
+struct Ahead(BTreeMap<usize, usize>);
+
+impl Ahead {
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn covers(&self, first: usize, last: usize) -> bool {
+        self.0.range(..=first).next_back().is_some_and(|(_, &end)| last <= end)
+    }
+
+    fn insert(&mut self, mut first: usize, mut last: usize) {
+        if first >= last {
+            return;
+        }
+        if let Some((&start, &end)) = self.0.range(..=first).next_back()
+            && end >= first
+        {
+            first = start;
+            last = last.max(end);
+            self.0.remove(&start);
+        }
+        while let Some((&start, &end)) = self.0.range(first..=last).next() {
+            last = last.max(end);
+            self.0.remove(&start);
+        }
+        self.0.insert(first, last);
+    }
+}
 
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
@@ -191,8 +229,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
-            j.ahead.push((first, last));
+        if !j.ahead.covers(first, last) && ask_kernel(j, first, last) {
+            j.ahead.insert(first, last);
         }
     }
     j.kept = !j.ahead.is_empty();
@@ -233,7 +271,7 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
     if ask_kernel(j, first, last) {
-        j.ahead.push((first, last));
+        j.ahead.insert(first, last);
         return;
     }
     let (a, b) = pieces.split_at(pieces.len() / 2);
@@ -290,8 +328,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+        .covers(first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -307,7 +344,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if j.ahead.covers(first, last) {
         return Some((
             j.ahead_asked,
             j.written
@@ -355,9 +392,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+    // Split the fields so the kernel's reusable answer can be consumed
+    // directly without allocating another vector for every query.
+    let Journal { found, written, .. } = j;
+    for page in found[..count].iter().map(|&at| at / PAGE).chain(guarded) {
+        written.insert(page, now);
     }
     Some((
         now,
@@ -1104,5 +1143,27 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod ahead_tests {
+    use super::{Ahead, BTreeMap};
+
+    #[test]
+    fn indexed_coverage_preserves_successful_page_union() {
+        let mut ahead = Ahead(BTreeMap::new());
+        let mut covered = [false; 128];
+        for (start, end) in [(32, 40), (0, 8), (8, 16), (35, 48), (50, 60),
+                             (16, 32), (48, 50), (90, 120), (100, 110), (58, 91)] {
+            ahead.insert(start, end);
+            covered[start..end].fill(true);
+            for first in 0..128 {
+                for last in first + 1..=128 {
+                    assert_eq!(ahead.covers(first, last), covered[first..last].iter().all(|&p| p));
+                }
+            }
+        }
+        assert_eq!(ahead.0.into_iter().collect::<Vec<_>>(), [(0, 120)]);
     }
 }
