@@ -194,7 +194,8 @@ fn kind(index: usize) -> u32 {
 impl Device {
     fn new(index: usize) -> Device {
         let mut id = [0; 32];
-        id[..7].copy_from_slice(b"vortex");
+        const PREFIX: &[u8] = b"vortex";
+        id[..PREFIX.len()].copy_from_slice(PREFIX);
         id[31] = index as u8 + 1;
         let info = DeviceInfo {
             size: size_of::<DeviceInfo>() as u32,
