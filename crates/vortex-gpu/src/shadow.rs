@@ -39,7 +39,7 @@ pub(crate) struct Shadow {
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
-    pending: Mutex<Vec<(usize, usize)>>,
+    pending: Mutex<std::collections::BTreeSet<(usize, usize)>>,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -517,20 +517,16 @@ pub(crate) fn relay_fetched(number: u64) {
 /// writing: the next refresh would have put title bytes over what the
 /// second flight's shaders were writing.
 #[derive(Default)]
-struct Flights(Vec<((usize, usize), u32, u64)>);
+struct Flights(std::collections::HashMap<(usize, usize), (u32, u64)>);
 
 impl Flights {
     /// Submission `number` declares `range`: counted once for it, however
     /// often it declares it.
     fn declare(&mut self, range: (usize, usize), number: u64) {
-        match self.0.iter_mut().find(|f| f.0 == range) {
-            Some(f) => {
-                if f.2 != number {
-                    f.1 += 1;
-                    f.2 = number;
-                }
-            }
-            None => self.0.push((range, 1, number)),
+        let entry = self.0.entry(range).or_insert((0, number));
+        if entry.0 == 0 || entry.1 != number {
+            entry.0 += 1;
+            entry.1 = number;
         }
     }
 
@@ -539,11 +535,11 @@ impl Flights {
     fn done(&mut self, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
         let mut free = Vec::new();
         for range in ranges {
-            match self.0.iter().position(|f| f.0 == *range) {
-                Some(at) => {
-                    self.0[at].1 = self.0[at].1.saturating_sub(1);
-                    if self.0[at].1 == 0 {
-                        self.0.swap_remove(at);
+            match self.0.get_mut(range) {
+                Some(entry) => {
+                    entry.0 = entry.0.saturating_sub(1);
+                    if entry.0 == 0 {
+                        self.0.remove(range);
                         free.push(*range);
                     }
                 }
@@ -632,6 +628,20 @@ mod relay_tests {
         assert_eq!(flights.done(&[a]), vec![a]);
         // A range never counted is free at once.
         assert_eq!(flights.done(&[b]), vec![b]);
+    }
+
+    #[test]
+    fn many_flights_keep_overlapping_ranges_until_last_completion() {
+        let mut flights = Flights::default();
+        let ranges: Vec<_> = (0..4096usize).map(|i| (i * 16, i * 16 + 32)).collect();
+        for &range in &ranges {
+            flights.declare(range, 1);
+            flights.declare(range, 1);
+            flights.declare(range, 2);
+        }
+        assert!(flights.done(&ranges).is_empty());
+        assert_eq!(flights.done(&ranges), ranges);
+        assert!(flights.0.is_empty());
     }
 
     /// The merge moves exactly the bytes the card changed, into title
@@ -1808,7 +1818,7 @@ impl Shadow {
         // the card (`Host::card_before` reads the declared ranges from the
         // lists).
         if self.card.is_some() {
-            pending.push(range);
+            pending.insert(range);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -1817,12 +1827,12 @@ impl Shadow {
         let (from, to) = self.inside(address, len);
         // Subtract the union once rather than rebuilding the parts vector
         // for every pending declaration, including unrelated ranges.
-        let overlaps = pending.iter().filter_map(|&(a, e)| {
+        let overlaps = pending.range(..(range.1, 0)).filter_map(|&(a, e)| {
             let (a, e) = self.inside(a, e - a);
             (a < e && a < to && e > from).then_some((a, e))
         }).collect();
         let parts = outside(from, to, overlaps);
-        pending.push(range);
+        pending.insert(range);
         if parts.is_empty() {
             return;
         }
@@ -2135,9 +2145,13 @@ impl Shadow {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         if relay() {
             let free = self.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges);
-            pending.retain(|r| !free.contains(r));
+            for range in free {
+                pending.remove(&range);
+            }
         } else {
-            pending.retain(|r| !ranges.contains(r));
+            for range in ranges {
+                pending.remove(range);
+            }
         }
         if !pending.is_empty() || self.card.is_some() {
             return;
@@ -2220,8 +2234,8 @@ impl Shadow {
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
+            .range(..(to, 0))
+            .filter(|&&(_, e)| e > from)
             .map(|&(a, e)| (a.max(from), e.min(to)))
             .collect();
         if busy.is_empty() {
@@ -2266,8 +2280,8 @@ impl Shadow {
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
+            .range(..(to, 0))
+            .filter(|&&(_, e)| e > from)
             .map(|&(a, e)| (a.max(from), e.min(to)))
             .collect();
         if busy.is_empty() {
@@ -2380,19 +2394,19 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
+        let busy: Vec<(usize, usize)> = self
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .iter()
+            .range(..(to, 0))
             .copied()
-            .filter(|&(a, e)| a < to && e > from)
+            .filter(|&(_, e)| e > from)
             .collect();
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
             // gaps whole cost ~1 s per frame).
-            busy.sort_unstable();
+            // The pending set already yields ranges in address order.
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
                 if a > at {
