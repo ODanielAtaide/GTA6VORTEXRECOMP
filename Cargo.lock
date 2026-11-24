@@ -651,17 +651,17 @@ dependencies = [
  "blake3",
  "clap",
  "memchr",
- "victory-core",
- "victory-game",
- "victory-hle",
- "victory-loader",
- "victory-pe",
- "victory-shader",
+ "vortex-core",
+ "vortex-game",
+ "vortex-hle",
+ "vortex-loader",
+ "vortex-pe",
+ "vortex-shader",
  "walkdir",
 ]
 
 [[package]]
-name = "victory-core"
+name = "vortex-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -673,11 +673,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "victory-formats"
+name = "vortex-formats"
 version = "0.1.0"
 
 [[package]]
-name = "victory-game"
+name = "vortex-game"
 version = "0.1.0"
 dependencies = [
  "memchr",
@@ -685,7 +685,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "victory-gpu"
+name = "vortex-gpu"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -693,32 +693,32 @@ dependencies = [
  "miniz_oxide",
  "tempfile",
  "tracing",
- "victory-formats",
- "victory-pipeline",
- "victory-shader",
+ "vortex-formats",
+ "vortex-pipeline",
+ "vortex-shader",
  "windows",
  "windows-sys",
 ]
 
 [[package]]
-name = "victory-hle"
+name = "vortex-hle"
 version = "0.1.0"
 dependencies = [
  "miniz_oxide",
  "opus-pure",
  "tempfile",
  "tracing",
- "victory-formats",
- "victory-gpu",
- "victory-loader",
- "victory-pe",
+ "vortex-formats",
+ "vortex-gpu",
+ "vortex-loader",
+ "vortex-pe",
  "windows",
  "windows-core",
  "windows-sys",
 ]
 
 [[package]]
-name = "victory-loader"
+name = "vortex-loader"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -726,13 +726,13 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
- "victory-core",
- "victory-pe",
+ "vortex-core",
+ "vortex-pe",
  "windows-sys",
 ]
 
 [[package]]
-name = "victory-pe"
+name = "vortex-pe"
 version = "0.1.0"
 dependencies = [
  "object",
@@ -740,18 +740,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "victory-pipeline"
+name = "vortex-pipeline"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
  "tempfile",
  "tracing",
- "victory-core",
+ "vortex-core",
 ]
 
 [[package]]
-name = "victory-shader"
+name = "vortex-shader"
 version = "0.1.0"
 dependencies = [
  "miniz_oxide",

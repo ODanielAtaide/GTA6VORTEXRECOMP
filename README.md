@@ -50,7 +50,7 @@ Optional experimental performance profile:
 cargo build --profile performance -p vortex --locked
 ```
 
-Internal crate names, config names, log targets and VICTORY_* variables remain stable for upstream compatibility. Use the [benchmark instructions](docs/BENCHMARKS.md) for authorized or original workloads. No FPS improvement from the performance profile is claimed without a controlled measurement.
+Internal crates, log targets, root marker, configuration and environment variables use the Vortex namespace. Set VORTEX_* variables and use vortex.toml. The default local cache and data directory is now named vortex; existing user data is not automatically moved. Use the [benchmark instructions](docs/BENCHMARKS.md) for authorized or original workloads. No FPS improvement from the performance profile is claimed without a controlled measurement.
 
 ## Join the project
 

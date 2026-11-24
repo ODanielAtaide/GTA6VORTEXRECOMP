@@ -31,14 +31,14 @@ Commit links above refer to the repository's public history. All changes must be
 
 Windows 11 x64, Intel Core i5-9400, AMD Radeon RX 6600 XT (8 GB dedicated VRAM), 16 GB system RAM. Driver reported: 32.0.21045.29003. Direct3D feature level 12_2 reported by dxdiag.
 
-The release build succeeded. Local test output from before the latest texture-queue changes:
+The release build succeeded. Local test output from before the latest texture-queue changes and namespace migration (suite names below use the current naming):
 
 | Suite | Passed | Failed | Ignored |
 |---|---:|---:|---:|
-| victory-gpu | 111 | 0 | 1 |
-| victory-formats | 27 | 0 | 4 |
-| victory-pipeline | 5 | 0 | 0 |
-| victory-shader | 210 | 0 | 2 |
+| vortex-gpu | 111 | 0 | 1 |
+| vortex-formats | 27 | 0 | 4 |
+| vortex-pipeline | 5 | 0 | 0 |
+| vortex-shader | 210 | 0 | 2 |
 | Explicit ignored texture-check benchmark | 1 | 0 | — |
 | Total successful invocations | 354 | 0 | — |
 

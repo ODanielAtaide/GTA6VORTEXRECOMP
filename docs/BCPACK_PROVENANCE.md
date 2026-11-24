@@ -10,4 +10,4 @@ The repository owner confirmed redistribution authorization before requesting th
 
 This subsequent addition supersedes the original source import's exclusion of the file. The binary is reproduced byte-for-byte; it is not a game executable. Compilation and runtime validation remain separate tasks.
 
-The binary now resides at the original root-relative path `crates/victory-formats/src/bcpack-tables.bin` after the workspace migration.
+The binary now resides at `crates/vortex-formats/src/bcpack-tables.bin` after the namespace migration; its bytes and original attribution are unchanged.

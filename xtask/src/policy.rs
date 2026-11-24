@@ -20,7 +20,7 @@ const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
     ".gitattributes",
     ".editorconfig",
-    ".victory-root",
+    ".vortex-root",
     "pre-commit",
     "LICENSE",
     "LICENSE-MIT",
@@ -29,7 +29,7 @@ const ALLOWED_NAMES: &[&str] = &[
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
 const EXCEPTIONS: &[(&str, &str)] = &[(
-    "crates/victory-formats/src/bcpack-tables.bin",
+    "crates/vortex-formats/src/bcpack-tables.bin",
     "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
 )];
 

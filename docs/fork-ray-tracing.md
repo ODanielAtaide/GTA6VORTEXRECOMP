@@ -48,7 +48,7 @@ shaders and emulates the one instruction.
 3. **The ray test, emulated in DXIL.** Four slab tests and a sorting network
    for box nodes; a watertight ray/triangle test for triangle nodes; both forms
    of the instruction. A plain Rust reference lives in
-   `crates/victory-shader/src/bvh.rs`; tests run the emitted DXIL on the GPU
+   `crates/vortex-shader/src/bvh.rs`; tests run the emitted DXIL on the GPU
    over 311 ray/node cases and compare with the reference bit for bit.
 4. **The trace and shading programs translate** (59 of 64 trace programs, and
    the irradiance-cache shading program). This needed lane masks treated as
@@ -56,14 +56,14 @@ shaders and emulates the one instruction.
    64-lane waves running on a GPU with 32-lane waves.
 5. **A safety rule on the host side.** The builder's stages run only while
    every builder pipeline the title has created has a host pipeline; otherwise
-   none run (`VICTORY_BVH_BUILDER=1` asks for it; `VICTORY_BVH_QUARANTINE=1`
+   none run (`VORTEX_BVH_BUILDER=1` asks for it; `VORTEX_BVH_QUARANTINE=1`
    also keeps the builder's stores out of title memory, for a first test). A
    partly working builder wrote garbage bounds into title memory and crashed
    the title.
 
 ## Known gaps
 
-- With `VICTORY_BVH_BUILDER=1` the builder still stays off in a real run: a few
+- With `VORTEX_BVH_BUILDER=1` the builder still stays off in a real run: a few
   of its pipelines are refused by the host (they still ask for 64-lane waves on
   a 32-lane GPU) or do not translate.
 - Five shadow-mask trace programs do not translate yet.
@@ -76,10 +76,10 @@ shaders and emulates the one instruction.
 
 ## Where to look
 
-- `crates/victory-shader/src/bvh.rs`: the reference for the node test.
-- `crates/victory-shader/src/emit/lower.rs`: the lowering of the two
+- `crates/vortex-shader/src/bvh.rs`: the reference for the node test.
+- `crates/vortex-shader/src/emit/lower.rs`: the lowering of the two
   instructions and of memory by address (`Lower::memory`).
-- `crates/victory-shader/src/resource.rs`: address tracking for descriptors
+- `crates/vortex-shader/src/resource.rs`: address tracking for descriptors
   and raw addresses.
-- `crates/victory-gpu/src/pipeline.rs`, `draw.rs`: the builder rule and the
+- `crates/vortex-gpu/src/pipeline.rs`, `draw.rs`: the builder rule and the
   host side of root views and title memory.
