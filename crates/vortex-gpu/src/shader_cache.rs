@@ -63,6 +63,9 @@ fn build() -> &'static [u8; 32] {
                 "VORTEX_WAVE_DEEP_SKIPS",
                 "VORTEX_WAVE_OWN_BITS",
                 "VORTEX_F16_NEAREST",
+                "VORTEX_WAVE_LOCAL",
+                "VORTEX_MESH_OUTPUT_STRICT",
+                "VORTEX_STRICT_JOINS",
             ] {
                 hasher.update(name.as_bytes());
                 hasher.update(b"=");
@@ -101,12 +104,31 @@ fn hash_reader(hasher: &mut blake3::Hasher, mut input: impl std::io::Read) -> st
     }
 }
 
+/// Device-dependent settings are sampled for each lookup: the view heap
+/// limit can be established after startup. The executable fingerprint
+/// alone cannot distinguish different adapters or heap configurations.
+fn device_key(base: &[u8; 32], wave: u32, view_limit: u32) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"vortex.shader.device.v1");
+    h.update(base);
+    h.update(&wave.to_le_bytes());
+    h.update(&view_limit.to_le_bytes());
+    *h.finalize().as_bytes()
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| vortex_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => {
+            let key = device_key(
+                build(),
+                vortex_shader::emit::host_max_wave(),
+                vortex_shader::emit::view_heap_limit(),
+            );
+            cached(cache, &key, container, translate)
+        }
         None => translate(container),
     }
 }
@@ -471,6 +493,17 @@ mod tests {
         });
         assert!(result.unwrap_err().contains("conversion failed"));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn shader_cache_keys_distinguish_device_translation_limits() {
+        let base = [7u8; 32];
+        let baseline = device_key(&base, 64, 0);
+        assert_eq!(baseline, device_key(&base, 64, 0));
+        assert_ne!(baseline, device_key(&base, 32, 0));
+        assert_ne!(baseline, device_key(&base, 64, 999_999));
+        assert_ne!(baseline, device_key(&[8; 32], 64, 0));
+        assert_ne!(device_key(&base, 32, 0), device_key(&base, 0, 32));
     }
 
     #[test]
