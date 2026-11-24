@@ -313,7 +313,7 @@ fn workers() -> bool {
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
-                            super::library::save(false);
+                            super::library::request_save();
                         }
                     }
                 });
@@ -342,7 +342,7 @@ fn drained() {
             "host pipelines all made"
         );
     }
-    super::library::save(false);
+    super::library::request_save();
 }
 
 #[cfg(test)]

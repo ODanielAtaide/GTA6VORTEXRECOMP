@@ -47,10 +47,10 @@
 //! 16,352 of 16,384 pages read zeros with the handle closed, none with it
 //! open (the test below). `VORTEX_LIBRARY_HANDLE=0`: closed, as before.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -407,14 +407,22 @@ unsafe impl Send for Library {}
 // SAFETY: as above; the other fields are an atomic and a lock.
 unsafe impl Sync for Library {}
 
-/// Held by a load of the pipeline named `name`: loads of the same name
-/// wait for each other (the host's one exception to the library's thread
-/// safety: such a load may change that pipeline's entry). Names share 64
-/// locks, so two different names seldom wait.
-fn same_name(name: &str) -> MutexGuard<'static, ()> {
-    static LOADING: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
-    let at = name.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(usize::from(b)));
-    LOADING[at % LOADING.len()].lock().unwrap_or_else(|e| e.into_inner())
+/// One lock for the complete load/compile/store sequence of an exact name.
+/// Different names remain independent, including during expensive compiles.
+/// Weak entries allow unused locks to be reclaimed.
+fn same_name(name: &str) -> Arc<Mutex<()>> {
+    static NAMES: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
+    let mut names = NAMES.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = names.get(name).and_then(Weak::upgrade) {
+        return existing;
+    }
+    if names.len() >= 4096 {
+        names.retain(|_, lock| lock.strong_count() != 0);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    names.insert(name.to_owned(), Arc::downgrade(&lock));
+    lock
 }
 
 /// With `VORTEX_LIBRARY_LOCK=1`: held by every library call, as before.
@@ -517,9 +525,10 @@ pub(crate) fn pipeline(
         return create();
     };
     let began = std::time::Instant::now();
+    let name_lock = same_name(name);
+    let _one = name_lock.lock().unwrap_or_else(|e| e.into_inner());
     let loaded = {
         let _all = one_call();
-        let _one = same_name(name);
         let _call = call("load", name);
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
@@ -537,7 +546,7 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
-    // Compiled outside any lock: compiles take up to seconds.
+    // Compiled outside global locks: only another request for this exact name waits.
     let pso = {
         let _call = call("make", name);
         create()?
@@ -561,9 +570,53 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
+/// Request a periodic save without occupying a pipeline compilation worker.
+/// The one-slot channel coalesces requests while a save is in progress.
+/// Explicit shutdown saves still call save(true) synchronously.
+pub(crate) fn request_save() {
+    if DIR.get().is_none() {
+        return;
+    }
+    static WRITER: OnceLock<Option<std::sync::mpsc::SyncSender<()>>> = OnceLock::new();
+    let writer = WRITER.get_or_init(|| {
+        let (send, recv) = std::sync::mpsc::sync_channel(1);
+        match std::thread::Builder::new().name("vortex-pipeline-cache".into()).spawn(move || {
+            while recv.recv().is_ok() {
+                save(false);
+            }
+        }) {
+            Ok(_) => Some(send),
+            Err(e) => {
+                tracing::warn!(error = %e, "no pipeline cache writer");
+                None
+            }
+        }
+    });
+    if let Some(writer) = writer {
+        match writer.try_send(()) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => {}
+            Err(std::sync::mpsc::TrySendError::Disconnected(())) => save(false),
+        }
+    } else {
+        save(false);
+    }
+}
+
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
+    // Serialize the complete publication, including the shared temporary
+    // paths, with shutdown saves. Periodic saves need not wait.
+    static PUBLICATION: Mutex<()> = Mutex::new(());
+    let _publication = if now {
+        PUBLICATION.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        match PUBLICATION.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        }
+    };
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
@@ -583,33 +636,42 @@ pub(crate) fn save(now: bool) {
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
     // of the library again: run 60's second save).
-    let bytes = {
+    let (bytes, saved_count) = {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
+        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+        if !used_changed && added == 0 {
             return;
         }
         if added == 0 {
-            0
+            (0, 0)
         } else {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
             let _call = call("serialise", "the whole library");
             if let Err(e) = serialise(&library.library, &tmp, size) {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
+                if used_changed {
+                    USED_CHANGED.store(true, Ordering::Relaxed);
+                }
                 let _ = std::fs::remove_file(&tmp);
                 return;
             }
             library.added.store(0, Ordering::Relaxed);
-            SAVED.store(size as u64, Ordering::Relaxed);
-            size
+            (size, added)
         }
     };
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+    if library_written.is_err() {
+        // Keep the failed batch dirty without overwriting additions made
+        // after serialization released its exclusive lock.
+        library.added.fetch_add(saved_count, Ordering::Relaxed);
+    }
     if bytes > 0 && library_written.is_ok() {
+        SAVED.store(bytes as u64, Ordering::Relaxed);
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
@@ -634,7 +696,10 @@ pub(crate) fn save(now: bool) {
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Err(e) => {
+            USED_CHANGED.store(true, Ordering::Relaxed);
+            tracing::warn!(error = %e, "host pipeline library not saved");
+        }
     }
 }
 
@@ -710,6 +775,18 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identical_pipeline_names_share_a_lock_but_distinct_names_do_not() {
+        let a = same_name("regression-pipeline-a");
+        let a2 = same_name("regression-pipeline-a");
+        let b = same_name("regression-pipeline-b");
+        assert!(Arc::ptr_eq(&a, &a2));
+        assert!(!Arc::ptr_eq(&a, &b));
+        let _held = a.lock().unwrap();
+        assert!(a2.try_lock().is_err());
+        assert!(b.try_lock().is_ok());
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
