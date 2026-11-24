@@ -78,13 +78,31 @@ pub fn file_header_offset(data: &[u8]) -> Option<usize> {
 
 /// Offset of data directory `index` from the start of the file.
 pub fn data_directory_offset(data: &[u8], index: usize) -> Option<usize> {
+    let file = file_header_offset(data)?;
+    let signature = file.checked_sub(NT_SIGNATURE_SIZE)?;
+    if data.get(..2)? != b"MZ" || signature < 64
+        || data.get(signature..file)? != b"PE\0\0"
+    {
+        return None;
+    }
     let opt = optional_header_offset(data)?;
-    let count = read_u32(data, opt.checked_add(OPT_NUMBER_OF_RVA_AND_SIZES)?)? as usize;
+    // SizeOfOptionalHeader belongs to IMAGE_FILE_HEADER, not the optional
+    // header. Respect it even if the buffer contains subsequent sections.
+    let size_at = file.checked_add(16)?;
+    let optional_size = u16::from_le_bytes(
+        data.get(size_at..size_at.checked_add(2)?)?.try_into().ok()?,
+    ) as usize;
+    let header = data.get(opt..opt.checked_add(optional_size)?)?;
+    if header.get(..2)? != 0x20bu16.to_le_bytes().as_slice() {
+        return None;
+    }
+    let count = read_u32(header, OPT_NUMBER_OF_RVA_AND_SIZES)? as usize;
     if index >= count {
         return None;
     }
-    opt.checked_add(OPT_DATA_DIRECTORY)?
-        .checked_add(index.checked_mul(DATA_DIRECTORY_SIZE)?)
+    let relative = OPT_DATA_DIRECTORY.checked_add(index.checked_mul(DATA_DIRECTORY_SIZE)?)?;
+    header.get(relative..relative.checked_add(DATA_DIRECTORY_SIZE)?)?;
+    opt.checked_add(relative)
 }
 
 pub fn read_u32(data: &[u8], at: usize) -> Option<u32> {
@@ -106,5 +124,39 @@ mod tests {
         let data = [0u8; 16];
         assert_eq!(read_u32(&data, usize::MAX - 1), None);
         assert_eq!(read_u64(&data, usize::MAX - 2), None);
+    }
+
+    fn directory_fixture() -> Vec<u8> {
+        let mut data = vec![0u8; 0x200];
+        data[..2].copy_from_slice(b"MZ");
+        data[DOS_E_LFANEW..DOS_E_LFANEW + 4].copy_from_slice(&64u32.to_le_bytes());
+        data[64..68].copy_from_slice(b"PE\0\0");
+        data[84..86].copy_from_slice(&240u16.to_le_bytes());
+        data[88..90].copy_from_slice(&0x20bu16.to_le_bytes());
+        data[196..200].copy_from_slice(&16u32.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn directory_offsets_respect_declared_header() {
+        let mut data = directory_fixture();
+        assert_eq!(data_directory_offset(&data, 0), Some(200));
+        assert_eq!(data_directory_offset(&data, 15), Some(320));
+        assert_eq!(data_directory_offset(&data, 16), None);
+        data[84..86].copy_from_slice(&112u16.to_le_bytes());
+        assert_eq!(data_directory_offset(&data, 0), None);
+    }
+
+    #[test]
+    fn directory_offsets_reject_wrong_format_and_truncation() {
+        let mut data = directory_fixture();
+        data[88..90].copy_from_slice(&0x10bu16.to_le_bytes());
+        assert_eq!(data_directory_offset(&data, 0), None);
+        let mut data = directory_fixture();
+        data.truncate(327);
+        assert_eq!(data_directory_offset(&data, 0), None);
+        let mut data = directory_fixture();
+        data[64] = 0;
+        assert_eq!(data_directory_offset(&data, 0), None);
     }
 }
