@@ -565,15 +565,69 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    merge_bytes::<false, false>(now, held, title)
+}
+
+/// Three-way byte merge. BASELINE_SOURCE selects which input is the old
+/// snapshot; MIRROR selects whether the mutable input receives the merged
+/// title bytes or just the observed GPU bytes (relay snapshots).
+fn merge_bytes<const BASELINE_SOURCE: bool, const MIRROR: bool>(
+    source: &[u8], other: &mut [u8], title: &mut [u8],
+) -> bool {
+    let len = source.len().min(other.len()).min(title.len());
+    #[cfg(target_arch = "x86_64")]
+    if len >= 128 && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the feature is available; the slices are disjoint
+        // where mutable, and the vector loop stays inside their lengths.
+        return unsafe { merge_avx2::<BASELINE_SOURCE, MIRROR>(source, other, title, len) };
+    }
+    merge_scalar::<BASELINE_SOURCE, MIRROR>(source, other, title)
+}
+
+fn merge_scalar<const BASELINE_SOURCE: bool, const MIRROR: bool>(
+    source: &[u8], other: &mut [u8], title: &mut [u8],
+) -> bool {
     let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
+    for ((s, o), t) in source.iter().zip(other.iter_mut()).zip(title.iter_mut()) {
+        let incoming = if BASELINE_SOURCE { *o } else { *s };
+        let wrote = if *s != *o { 0xffu8 } else { 0 };
+        let merged = (*t & !wrote) | (incoming & wrote);
         differs |= merged ^ *t;
         *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+        *o = if MIRROR { merged } else { incoming };
     }
     differs != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_avx2<const BASELINE_SOURCE: bool, const MIRROR: bool>(
+    source: &[u8], other: &mut [u8], title: &mut [u8], len: usize,
+) -> bool {
+    use std::arch::x86_64::*;
+    let whole = len / 32 * 32;
+    let mut changed = _mm256_setzero_si256();
+    for at in (0..whole).step_by(32) {
+        // SAFETY: 32-byte unaligned accesses are within the checked
+        // slice bounds; other and title are exclusive mutable slices.
+        unsafe {
+            let s = _mm256_loadu_si256(source.as_ptr().add(at).cast());
+            let o = _mm256_loadu_si256(other.as_ptr().add(at).cast());
+            let t = _mm256_loadu_si256(title.as_ptr().add(at).cast());
+            let equal = _mm256_cmpeq_epi8(s, o);
+            let incoming = if BASELINE_SOURCE { o } else { s };
+            let merged = _mm256_blendv_epi8(incoming, t, equal);
+            changed = _mm256_or_si256(changed, _mm256_xor_si256(merged, t));
+            _mm256_storeu_si256(title.as_mut_ptr().add(at).cast(), merged);
+            _mm256_storeu_si256(other.as_mut_ptr().add(at).cast(), if MIRROR { merged } else { incoming });
+        }
+    }
+    // Do not short-circuit the tail: it must be merged even when a vector
+    // already differed.
+    let tail = merge_scalar::<BASELINE_SOURCE, MIRROR>(
+        &source[whole..len], &mut other[whole..len], &mut title[whole..len],
+    );
+    _mm256_testz_si256(changed, changed) == 0 || tail
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -602,6 +656,67 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
 #[cfg(test)]
 mod relay_tests {
     use super::{Flights, changed_runs, merge_piece, outside};
+
+    #[test]
+    fn vector_merges_match_scalar_for_all_modes_and_unaligned_tails() {
+        fn check<const B: bool, const M: bool>() {
+            for len in [0usize, 1, 31, 32, 33, 127, 128, 129, 255, 256, 257, 65536, 65539] {
+                let source: Vec<u8> = (0..len + 7).map(|i| (i * 19 + i / 17) as u8).collect();
+                for pattern in [0usize, 1, 7, 32] {
+                    let mut other = source.clone();
+                    if pattern != 0 {
+                        for at in (3..len + 3).step_by(pattern) {
+                            other[at] ^= 0x81;
+                        }
+                    }
+                    let mut title: Vec<u8> = (0..len + 7).map(|i| (i * 5 + 23) as u8).collect();
+                    let (mut expected_other, mut expected_title) = (other.clone(), title.clone());
+                    let expected = super::merge_scalar::<B, M>(
+                        &source[3..3 + len], &mut expected_other[3..3 + len], &mut expected_title[3..3 + len],
+                    );
+                    let actual = super::merge_bytes::<B, M>(
+                        &source[3..3 + len], &mut other[3..3 + len], &mut title[3..3 + len],
+                    );
+                    assert_eq!(actual, expected);
+                    assert_eq!(other, expected_other);
+                    assert_eq!(title, expected_title);
+                }
+            }
+        }
+        check::<false, false>();
+        check::<false, true>();
+        check::<true, true>();
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn vector_merge_benchmark() {
+        const LEN: usize = 16 << 20;
+        let old = vec![0x11u8; LEN];
+        let mut incoming = old.clone();
+        for at in (0..LEN).step_by(17) {
+            incoming[at] ^= 0x40;
+        }
+        let baseline_title = vec![0x37u8; LEN];
+        let mut scalar_times = Vec::new();
+        let mut vector_times = Vec::new();
+        for _ in 0..5 {
+            let (mut a, mut t) = (incoming.clone(), baseline_title.clone());
+            let (mut b, mut u) = (incoming.clone(), baseline_title.clone());
+            let start = std::time::Instant::now();
+            let changed_a = super::merge_scalar::<true, true>(&old, &mut a, &mut t);
+            scalar_times.push(start.elapsed());
+            let start = std::time::Instant::now();
+            let changed_b = super::merge_bytes::<true, true>(&old, &mut b, &mut u);
+            vector_times.push(start.elapsed());
+            assert_eq!(changed_a, changed_b);
+            assert_eq!(a, b);
+            assert_eq!(t, u);
+        }
+        scalar_times.sort_unstable();
+        vector_times.sort_unstable();
+        eprintln!("16 MiB three-way merge: scalar median {:?}, dispatched median {:?}", scalar_times[2], vector_times[2]);
+    }
 
     /// A range two flights declared is free only when both are done, in
     /// either order; a submission that declares it many times counts once.
@@ -2012,15 +2127,7 @@ impl Shadow {
                 // the GPU's byte where the copy's byte is not what it was
                 // before the submission, else the title's. (With the two
                 // searches above this was 44 ms a frame for 970 pieces.)
-                let mut differs = 0u8;
-                for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                    let gpu = if *h != *o { 0xffu8 } else { 0 };
-                    let merged = (*t & !gpu) | (*h & gpu);
-                    differs |= merged ^ *t;
-                    *t = merged;
-                    *h = merged;
-                }
-                if differs != 0 {
+                if merge_bytes::<true, true>(old, host, title) {
                     crate::watch::writing(start + at, n);
                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                     written += n;
@@ -2633,15 +2740,7 @@ impl Shadow {
         if crate::host::read_into((start + at) as *const u8, title) {
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
-            let mut differs = 0u8;
-            for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
-                let wrote = if *g != *o { 0xffu8 } else { 0 };
-                let merged = (*t & !wrote) | (*g & wrote);
-                differs |= merged ^ *t;
-                *t = merged;
-                *o = merged;
-            }
-            if differs != 0 {
+            if merge_bytes::<false, true>(gpu, old, title) {
                 crate::watch::writing(start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
