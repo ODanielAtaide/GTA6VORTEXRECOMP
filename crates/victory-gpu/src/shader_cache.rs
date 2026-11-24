@@ -43,7 +43,7 @@ pub(crate) fn counts() -> (u64, u64) {
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
+        let exe = std::env::current_exe().and_then(std::fs::File::open);
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -51,32 +51,31 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                // Which group barriers wait is part of the translation too.
-                bytes.push(victory_shader::emit::group_sync());
-                // So are the switches that pick the form of a wave64 program:
-                // without them here a run with `VICTORY_WAVE_WIDE=0` was
-                // served the translations an earlier run of the same
-                // executable had cached with the switch unset.
-                for name in [
-                    "VICTORY_WAVE_WIDE",
-                    "VICTORY_WAVE_DEEP_SKIPS",
-                    "VICTORY_WAVE_OWN_BITS",
-                    "VICTORY_F16_NEAREST",
-                ] {
-                    bytes.extend_from_slice(name.as_bytes());
-                    bytes.push(b'=');
-                    if let Some(value) = std::env::var_os(name) {
-                        bytes.extend_from_slice(value.as_encoded_bytes());
-                    }
-                    bytes.push(0);
+        let hash = exe.and_then(|file| {
+            let mut hasher = blake3::Hasher::new();
+            // Stream the image instead of allocating another full executable
+            // in memory. Preserve the order of the existing key inputs.
+            hash_reader(&mut hasher, file)?;
+            hasher.update(&limit.to_le_bytes());
+            hasher.update(&[victory_shader::emit::group_sync()]);
+            for name in [
+                "VICTORY_WAVE_WIDE",
+                "VICTORY_WAVE_DEEP_SKIPS",
+                "VICTORY_WAVE_OWN_BITS",
+                "VICTORY_F16_NEAREST",
+            ] {
+                hasher.update(name.as_bytes());
+                hasher.update(b"=");
+                if let Some(value) = std::env::var_os(name) {
+                    hasher.update(value.as_encoded_bytes());
                 }
-                // And which clean-up passes ran over the translated code.
-                bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
-                *blake3::hash(&bytes).as_bytes()
+                hasher.update(&[0]);
             }
+            hasher.update(&victory_shader::emit::shader_opt().to_le_bytes());
+            Ok(*hasher.finalize().as_bytes())
+        });
+        match hash {
+            Ok(key) => key,
             Err(e) => {
                 // Without it no entry can be trusted: a fresh key per run.
                 tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
@@ -87,6 +86,19 @@ fn build() -> &'static [u8; 32] {
             }
         }
     })
+}
+
+/// Read in bounded chunks; Interrupted reads are retried.
+fn hash_reader(hasher: &mut blake3::Hasher, mut input: impl std::io::Read) -> std::io::Result<()> {
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        match input.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(n) => { hasher.update(&buffer[..n]); }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// The translation of a console shader container, from the cache when
@@ -402,6 +414,17 @@ mod tests {
             }
         }
         files
+    }
+
+    #[test]
+    fn streamed_hash_matches_contiguous_input() {
+        for len in [0, 1, 65536, 65537, 190001] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let mut h = blake3::Hasher::new();
+            hash_reader(&mut h, data.as_slice()).unwrap();
+            h.update(b"settings");
+            assert_eq!(h.finalize(), blake3::hash(&[data.as_slice(), b"settings"].concat()));
+        }
     }
 
     #[test]

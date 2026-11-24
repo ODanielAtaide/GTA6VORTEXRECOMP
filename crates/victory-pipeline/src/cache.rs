@@ -65,11 +65,19 @@ impl Cache {
             .open(&tmp)?;
         let written = file.write_all(&output);
         drop(file);
-        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
-        if published.is_err() {
+        if let Err(e) = written {
             let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
         }
-        published?;
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            // Another converter may have published this same content key
+            // first. Its complete output is valid; never hide an actual
+            // write failure or mistake a directory for a cache entry.
+            if !path.is_file() {
+                return Err(e.into());
+            }
+        }
         Ok(path)
     }
 }
@@ -117,6 +125,30 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(std::fs::read(&a).unwrap(), b"ABC");
         assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn concurrent_publication_returns_complete_output() {
+        struct Racing(std::sync::Barrier);
+        impl Converter for Racing {
+            fn id(&self) -> &'static str { "test.racing" }
+            fn version(&self) -> u32 { 1 }
+            fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+                self.0.wait();
+                Ok(input.to_ascii_uppercase())
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Racing(std::sync::Barrier::new(2));
+        let (a, b) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| cache.get_or_convert(&conv, b"race"));
+            let b = scope.spawn(|| cache.get_or_convert(&conv, b"race"));
+            (a.join().unwrap().unwrap(), b.join().unwrap().unwrap())
+        });
+        assert_eq!(a, b);
+        assert_eq!(std::fs::read(&a).unwrap(), b"RACE");
+        assert_eq!(std::fs::read_dir(a.parent().unwrap()).unwrap().count(), 1);
     }
 
     #[test]

@@ -17,3 +17,7 @@ Public CLI package and executable renamed to `vortex`; window branding renamed t
 ## Packed linear texture copy
 
 For linear subresources with equal, tightly packed source and destination row pitches, coalesce all active rows into one copy per depth slice. Padded and tiled layouts use the original path. Added three synthetic regression tests. This reduces copy invocations for the eligible case; a frame-rate benefit is not yet measured.
+
+## Bounded shader fingerprinting and concurrent cache publication
+
+Stream the executable fingerprint in 64 KiB chunks instead of loading an extra copy of the executable. Preserve the existing key inputs and order. Handle concurrent publication of the same content-addressed cache entry without reporting a false failure when another writer has already published it. Added synthetic hash-equivalence and concurrent-publication tests. This targets transient memory use and cache robustness, not verified rendering throughput.
