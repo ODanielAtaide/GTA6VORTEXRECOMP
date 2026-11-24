@@ -341,12 +341,26 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// An explicit limit lets constrained machines reserve CPU time for
+/// submitting commands and servicing memory. Invalid values retain the
+/// original automatic selection.
+fn worker_count(logical: usize, asked: Option<&str>) -> usize {
+    let default = (logical / 2).clamp(2, 8);
+    asked.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .map_or(default, |n| n.min(logical.max(1)).min(16))
+}
+
+/// Starts the workers (half the logical processors, 2 to 8 by default)
+/// on first use. VORTEX_PIPELINE_WORKERS may explicitly limit concurrency.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let asked = std::env::var("VORTEX_PIPELINE_WORKERS").ok();
+        let workers = worker_count(logical, asked.as_deref());
+        tracing::info!(workers, logical, "pipeline compilation worker count");
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("vortex-pipelines-{i}"))
@@ -397,6 +411,19 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_limit_preserves_automatic_default_and_bounds_override() {
+        assert_eq!(worker_count(6, None), 3);
+        assert_eq!(worker_count(32, None), 8);
+        assert_eq!(worker_count(1, None), 2);
+        assert_eq!(worker_count(6, Some("1")), 1);
+        assert_eq!(worker_count(6, Some(" 2 ")), 2);
+        assert_eq!(worker_count(6, Some("64")), 6);
+        assert_eq!(worker_count(64, Some("64")), 16);
+        assert_eq!(worker_count(6, Some("0")), 3);
+        assert_eq!(worker_count(6, Some("oops")), 3);
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).

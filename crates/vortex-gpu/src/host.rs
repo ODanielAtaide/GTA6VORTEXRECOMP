@@ -703,6 +703,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn packed_readback_rows_preserve_padded_layouts() {
+        for (row, rows, pitch) in [(256usize, 7usize, 256usize), (512, 3, 512), (257, 9, 300), (16, 5, 32), (0, 4, 16), (256, 0, 256)] {
+            let source_pitch = row.next_multiple_of(256);
+            let source: Vec<u8> = (0..source_pitch * rows).map(|i| (i % 251) as u8).collect();
+            let mut expected = vec![0xDA; pitch * rows];
+            for line in 0..rows {
+                expected[line * pitch..line * pitch + row].copy_from_slice(&source[line * source_pitch..line * source_pitch + row]);
+            }
+            let mut actual = vec![0xDA; pitch * rows];
+            // SAFETY: private independent buffers, sized for all rows.
+            unsafe { copy_readback_rows(source.as_ptr(), actual.as_mut_ptr(), row, rows, pitch); }
+            assert_eq!(actual, expected, "row={row}, rows={rows}, pitch={pitch}");
+        }
+    }
+
+    #[test]
     fn gpu_upload_preserves_local_memory_headroom() {
         let gib = 1u64 << 30;
         assert!(!gpu_upload_room(0, 0, 1));
@@ -3211,11 +3227,31 @@ fn read_backs(list: &HostList) {
         // copy was recorded).
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
-                let from = data.cast::<u8>().cast_const();
-                for line in 0..*rows {
-                    std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
-                }
+                copy_readback_rows(data.cast::<u8>().cast_const(), *at as *mut u8, *row, *rows, *pitch);
                 buffer.Unmap(0, None);
+            }
+        }
+    }
+}
+
+/// Copy a D3D12 footprint to the CPU layout without copying row padding.
+/// # Safety
+///: the caller owns both non-overlapping buffers and guarantees
+/// they contain the described rows.
+unsafe fn copy_readback_rows(from: *const u8, to: *mut u8, row: usize, rows: usize, pitch: usize) {
+    if row == 0 || rows == 0 {
+        return;
+    }
+    let source_pitch = row.next_multiple_of(256);
+    // SAFETY: the caller guarantees the full footprint and destination.
+    unsafe {
+        if source_pitch == row && pitch == row {
+            if let Some(bytes) = row.checked_mul(rows) {
+                std::ptr::copy_nonoverlapping(from, to, bytes);
+            }
+        } else {
+            for line in 0..rows {
+                std::ptr::copy_nonoverlapping(from.add(line * source_pitch), to.add(line * pitch), row);
             }
         }
     }

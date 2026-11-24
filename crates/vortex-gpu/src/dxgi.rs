@@ -247,7 +247,7 @@ fn parse_display_size(value: &str) -> Option<(u32, u32)> {
 /// These presets report a display mode only; they never resize title
 /// resources or override its internal render dimensions.
 fn select_display_size(mode: Option<&str>, profile: Option<&str>) -> (u32, u32) {
-    mode.and_then(parse_display_size).unwrap_or_else(|| match profile {
+    mode.and_then(parse_display_size).unwrap_or(match profile {
         Some("ultra") => (960, 540),
         Some("performance") => (1280, 720),
         Some("quality") => (1920, 1080),
