@@ -1,0 +1,123 @@
+name: Vortex namespace migration
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rename-runtime.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: vortex-namespace-migration
+  cancel-in-progress: false
+jobs:
+  migrate:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      revision: ${{ steps.publish.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Rename tracked source and configuration
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, subprocess
+          old = "vic" + "tory"
+          pattern = re.compile(old, re.IGNORECASE)
+          def rename(match):
+              s = match.group()
+              return "VORTEX" if s.isupper() else "vortex" if s.islower() else "Vortex"
+          def renamed(s):
+              return pattern.sub(rename, s)
+          def git(*args):
+              return subprocess.check_output(["git", *args])
+          paths = [p.decode() for p in git("ls-files", "-z").split(b"\0") if p]
+          credits = {"AUTHORS.md", "docs/UPSTREAM_CREDITS.md", "docs/SOURCE_IMPORT.md", "docs/BCPACK_PROVENANCE.md", "LICENSE"}
+          attribution = ("copyright", "spdx-filecopyrighttext", "github.com/marvisak/", "github.com/fxceless/")
+          for name in paths:
+              p = pathlib.Path(name)
+              if name in credits or name.startswith(".github/workflows/") or p.suffix == ".bin":
+                  continue
+              raw = p.read_bytes()
+              src = raw.decode("utf-8")
+              lines = []
+              for line in src.splitlines(keepends=True):
+                  # Preserve copyright notices and real upstream links.
+                  # These are attribution rather than runtime branding.
+                  if any(term in line.lower() for term in attribution):
+                      lines.append(line)
+                  elif name == "docs/README.pt-BR.md" and "projetos públicos" in line:
+                      lines.append(line)
+                  else:
+                      lines.append(renamed(line))
+              out = "".join(lines).encode("utf-8")
+              if out != raw:
+                  p.write_bytes(out)
+          # Move directories and root configuration in one change, including
+          # the format table as an unchanged blob.
+          for p in [*pathlib.Path("crates").iterdir(), *pathlib.Path("apps").iterdir(),
+                    pathlib.Path("." + old + "-root"), pathlib.Path(old + ".example.toml")]:
+              if p.exists() and pattern.search(p.name):
+                  p.rename(p.with_name(renamed(p.name)))
+          readme = pathlib.Path("README.md")
+          s = readme.read_text(encoding="utf-8")
+          s = s.replace("Internal crate names, config names, log targets and VORTEX_* variables remain stable for upstream compatibility.",
+                        "Internal crates, log targets, root marker, configuration and environment variables use the Vortex namespace. Set VORTEX_* variables and use vortex.toml. The default local cache and data directory is now named vortex; existing user data is not automatically moved.")
+          readme.write_text(s, encoding="utf-8")
+          p = pathlib.Path("docs/DEVELOPMENT_STATUS.md")
+          s = p.read_text(encoding="utf-8")
+          s = s.replace("Local test output from before the latest texture-queue changes:", "Local test output from before the latest texture-queue changes and namespace migration (suite names below use the current naming):")
+          p.write_text(s, encoding="utf-8")
+          # Keep historical original paths in provenance; record current path.
+          p = pathlib.Path("docs/BCPACK_PROVENANCE.md")
+          s = p.read_text(encoding="utf-8")
+          s = s.replace("The binary now resides at the original root-relative path `crates/" + old + "-formats/src/bcpack-tables.bin` after the workspace migration.",
+                        "The binary now resides at `crates/vortex-formats/src/bcpack-tables.bin` after the namespace migration; its bytes and original attribution are unchanged.")
+          p.write_text(s, encoding="utf-8")
+          # Ensure the original binary is byte-for-byte preserved.
+          assert git("hash-object", "crates/vortex-formats/src/bcpack-tables.bin").strip() == b"1e548501764588b06e2ed47aa7fed263cd797f3b"
+          subprocess.check_call(["git", "add", "-A"])
+          # All remaining legacy occurrences must be credit/history notices.
+          leftovers = []
+          for name in [p.decode() for p in git("ls-files", "-z").split(b"\0") if p]:
+              if name in credits or name.startswith(".github/workflows/") or name.endswith(".bin"):
+                  continue
+              assert not pattern.search(name), name
+              for i, line in enumerate(pathlib.Path(name).read_text(encoding="utf-8").splitlines(), 1):
+                  if pattern.search(line):
+                      if any(term in line.lower() for term in attribution) or (name == "docs/README.pt-BR.md" and "projetos públicos" in line):
+                          print("Attribution retained:", name, i)
+                      else:
+                          leftovers.append((name, i))
+          assert not leftovers, leftovers
+          PY
+          git diff --cached --stat
+      - name: Publish atomic rename
+        id: publish
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --cached --quiet; then
+            git commit -m "Rename runtime crates, configuration and source namespace to Vortex"
+            git push origin HEAD:refs/heads/main
+          fi
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  validate:
+    needs: migrate
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.migrate.outputs.revision }}
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo metadata --locked --no-deps --format-version 1
+      - run: cargo test --workspace --locked
+      - run: cargo build --release -p vortex --locked
+      - run: .\target\release\vortex.exe --help
