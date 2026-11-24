@@ -1296,6 +1296,43 @@ mod wide_tests {
         }
     }
 
+    /// A freely shareable CPU benchmark: compare exactly the same
+    /// 64 MiB of synthetic data using serial ranges and persistent workers.
+    #[test]
+    #[ignore = "benchmark"]
+    fn parallel_scan_benchmark() {
+        const LEN: usize = 64 << 20;
+        const RANGE: usize = 256 << 10;
+        let old = vec![0xabu8; LEN];
+        let mut now = old.clone();
+        for at in (0..LEN).step_by(7 * PIECE + 31) {
+            now[at] ^= 1;
+        }
+        let scans: Vec<_> = (0..LEN).step_by(RANGE)
+            .map(|at| (now.as_ptr() as usize, old.as_ptr() as usize, 0, at, at + RANGE))
+            .collect();
+        // Warm the persistent worker pool before measuring.
+        let _ = find_pieces(scans.clone());
+        let mut serial_times = Vec::new();
+        let mut parallel_times = Vec::new();
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            let expected: Vec<Vec<(usize, usize)>> = (0..LEN).step_by(RANGE)
+                .map(|from| (from..from + RANGE).step_by(PIECE)
+                    .filter(|&at| now[at..at + PIECE] != old[at..at + PIECE])
+                    .map(|at| (at, PIECE)).collect()).collect();
+            serial_times.push(started.elapsed());
+            let started = std::time::Instant::now();
+            let actual = find_pieces(scans.clone());
+            parallel_times.push(started.elapsed());
+            assert_eq!(actual, expected);
+        }
+        serial_times.sort_unstable();
+        parallel_times.sort_unstable();
+        eprintln!("64 MiB synthetic scan, 256 ranges: serial median {:?}, parallel median {:?}",
+            serial_times[2], parallel_times[2]);
+    }
+
     /// Copies cut into jobs copy every byte once: long ones, short ones
     /// and empty ones.
     #[test]

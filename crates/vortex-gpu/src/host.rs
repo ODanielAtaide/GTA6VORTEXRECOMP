@@ -704,6 +704,15 @@ mod tests {
     }
 
     #[test]
+    fn batch_readback_avoids_small_or_single_range_submissions() {
+        assert!(!batch_readback_worthwhile(0, 0));
+        assert!(!batch_readback_worthwhile(8 << 20, 1));
+        assert!(!batch_readback_worthwhile((8 << 20) - 1, 32));
+        assert!(batch_readback_worthwhile(8 << 20, 2));
+        assert!(batch_readback_worthwhile(64 << 20, 512));
+    }
+
+    #[test]
     fn declarations_keep_first_seen_order_and_deduplicate_exact_ranges() {
         let mut index = DeclarationIndex::default();
         assert_eq!(index.insert(900, (0, 12)), Some(0));
@@ -2791,70 +2800,62 @@ fn read_backs(list: &HostList) {
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
 fn hand_back(back: &[Declared]) {
-    if crate::shadow::wide_back() {
-        // Every range first (the pieces that differ, found on several
-        // threads), then the merges, in order, as below.
-        let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        for (shadow, declared) in back {
-            if shadow.carded() {
-                continue;
-            }
-            let mut sorted = declared.clone();
-            sorted.sort_unstable();
-            let mut spans: Vec<(usize, usize)> = Vec::new();
-            for (from, to) in sorted {
-                match spans.last_mut() {
-                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                    _ => spans.push((from, to)),
-                }
-            }
-            work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
+    // Batch comparisons across independent host copies. Keep the original
+    // snapshot capture timing unless the separate wide-back option is on.
+    // Small submissions still take the direct path to avoid worker overhead.
+    let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    let mut bytes = 0usize;
+    for (shadow, declared) in back {
+        if shadow.carded() {
+            continue;
         }
+        let mut spans = Vec::new();
+        join_ranges(&mut spans, declared.iter().copied());
+        for (from, to) in spans {
+            bytes = bytes.saturating_add(to - from);
+            work.push((shadow.clone(), from, to));
+        }
+    }
+    let parallel = crate::shadow::wide_back() || batch_readback(bytes, work.len());
+    if parallel {
         #[cfg(feature = "diagnostics")]
         let scanning = std::time::Instant::now();
         let found = crate::shadow::find_all(&work);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
+        // Merge in the original copy/range order, not on the scan workers.
         for ((shadow, from, to), found) in work.iter().zip(found) {
             let written = shadow.copy_back_with(*from, to - from, Some(found));
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written);
         }
-        for (shadow, declared) in back {
-            shadow.copy_back_done(declared);
-        }
-        return;
-    }
-    for (shadow, declared) in back {
-        if shadow.carded() {
-            // Done before (`Host::card_back`).
-            shadow.copy_back_done(declared);
-            continue;
-        }
-        // Each byte compared once: the world declares dozens of views
-        // of its 174 MB heap that overlap almost entirely, and comparing
-        // every one whole was gigabytes a frame (0.3-0.5 s) for the few
-        // MB shaders wrote. Only ranges that overlap or touch are
-        // joined: what lies between two was not given to shaders (the
-        // snapshot does not hold it).
-        let mut sorted = declared.clone();
-        sorted.sort_unstable();
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-        for (from, to) in sorted {
-            match spans.last_mut() {
-                Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                _ => spans.push((from, to)),
-            }
-        }
-        for (from, to) in spans {
-            let written = shadow.copy_back(from, to - from);
+    } else {
+        for (shadow, from, to) in &work {
+            let written = shadow.copy_back(*from, to - from);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::compared(from, to - from, written);
+            crate::copystat::compared(*from, to - from, written);
         }
+    }
+    for (shadow, declared) in back {
         shadow.copy_back_done(declared);
     }
+}
+
+/// Separate the read-only comparison optimization from delayed snapshots.
+/// Set VORTEX_BATCH_READBACK=0 to retain per-range comparisons.
+fn batch_readback(bytes: usize, ranges: usize) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let enabled = *ON.get_or_init(|| {
+        std::env::var_os("VORTEX_BATCH_READBACK").is_none_or(|v| v != "0")
+            && std::thread::available_parallelism().is_ok_and(|n| n.get() >= 4)
+    });
+    enabled && batch_readback_worthwhile(bytes, ranges)
+}
+
+fn batch_readback_worthwhile(bytes: usize, ranges: usize) -> bool {
+    ranges > 1 && bytes >= 8 << 20
 }
 
 impl Host {

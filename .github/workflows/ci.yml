@@ -39,6 +39,8 @@ jobs:
         run: cargo test --workspace --locked
       - name: Build Vortex executable
         run: cargo build --release -p vortex --locked
+      - name: Synthetic readback benchmark
+        run: cargo test --release --locked -p vortex-gpu parallel_scan_benchmark -- --ignored --nocapture
       - name: Verify Vortex CLI
         run: .\target\release\vortex.exe --help
       - name: Check performance profile
