@@ -179,11 +179,15 @@ pub(crate) fn card_stats() -> [u64; 10] {
     out
 }
 
-/// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
-/// for each 64 KiB piece (a copy that does not start on a piece boundary
-/// has one piece more).
+/// Fingerprint storage for the selected compare shader. A skewed copy
+/// may use one extra piece. Parallel comparison keeps a separate 16-byte
+/// fingerprint per lane (1 KiB per 64 KiB piece).
+fn hash_storage(size: u64, parallel: bool) -> u64 {
+    (size / PIECE as u64 + 2) * if parallel { 1024 } else { 16 }
+}
+
 pub(crate) fn card_hash_bytes(size: u64) -> u64 {
-    (size / PIECE as u64 + 2) * 16
+    hash_storage(size, crate::host::parallel_card_compare())
 }
 
 /// A buffer of `size` bytes in the card's memory for a title buffer's
@@ -390,6 +394,16 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 #[cfg(test)]
 mod card_tests {
     use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+
+    #[test]
+    fn parallel_card_hash_storage_covers_every_lane() {
+        for size in [1u64, 65536, 65537, (1 << 30) - 1] {
+            let pieces = size.div_ceil(65536) + 1;
+            assert!(super::hash_storage(size, true) >= pieces * 64 * 16);
+            assert!(super::hash_storage(size, false) >= pieces * 16);
+            assert_eq!(super::hash_storage(size, true), super::hash_storage(size, false) * 64);
+        }
+    }
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]

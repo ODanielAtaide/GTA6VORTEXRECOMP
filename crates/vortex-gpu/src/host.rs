@@ -685,6 +685,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn card_compare_variants_compile() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        for source in [CARD_COMPARE, CARD_COMPARE_PARALLEL] {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: valid shader source and output pointer for this call.
+            unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(), source.len(),
+                    windows::core::s!("synthetic card comparison"),
+                    None, None, windows::core::s!("main"),
+                    windows::core::s!("cs_5_1"), 0, 0, &mut code, None,
+                ).unwrap();
+            }
+            assert!(code.is_some());
+        }
+    }
+
+    #[test]
+    fn card_compare_groups_match_the_shader_layouts() {
+        for pieces in [1u32, 63, 64, 65, 16385] {
+            assert_eq!(card_compare_groups(pieces, true), pieces);
+            assert_eq!(card_compare_groups(pieces, false), pieces.div_ceil(64));
+        }
+        // Every aligned 16-byte block of a piece has exactly one owner.
+        for blocks in [1usize, 63, 64, 65, 4095, 4096] {
+            let mut visited = vec![0u8; blocks];
+            for lane in 0..64 {
+                for at in (lane..blocks).step_by(64) {
+                    visited[at] += 1;
+                }
+            }
+            assert!(visited.iter().all(|&n| n == 1));
+        }
+    }
+
+    #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
@@ -1488,6 +1525,70 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 }
 "#;
+
+/// Experimental card-side compare: one group per 64 KiB piece, with
+/// independent 1 KiB stripes hashed by its 64 lanes. Keep every stripe's
+/// 128-bit fingerprint rather than compressing the group into one hash.
+/// The result interface remains one dirty flag per original piece.
+const CARD_COMPARE_PARALLEL: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Span : register(b0) {
+    uint first;
+    uint skew;
+    uint size;
+    uint pieces;
+    uint out_at;
+    uint compare;
+};
+ByteAddressBuffer now : register(t0);
+RWByteAddressBuffer hashes : register(u0);
+RWByteAddressBuffer differs : register(u1);
+groupshared uint dirty;
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
+    uint index = group.x;
+    if (index >= pieces) return;
+    uint piece = first + index;
+    uint lo = piece * 65536u;
+    lo = lo > skew ? lo - skew : 0u;
+    uint hi = min((piece + 1u) * 65536u - skew, size);
+    lo = lo & ~15u;
+    hi = (hi + 15u) & ~15u;
+    // Interleave 16-byte loads to keep neighboring lanes' accesses
+    // contiguous. Each lane owns a disjoint subset of the full piece.
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    [loop]
+    for (uint at = lo + lane * 16u; at < hi; at += 1024u) {
+        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
+    uint offset = (piece * 64u + lane) * 16u;
+    if (compare == 0u) {
+        hashes.Store4(offset, h);
+        return;
+    }
+    if (lane == 0u) dirty = 0u;
+    GroupMemoryBarrierWithGroupSync();
+    if (any(h != hashes.Load4(offset))) {
+        InterlockedOr(dirty, 1u);
+    }
+    if (compare == 2u) hashes.Store4(offset, h);
+    GroupMemoryBarrierWithGroupSync();
+    if (lane == 0u) differs.Store(out_at + index * 4u, dirty);
+}
+"#;
+
+pub(crate) fn parallel_card_compare() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VORTEX_CARD_COMPARE_PARALLEL").is_some_and(|v| v == "1"))
+}
+
+/// Card copies are below 1 GiB, so even with a skewed starting address
+/// there are at most 16,385 pieces, below the D3D12 dispatch limit.
+fn card_compare_groups(pieces: u32, parallel: bool) -> u32 {
+    if parallel { pieces } else { pieces.div_ceil(64) }
+}
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
@@ -2906,12 +3007,14 @@ impl Host {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let mut code: Option<ID3DBlob> = None;
+        let source = if parallel_card_compare() { CARD_COMPARE_PARALLEL } else { CARD_COMPARE };
+        tracing::info!(parallel = parallel_card_compare(), "card comparison shader");
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -3077,7 +3180,7 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            list.Dispatch(card_compare_groups(run.pieces, parallel_card_compare()), 1, 1);
                         }
                     }
                     list.Close()?;
@@ -3162,7 +3265,7 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        list.Dispatch(card_compare_groups(r.span.pieces, parallel_card_compare()), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
