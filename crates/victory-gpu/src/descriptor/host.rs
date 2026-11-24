@@ -179,10 +179,13 @@ impl Spans {
 
     /// The slots whose texture's memory overlaps `[start, end)`.
     fn slots_in(&self, start: u64, end: u64) -> Vec<u32> {
-        self.overlapping(start, end)
-            .iter()
-            .filter_map(|at| self.by_start.get(at))
-            .flat_map(|span| span.1.iter().copied())
+        if start >= end {
+            return Vec::new();
+        }
+        let before = self.by_start.range(..start).next_back().filter(|(_, span)| span.0 > start);
+        before.into_iter()
+            .chain(self.by_start.range(start..end))
+            .flat_map(|(_, span)| span.1.iter().copied())
             .collect()
     }
 }
@@ -244,7 +247,7 @@ pub(crate) fn remapped(at: usize, len: usize) {
     /// Ranges kept until a pass takes them.
     const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
-    if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
+    if start >= end || end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
@@ -257,10 +260,17 @@ pub(crate) fn remapped(at: usize, len: usize) {
         return;
     }
     if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
+        // Try to retain all affected memory before falling back to the
+        // existing bounded-queue policy. Avoid repeated sorting at capacity:
+        // compact only when it frees a substantial part of the queue.
+        let before = ranges.len();
+        coalesce_remapped(&mut ranges);
+        if ranges.len() > MOST / 2 {
+            // No pass runs fast enough to take these ranges.
+            // The slots are looked at when they are due, as before.
+            STALE[2].fetch_add(before as u64, Relaxed);
+            ranges.clear();
+        }
     }
     ranges.push((start, end));
 }
@@ -2454,6 +2464,17 @@ mod tests {
         assert_eq!(affected(&ranges), expected);
         coalesce_remapped(&mut ranges);
         assert_eq!(affected(&ranges), expected);
+        // An empty range must not select a texture that contains its start.
+        assert!(spans.slots_in(1, 1).is_empty());
+    }
+
+    #[test]
+    fn repeated_remaps_compact_without_losing_coverage() {
+        let mut ranges: Vec<(u64, u64)> = (0..32768u64)
+            .map(|i| ((i % 128) * 4096, (i % 128 + 1) * 4096))
+            .collect();
+        coalesce_remapped(&mut ranges);
+        assert_eq!(ranges, [(0, 128 * 4096)]);
     }
 
     /// A view written over memory that older views describe otherwise
