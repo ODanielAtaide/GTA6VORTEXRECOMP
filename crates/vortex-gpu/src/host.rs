@@ -709,21 +709,38 @@ mod tests {
     /// pages, unchanged pages, repeated comparisons and hash updates.
     #[test]
     fn card_compare_dispatch_matches_expected_flags_on_warp() {
-        compare_dispatch(true, 2 * 65536);
+        for (size, skew, dense) in [(65536, 0, false), (2 * 65536, 16, false), (2 * 65536, 65520, true)] {
+            compare_dispatch(true, size, skew, dense);
+        }
     }
 
     /// Explicitly opt in on a physical adapter. Uses only synthetic data.
     #[test]
     #[ignore = "requires a physical D3D12 adapter; synthetic GPU timing"]
     fn card_compare_hardware_benchmark() {
-        compare_dispatch(false, 16 << 20);
+        for size in [64 << 10, 1 << 20, 16 << 20, 64 << 20, 128 << 20, 256 << 20] {
+            compare_dispatch(false, size, 16, false);
+        }
+        for (size, skew, dense) in [(64 << 10, 0, true), (1 << 20, 65520, true), (16 << 20, 0, true)] {
+            compare_dispatch(false, size, skew, dense);
+        }
     }
 
-    fn compare_dispatch(warp: bool, size: usize) {
+    fn compare_dispatch(warp: bool, size: usize, skew: usize, dense: bool) {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-        let pieces = (size + 16).div_ceil(65536) as u32;
+        assert!(skew < 65536 && skew.is_multiple_of(16));
+        let pieces = (size + skew).div_ceil(65536) as u32;
+        // Independent CPU oracle: mark each page containing a changed byte.
+        let mut changes = vec![7, size - 1];
+        if dense {
+            changes.extend((0..size).step_by(256));
+        }
+        let mut dirty = vec![0u32; pieces as usize];
+        for &at in &changes {
+            dirty[(at + skew) / 65536] = 1;
+        }
         let result_bytes = 5 * u64::from(pieces) * 4;
         const STAMPS: u32 = 12;
         // SAFETY: test-owned D3D12 resources; all root addresses and
@@ -779,8 +796,9 @@ mod tests {
                 let bytes = std::slice::from_raw_parts_mut(data.cast::<u8>(), size);
                 bytes.fill(0);
                 if changed {
-                    bytes[7] = 0x5a;
-                    bytes[size - 1] = 0xc3;
+                    for &at in &changes {
+                        bytes[at] = 0x5a;
+                    }
                 }
                 resource.Unmap(0, None);
                 resource
@@ -835,7 +853,7 @@ mod tests {
                 list.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
                 list.SetComputeRootUnorderedAccessView(3, flags.GetGPUVirtualAddress());
                 for (pass, (input, mode)) in [(&local_a, 0u32), (&local_a, 1), (&local_b, 1), (&local_b, 2), (&local_b, 1), (&local_a, 1)].into_iter().enumerate() {
-                    let constants = [0, 16, size as u32, pieces, pass.saturating_sub(1) as u32 * pieces * 4, mode];
+                    let constants = [0, skew as u32, size as u32, pieces, pass.saturating_sub(1) as u32 * pieces * 4, mode];
                     list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                     list.SetComputeRootShaderResourceView(1, input.GetGPUVirtualAddress());
                     list.EndQuery(&query, D3D12_QUERY_TYPE_TIMESTAMP, pass as u32 * 2);
@@ -862,17 +880,14 @@ mod tests {
                 fence.SetEventOnCompletion(value, event).unwrap();
                 let waited = WaitForSingleObject(event, 30_000);
                 CloseHandle(event).unwrap();
-                assert_eq!(waited, WAIT_OBJECT_0, "WARP compare timed out");
+                assert_eq!(waited, WAIT_OBJECT_0, "GPU compare timed out");
                 let mut data = std::ptr::null_mut();
                 readback.Map(0, None, Some(&mut data)).unwrap();
                 let actual = std::slice::from_raw_parts(data.cast::<u32>(), result_bytes as usize / 4).to_vec();
                 readback.Unmap(0, None);
-                let mut dirty = vec![0u32; pieces as usize];
-                dirty[0] = 1;
-                dirty[pieces as usize - 1] = 1;
-                let clean = vec![0; pieces as usize];
+                 let clean = vec![0; pieces as usize];
                 let expected = [&clean[..], &dirty, &dirty, &clean, &dirty].concat();
-                assert_eq!(actual, expected, "parallel={parallel}");
+                assert_eq!(actual, expected, "parallel={parallel}, size={size}, skew={skew}, dense={dense}");
                 let mut data = std::ptr::null_mut();
                 times.Map(0, None, Some(&mut data)).unwrap();
                 assert!(!data.is_null());
@@ -883,7 +898,7 @@ mod tests {
                     (t[1] - t[0]) as f64 * 1000.0 / frequency as f64
                 }).collect();
                 compare_ms.sort_by(f64::total_cmp);
-                println!("synthetic GPU comparison: warp={warp}, parallel={parallel}, bytes={size}, median of five comparisons={:.3} ms", compare_ms[2]);
+                println!("synthetic GPU comparison: warp={warp}, parallel={parallel}, bytes={size}, skew={skew}, dense={dense}, median of five comparisons={:.3} ms", compare_ms[2]);
             }
         }
     }
