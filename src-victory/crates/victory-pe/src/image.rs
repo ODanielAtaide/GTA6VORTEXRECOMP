@@ -167,7 +167,7 @@ impl ImageInfo {
         };
         let delay_imports = parse_delay_imports(&file, opt.size_of_image())?;
         let exports = parse_exports(&file)?;
-        let tls = parse_tls(&file, data, opt.image_base())?;
+        let tls = parse_tls(&file, data, opt.image_base(), opt.size_of_image())?;
         let codeview = file.pdb_info()?.map(|cv| CodeViewInfo {
             pdb_path: String::from_utf8_lossy(cv.path()).into_owned(),
             guid: cv.guid(),
@@ -359,6 +359,7 @@ fn parse_tls(
     file: &PeFile64<'_>,
     data: &[u8],
     image_base: u64,
+    size_of_image: u32,
 ) -> Result<Option<TlsInfo>, PeError> {
     let Some(dd) = file.data_directory(pe::IMAGE_DIRECTORY_ENTRY_TLS) else {
         return Ok(None);
@@ -367,32 +368,62 @@ fn parse_tls(
     if directory_rva == 0 {
         return Ok(None);
     }
+    const TLS_DIRECTORY_SIZE: u32 = 40;
+    if dd.size.get(LE) < TLS_DIRECTORY_SIZE
+        || directory_rva.checked_add(TLS_DIRECTORY_SIZE).is_none_or(|end| end > size_of_image)
+    {
+        return Err(PeError::Malformed("invalid TLS directory extent".into()));
+    }
     let sections = file.section_table();
     let tls = sections
         .pe_data_at(data, directory_rva)
-        .ok_or_else(|| PeError::Malformed("TLS directory outside of sections".into()))?;
+        .and_then(|bytes| bytes.get(..TLS_DIRECTORY_SIZE as usize))
+        .ok_or_else(|| PeError::Malformed("truncated TLS directory".into()))?;
     let callbacks_va = layout::read_u64(tls, layout::TLS64_ADDRESS_OF_CALLBACKS)
         .ok_or_else(|| PeError::Malformed("truncated TLS directory".into()))?;
 
-    let mut callback_rvas = Vec::new();
-    if callbacks_va != 0 {
+    let callback_rvas = if callbacks_va == 0 {
+        Vec::new()
+    } else {
         let array_rva = va_to_rva(callbacks_va, image_base)?;
+        let remaining = size_of_image.checked_sub(array_rva)
+            .ok_or_else(|| PeError::Malformed("TLS callback array outside image".into()))?;
         let array = sections
             .pe_data_at(data, array_rva)
             .ok_or_else(|| PeError::Malformed("TLS callback array outside of sections".into()))?;
-        for slot in array.as_chunks::<8>().0.iter().take(MAX_TLS_CALLBACKS) {
-            let va = u64::from_le_bytes(*slot);
-            if va == 0 {
-                break;
-            }
-            callback_rvas.push(va_to_rva(va, image_base)?);
-        }
-    }
+        let array = &array[..array.len().min(remaining as usize)];
+        parse_callback_array(array, image_base, size_of_image)?
+    };
     Ok(Some(TlsInfo {
         directory_rva,
         callbacks_va,
         callback_rvas,
     }))
+}
+
+/// A callback array must terminate within the file-backed image and the
+/// bounded walk. Never silently accept an unterminated or oversized list.
+fn parse_callback_array(
+    array: &[u8],
+    image_base: u64,
+    size_of_image: u32,
+) -> Result<Vec<u32>, PeError> {
+    let mut callbacks = Vec::new();
+    for slot in array.as_chunks::<8>().0.iter().take(MAX_TLS_CALLBACKS + 1) {
+        let va = u64::from_le_bytes(*slot);
+        if va == 0 {
+            return Ok(callbacks);
+        }
+        if callbacks.len() == MAX_TLS_CALLBACKS {
+            break;
+        }
+        let rva = va_to_rva(va, image_base)?;
+        if rva >= size_of_image {
+            return Err(PeError::Malformed("TLS callback outside image".into()));
+        }
+        callbacks.push(rva);
+    }
+    Err(PeError::Malformed("unterminated or oversized TLS callback array".into()))
 }
 
 fn va_to_rva(va: u64, image_base: u64) -> Result<u32, PeError> {
@@ -543,5 +574,45 @@ mod tests {
                 (Some("gamma"), 3, Some(0x1204))
             ]
         );
+    }
+
+    fn callback_bytes(values: &[u64]) -> Vec<u8> {
+        values.iter().flat_map(|value| value.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn tls_array_requires_terminator() {
+        let base = 0x1_8000_0000;
+        assert_eq!(
+            parse_callback_array(&callback_bytes(&[base + 16, 0]), base, 4096).unwrap(),
+            vec![16]
+        );
+        assert!(parse_callback_array(&callback_bytes(&[base + 16]), base, 4096).is_err());
+        assert!(parse_callback_array(&[0; 7], base, 4096).is_err());
+        assert!(parse_callback_array(&[], base, 4096).is_err());
+    }
+
+    #[test]
+    fn tls_callbacks_must_be_inside_image() {
+        let base = 0x1_8000_0000;
+        assert!(parse_callback_array(&callback_bytes(&[base - 1, 0]), base, 4096).is_err());
+        assert!(parse_callback_array(&callback_bytes(&[base + 4096, 0]), base, 4096).is_err());
+        assert_eq!(
+            parse_callback_array(&callback_bytes(&[base + 4095, 0]), base, 4096).unwrap(),
+            vec![4095]
+        );
+    }
+
+    #[test]
+    fn tls_callback_limit_allows_exactly_the_limit() {
+        let base = 0x1_8000_0000;
+        let mut values = vec![base + 16; MAX_TLS_CALLBACKS];
+        values.push(0);
+        assert_eq!(
+            parse_callback_array(&callback_bytes(&values), base, 4096).unwrap().len(),
+            MAX_TLS_CALLBACKS
+        );
+        values.insert(0, base + 16);
+        assert!(parse_callback_array(&callback_bytes(&values), base, 4096).is_err());
     }
 }
