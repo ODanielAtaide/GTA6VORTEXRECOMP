@@ -54,8 +54,7 @@ pub(crate) struct ComputeHead {
     stage: Bytecode,
 }
 
-/// A shader container a title passed, shared by every pipeline with the
-/// same bytes.
+/// A shader container shared by pipelines with the same stage and bytes.
 pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
@@ -71,8 +70,10 @@ impl std::fmt::Debug for Shader {
     }
 }
 
-/// Every container seen, by full content hash.
-static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
+/// The stage is part of identity: it determines how the host pipeline
+/// binds this shader. Equal container bytes alone cannot identify it.
+type ShaderKey = (&'static str, [u8; 32]);
+static SHADERS: Mutex<Option<HashMap<ShaderKey, Arc<Shader>>>> = Mutex::new(None);
 
 /// For the memory lines: containers kept and their bytes, translations
 /// kept and the bytes of their host code. None of them is ever let go.
@@ -103,7 +104,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
+        .entry((stage, *full.as_bytes()))
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -502,7 +503,7 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = make::Pending::shared(shaders.clone(), graphics);
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
@@ -746,6 +747,17 @@ mod tests {
     }
 
     #[test]
+    fn same_shader_bytes_do_not_alias_distinct_stages() {
+        let bytes = [0x61u8, 0x32, 0x49, 0x10];
+        let vertex = shader("vertex", &bytes);
+        let pixel = shader("pixel", &bytes);
+        assert_eq!(vertex.stage, "vertex");
+        assert_eq!(pixel.stage, "pixel");
+        assert!(!Arc::ptr_eq(&vertex, &pixel));
+        assert!(Arc::ptr_eq(&vertex, &shader("vertex", &bytes)));
+    }
+
+    #[test]
     fn pipelines_keep_their_shaders() {
         let (vs, ps) = ([1u8, 2, 3], [4u8; 5]);
         let none = || Bytecode {
@@ -784,6 +796,9 @@ mod tests {
             &pipeline(p).shaders[1],
             &pipeline(q).shaders[1]
         ));
+        #[cfg(windows)]
+        assert!(Arc::ptr_eq(&pipeline(p).host, &pipeline(q).host));
+        assert_ne!(p, q, "the title still owns distinct COM objects");
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
 

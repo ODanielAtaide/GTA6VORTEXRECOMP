@@ -180,6 +180,13 @@ impl GraphicsState {
         }
     }
 
+    /// Invalid non-finite rasterizer values must not be interned by
+    /// their textual description, which cannot distinguish NaN payloads.
+    pub(crate) fn shareable(&self) -> bool {
+        self.rasterizer.DepthBiasClamp.is_finite()
+            && self.rasterizer.SlopeScaledDepthBias.is_finite()
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {

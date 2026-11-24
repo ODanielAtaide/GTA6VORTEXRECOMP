@@ -15,9 +15,9 @@
 //! The default budget is half a second per title frame. A pass the title
 //! runs only once and whose pipeline takes longer is lost.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use super::Shader;
@@ -43,8 +43,44 @@ unsafe impl Send for Pending {}
 // SAFETY: as above.
 unsafe impl Sync for Pending {}
 
+/// Exact in-process identity: shader interning already distinguishes
+/// stage and full content hash. The shader table retains those Arcs, so
+/// their identities cannot be recycled during this process. Graphics
+/// state is the complete owned host description, not the short disk key.
+#[derive(Eq, PartialEq, Hash)]
+struct Identity {
+    shaders: Vec<usize>,
+    graphics: Option<String>,
+}
+
 impl Pending {
-    pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+    /// Share both outstanding compilation and its result for equivalent
+    /// host descriptions. The title's COM objects remain independent.
+    pub(crate) fn shared(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Arc<Pending> {
+        static LIVE: OnceLock<Mutex<HashMap<Identity, Weak<Pending>>>> = OnceLock::new();
+        if graphics.as_ref().is_some_and(|g| !g.shareable()) {
+            return Arc::new(Self::new(shaders, graphics));
+        }
+        let identity = Identity {
+            shaders: shaders.iter().map(|s| Arc::as_ptr(s) as usize).collect(),
+            graphics: graphics.as_ref().map(|g| g.describe()),
+        };
+        let mut live = LIVE.get_or_init(|| Mutex::new(HashMap::new()))
+            .lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pending) = live.get(&identity).and_then(Weak::upgrade) {
+            return pending;
+        }
+        // Do not retain dead pipelines or grow a table of unused keys
+        // forever. Live COM objects and queued work keep their own Arcs.
+        if live.len() >= 4096 && live.len().is_multiple_of(256) {
+            live.retain(|_, p| p.strong_count() != 0);
+        }
+        let pending = Arc::new(Self::new(shaders, graphics));
+        live.insert(identity, Arc::downgrade(&pending));
+        pending
+    }
+
+    fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());
@@ -141,8 +177,10 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
-        super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, EARLY);
+        if p.made.get().is_none() && p.queue_state.load(Ordering::Relaxed) == NOT_QUEUED {
+            super::library::EARLY.fetch_add(1, Ordering::Relaxed);
+            start(p, EARLY);
+        }
     }
 }
 
@@ -172,6 +210,11 @@ fn wait(p: &Pending, frame: u64) {
     let left = {
         let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
+            // A recording thread may arrive late with an older frame.
+            // Never reset the current frame's reservations backwards.
+            if spent.0 != u64::MAX && frame < spent.0 {
+                return;
+            }
             *spent = (frame, Duration::ZERO);
         }
         let left = budget.saturating_sub(spent.1);
@@ -361,6 +404,23 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn equivalent_requests_share_one_pending_job() {
+        let cs = super::super::shader("compute", &[0x13, 0x57, 0x9b, 0xdf]);
+        let a = Pending::shared(vec![cs.clone()], None);
+        let b = Pending::shared(vec![cs.clone()], None);
+        let other = Pending::shared(vec![super::super::shader("compute", &[0x13, 0x57, 0x9b, 0xde])], None);
+        let graphics = Pending::shared(vec![cs], Some(Box::default()));
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(!Arc::ptr_eq(&a, &other));
+        assert!(!Arc::ptr_eq(&a, &graphics));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push(&a, EARLY), Some(true));
+        assert_eq!(queue.push(&b, REQUESTED), Some(false));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &a));
+        assert!(queue.pop().is_none());
     }
 
     #[test]
