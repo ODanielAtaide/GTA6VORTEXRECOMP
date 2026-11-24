@@ -127,7 +127,7 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
 /// names any more (copies of windows of title memory, staging buffers,
 /// host copies of textures the title fills).
 /// `VORTEX_SWEEP=0` keeps everything, as before.
-fn sweep() {
+fn sweep(host: &Host) {
     // The in-place probe and census, if asked for (`VORTEX_INPLACE_PROBE`).
     crate::inplace::tick();
     static ON: OnceLock<bool> = OnceLock::new();
@@ -144,6 +144,7 @@ fn sweep() {
     {
         return;
     }
+    trim_scratch_budget(host);
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
@@ -1413,6 +1414,46 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 const SCRATCH_FIRST: u64 = 256 << 10;
 /// The most bytes of chunks kept while no list holds them.
 const SPARE_MOST: u64 = 128 << 20;
+static SPARE_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(SPARE_MOST);
+
+/// Limit idle upload allocations to a fraction of available budget.
+/// Both segments can matter (UMA and discrete adapters). A zero budget
+/// means the segment is unavailable, not that all resources must go.
+fn scratch_budget([local, local_used, shared, shared_used]: [u64; 4]) -> u64 {
+    [(local, local_used), (shared, shared_used)]
+        .into_iter()
+        .filter(|&(budget, _)| budget != 0)
+        .map(|(budget, usage)| budget.saturating_sub(usage) / 4)
+        .fold(SPARE_MOST, u64::min)
+}
+
+/// Respond to DXGI's changing process budget once per sweep. Only spare
+/// chunks, already returned by completed lists, can be reclaimed.
+fn trim_scratch_budget(host: &Host) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VORTEX_SCRATCH_BUDGET").is_none_or(|v| v != "0")) {
+        return;
+    }
+    let Some(memory) = host.video_memory() else { return };
+    let limit = scratch_budget(memory);
+    let (freed, bytes) = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        SPARE_LIMIT.store(limit, Ordering::Relaxed);
+        let freed = spare.trim_to(limit);
+        let bytes = freed.iter().map(|(_, size)| *size).sum::<u64>();
+        let count = freed.len() as u64;
+        ALIVE[1].fetch_sub(count, Ordering::Relaxed);
+        ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
+        ALIVE[3].fetch_sub(count, Ordering::Relaxed);
+        ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+        (freed, bytes)
+    };
+    // Release driver objects outside the pool's lock.
+    drop(freed);
+    if bytes != 0 {
+        tracing::info!(bytes, limit, "idle scratch cache trimmed to video memory budget");
+    }
+}
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
@@ -1449,12 +1490,23 @@ impl<T> Spare<T> {
     /// Keeps `thing` (`size` bytes) unless that takes the kept bytes past
     /// `most`: then it comes back.
     fn give(&mut self, thing: T, size: u64, most: u64) -> Option<T> {
-        if self.bytes + size > most {
+        if size > most.saturating_sub(self.bytes) {
             return Some(thing);
         }
         self.bytes += size;
         self.kept.push((thing, size));
         None
+    }
+
+    /// Evict the oldest unused entries first while preserving the recent
+    /// size classes and their LIFO reuse order.
+    fn trim_to(&mut self, most: u64) -> Vec<(T, u64)> {
+        let mut remove = 0;
+        while self.bytes > most && remove < self.kept.len() {
+            self.bytes -= self.kept[remove].1;
+            remove += 1;
+        }
+        self.kept.drain(..remove).collect()
     }
 }
 
@@ -1496,7 +1548,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, SPARE_MOST)
+                spare.give(chunk, size, SPARE_LIMIT.load(Ordering::Relaxed))
             } else {
                 Some(chunk)
             };
@@ -4156,13 +4208,13 @@ impl Host {
         // one at every present).
         static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if !behind {
-            sweep();
+            sweep(self);
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
-            sweep();
+            sweep(self);
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
@@ -6708,6 +6760,26 @@ mod spare {
 
     /// Kept things come back by size, the last given first, and nothing is
     /// kept past the limit.
+    #[test]
+    fn budget_pressure_reclaims_only_idle_entries_in_age_order() {
+        use super::{SPARE_MOST, scratch_budget};
+        let mib = 1u64 << 20;
+        assert_eq!(scratch_budget([0, 0, 0, 0]), SPARE_MOST);
+        assert_eq!(scratch_budget([4096*mib, 1024*mib, 0, 0]), SPARE_MOST);
+        assert_eq!(scratch_budget([4096*mib, 4000*mib, 1024*mib, 800*mib]), 24*mib);
+        assert_eq!(scratch_budget([1024*mib, 1025*mib, 0, 0]), 0);
+        let mut spare = Spare::new();
+        assert_eq!(spare.give(1, 4, 16), None);
+        assert_eq!(spare.give(2, 1, 16), None);
+        assert_eq!(spare.give(3, 4, 16), None);
+        assert_eq!(spare.trim_to(5), vec![(1, 4)]);
+        assert_eq!(spare.bytes, 5);
+        assert_eq!(spare.take(4), Some(3));
+        assert_eq!(spare.trim_to(0), vec![(2, 1)]);
+        assert_eq!(spare.bytes, 0);
+        assert_eq!(spare.give(4, 1, 0), Some(4));
+    }
+
     #[test]
     fn kept_things_come_back_by_size_within_the_limit() {
         let mut spare: Spare<u32> = Spare::new();

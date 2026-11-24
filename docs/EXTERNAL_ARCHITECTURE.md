@@ -12,3 +12,7 @@ Vortex executes native CPU code and translates graphics interfaces. External pro
 ## Validation
 
 The catalogue publication regression uses a temporary directory and requires no proprietary assets or driver library. Driver cache and runtime catalogue have independent dirty state. No FPS improvement is claimed. Test and profile on repeatable, authorized workloads before changing defaults.
+
+## Budget-aware scratch pool
+
+The existing scratch pool now bounds idle allocations using one quarter of the smallest reported available DXGI segment budget, capped at 128 MiB. Zero-budget segments are ignored; an unavailable query leaves the previous policy intact. Oldest idle entries are released outside the pool lock. Active allocations and their fence lifetimes are unchanged. `VORTEX_SCRATCH_BUDGET=0` restores the fixed cap. This is an original implementation informed by [AMD's RDNA performance guide](https://gpuopen.com/learn/rdna-performance-guide/) and [DXGI budget documentation](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_4/ns-dxgi1_4-dxgi_query_video_memory_info), not a port of D3D12MA. The threshold is a conservative policy choice, not a measured optimum.
