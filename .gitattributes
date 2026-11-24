@@ -2,3 +2,8 @@
 * text=auto eol=lf
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
+
+# Explicit source classifications for GitHub Linguist. Keep real upstream
+# Rust source and auxiliary Python tools visible in language statistics.
+*.rs linguist-language=Rust linguist-detectable=true
+*.py linguist-language=Python linguist-detectable=true

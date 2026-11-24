@@ -23,9 +23,13 @@ Buscamos pessoas com experiência em Rust, Direct3D 12, compiladores de shaders,
 
 Abra uma [issue](https://github.com/ODanielAtaide/GTA6VORTEXRECOMP/issues/new), faça um fork ou envie um pull request seguindo o [guia de contribuição](../CONTRIBUTING.md). Utilize exemplos sintéticos próprios ou cargas autorizadas e não envie conteúdo proprietário, arquivos de jogos ou logs com informações privadas.
 
-## Mantenedor e inteligência artificial
+## Tecnologia, mantenedor e inteligência artificial
 
-O projeto é mantido por [@ODanielAtaide](https://github.com/ODanielAtaide), com assistência do **ChatGPT, da OpenAI**, na análise técnica, alterações de código, testes, documentação e interpretação das métricas. O mantenedor conduz o desenvolvimento e executa as validações locais. O assistente não opera a GPU local de forma independente.
+O Vortex é desenvolvido principalmente em **Rust**. Na fotografia do código de 24/11/2026, são 139 arquivos Rust (4.175.366 bytes) e seis arquivos Python (9.299 bytes). O Python é utilizado nas ferramentas auxiliares de diagnóstico e testes.
+
+O mantenedor e responsável pelo Vortex é [@ODanielAtaide](https://github.com/ODanielAtaide). A lista automática de colaboradores do GitHub inclui autores do histórico importado; isso não significa que participaram diretamente do Vortex. Veja a separação de créditos em [AUTHORS.md](../AUTHORS.md).
+
+Segundo o mantenedor, o desenvolvimento utiliza diferentes sistemas de IA, incluindo **ChatGPT/GPT (OpenAI), Claude (Anthropic), Llama (Meta) executado localmente e outros LLMs locais**. Essas ferramentas auxiliam a análise técnica, programação, testes e documentação. As versões e a participação individual de todos os modelos não foram auditadas. O mantenedor conduz o desenvolvimento e executa as validações locais.
 
 A colaboração é aberta a todos. A assistência de IA não substitui revisão humana, evidência experimental ou os créditos dos autores originais. O projeto não tem vínculo oficial com OpenAI, Microsoft, Xbox, Rockstar Games ou Take-Two Interactive.
 

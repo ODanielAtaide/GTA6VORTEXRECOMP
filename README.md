@@ -1,6 +1,6 @@
 # Vortex
 
-**Open-source Xbox Series compatibility research for Windows x64.**
+**Open-source Xbox Series compatibility research for Windows x64, written primarily in Rust.**
 
 [![Windows CI](https://github.com/ODanielAtaide/GTA6VORTEXRECOMP/actions/workflows/ci.yml/badge.svg)](https://github.com/ODanielAtaide/GTA6VORTEXRECOMP/actions/workflows/ci.yml) [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
 
@@ -58,11 +58,21 @@ Contributors are welcome: Rust developers, graphics engineers, D3D12 and GPU spe
 
 Start with [CONTRIBUTING.md](CONTRIBUTING.md), the [roadmap](docs/ROADMAP.md), or [open an issue](https://github.com/ODanielAtaide/GTA6VORTEXRECOMP/issues/new) to propose a focused improvement. Please preserve rendering correctness, include tests and disclose known limitations.
 
-## Maintainer and AI-assisted development
+## Technology and project credits
 
-- Project maintainer: [@ODanielAtaide](https://github.com/ODanielAtaide).
-- Vortex-specific development has been assisted by **OpenAI ChatGPT**, including technical analysis, code proposals and edits, tests, CI interpretation, documentation and performance-log analysis.
-- The maintainer builds and tests locally, supplies observations and directs development priorities. AI assistance is not a substitute for review or hardware validation. It does not make OpenAI an official project partner.
-- The original VIctory and victory-gta6 contributors retain credit for their work; the earlier fork also documents its own Claude Code assistance in the [preserved upstream notes](docs/UPSTREAM_CREDITS.md).
+The runtime, loader, graphics backend and shader compiler are written in **Rust**. Python is used only for auxiliary inspection, telemetry and regression tools. At the November 24, 2026 source snapshot, the repository held 139 Rust files (4,175,366 bytes) and six Python files (9,299 bytes): approximately 99.78% Rust by combined Rust/Python source bytes.
+
+**Vortex maintainer and project lead:** [@ODanielAtaide](https://github.com/ODanielAtaide). The project-specific work and inherited upstream contributions are documented separately in [AUTHORS.md](AUTHORS.md). GitHub's automatic contributor graph also includes authors of the imported Git history; their appearance does not establish direct participation in Vortex.
+
+### Multi-model AI-assisted development
+
+According to the maintainer, the development workflow has involved multiple AI systems, including:
+
+- **OpenAI ChatGPT (GPT family)** — code assistance, technical analysis, tests, documentation and profiling.
+- **Anthropic Claude (Claude family)** — AI-assisted development, including the separately credited upstream Claude Code work.
+- **Meta Llama (locally hosted LLMs)** — part of the maintainer's reported multi-model workflow.
+- **Other local large language models** — additional AI assistance; specific models and versions have not been documented.
+
+The maintainer directs the project, reviews changes and runs the Windows builds and hardware validation. The exact scope of assistance from each model has not been independently audited. AI tools are not human contributors or official project partners. All original authorship and licensing remain intact. See [AUTHORS.md](AUTHORS.md) and [upstream credits](docs/UPSTREAM_CREDITS.md).
 
 This independent research project is not affiliated with or endorsed by Microsoft, Xbox, Rockstar Games, Take-Two Interactive or OpenAI. Do not upload unauthorized proprietary material or distribute commercial game files. See [LICENSE](LICENSE) and the separate [BCPack provenance](docs/BCPACK_PROVENANCE.md).
