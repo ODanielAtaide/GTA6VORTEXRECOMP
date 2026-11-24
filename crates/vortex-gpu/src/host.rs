@@ -741,6 +741,41 @@ mod tests {
     }
 
     #[test]
+    fn comparison_runs_share_flags_without_expanding_byte_ranges() {
+        use crate::shadow::CardSpan;
+        let span = |first, pieces| CardSpan { from: first * 65536, to: (first + pieces) * 65536, first, pieces, skew: 0 };
+        let spans = [span(3, 2), span(4, 2), span(6, 1), span(10, 2)];
+        let mut at = 9;
+        let (flags, runs) = comparison_runs(&spans, &mut at, 32, true);
+        assert_eq!(flags, [Some(9), Some(10), Some(12), Some(13)]);
+        assert_eq!(runs.iter().map(|(r, o)| (r.first, r.pieces, *o)).collect::<Vec<_>>(),
+            [(3, 4, 9), (10, 2, 13)]);
+        assert_eq!(at, 15);
+        let mut at = 9;
+        let (flags, runs) = comparison_runs(&spans, &mut at, 12, true);
+        assert_eq!(flags, [None, None, None, Some(9)]);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(at, 11);
+        let (flags, runs) = comparison_runs(&spans, &mut at, 32, false);
+        assert!(flags.iter().all(Option::is_none));
+        assert!(runs.is_empty());
+        assert_eq!(at, 11);
+    }
+
+    #[test]
+    fn one_page_with_many_disjoint_writes_is_compared_once() {
+        use crate::shadow::CardSpan;
+        let spans: Vec<_> = (0..1024u32).map(|i| CardSpan {
+            from: i * 64, to: i * 64 + 16, first: 0, pieces: 1, skew: 0,
+        }).collect();
+        let mut at = 0;
+        let (flags, runs) = comparison_runs(&spans, &mut at, 1024, true);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(at, 1);
+        assert!(flags.iter().all(|&offset| offset == Some(0)));
+    }
+
+    #[test]
     fn card_compare_groups_match_the_shader_layouts() {
         for pieces in [1u32, 63, 64, 65, 16385] {
             assert_eq!(card_compare_groups(pieces, true), pieces);
@@ -1629,7 +1664,7 @@ fn card_compare_groups(pieces: u32, parallel: bool) -> u32 {
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
-/// once (`VORTEX_CARD_REHASH_RUNS=1`; off by default), and not in a pass
+/// once (on by default; `VORTEX_CARD_REHASH_RUNS=0` restores the old mode), and not in a pass
 /// per range sent up.
 ///
 /// These passes are ours, they run on the card before every submission's
@@ -1641,7 +1676,7 @@ fn card_compare_groups(pieces: u32, parallel: bool) -> u32 {
 /// a fetch that finds nothing and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VORTEX_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VORTEX_CARD_REHASH_RUNS").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -1672,6 +1707,44 @@ struct CardRange {
     at: u32,
     /// Whether the card compares it; else every piece is fetched.
     compared: bool,
+}
+
+/// Plan the comparison of sorted byte spans within a single buffer at
+/// page granularity. Several disjoint byte spans can share the same page:
+/// they must share a flag, rather than hash (and in relay mode overwrite)
+/// its fingerprint multiple times. A group that cannot fit in the result
+/// area falls back to fetching its original byte ranges in full.
+fn comparison_runs(
+    spans: &[crate::shadow::CardSpan],
+    at: &mut u32,
+    limit: u32,
+    enabled: bool,
+) -> (Vec<Option<u32>>, Vec<(crate::shadow::CardSpan, u32)>) {
+    let mut offsets = vec![None; spans.len()];
+    let mut runs = Vec::new();
+    if !enabled {
+        return (offsets, runs);
+    }
+    let mut i = 0;
+    while i < spans.len() {
+        let mut run = spans[i];
+        let mut j = i + 1;
+        while j < spans.len() && spans[j].first <= run.first + run.pieces {
+            let next = spans[j];
+            run.pieces = run.pieces.max(next.first + next.pieces - run.first);
+            run.to = run.to.max(next.to);
+            j += 1;
+        }
+        if let Some(end) = at.checked_add(run.pieces).filter(|&end| end <= limit) {
+            for k in i..j {
+                offsets[k] = Some(*at + spans[k].first - run.first);
+            }
+            runs.push((run, *at));
+            *at = end;
+        }
+        i = j;
+    }
+    (offsets, runs)
 }
 
 /// What a submission does for copies in the card's memory.
@@ -3259,6 +3332,10 @@ impl Host {
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let mut at = work.taken;
+        // Record unique page runs separately from the original byte
+        // ranges used by the CPU merge. Do not merge across buffers.
+        let mut comparisons = Vec::new();
+        let limit = (work.differs.2 / 4) as u32;
         for (shadow, ranges) in declared {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
@@ -3270,25 +3347,24 @@ impl Host {
                 }
             }
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
-            for (from, to) in spans {
-                let Some(span) = shadow.card_span(from, to) else {
-                    continue;
-                };
-                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
+            let spans: Vec<_> = spans.into_iter().filter_map(|(from, to)| {
+                shadow.card_span(from, to).map(|span| ((from, to), span))
+            }).collect();
+            let page_spans: Vec<_> = spans.iter().map(|(_, span)| *span).collect();
+            let (offsets, runs) = comparison_runs(&page_spans, &mut at, limit, twin);
+            comparisons.extend(runs.into_iter().map(|(span, offset)| (shadow.clone(), span, offset)));
+            for ((declared, span), offset) in spans.into_iter().zip(offsets) {
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
-                    declared: (from, to),
+                    declared,
                     span,
-                    at,
-                    compared,
+                    at: offset.unwrap_or(0),
+                    compared: offset.is_some(),
                 });
-                if compared {
-                    at += span.pieces;
-                }
             }
         }
         work.taken = at;
-        if plan.ranges.iter().any(|r| r.compared) {
+        if !comparisons.is_empty() {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
@@ -3313,15 +3389,15 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
-                        let Some((_, Some(before), size)) = r.shadow.card_sides() else {
+                    for (shadow, span, offset) in &comparisons {
+                        let Some((_, Some(before), size)) = shadow.card_sides() else {
                             continue;
                         };
-                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
+                        let constants = [span.first, span.skew, size as u32, span.pieces, *offset * 4, if flown { 2 } else { 1 }];
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
+                        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(card_compare_groups(r.span.pieces, parallel_card_compare()), 1, 1);
+                        list.Dispatch(card_compare_groups(span.pieces, parallel_card_compare()), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
