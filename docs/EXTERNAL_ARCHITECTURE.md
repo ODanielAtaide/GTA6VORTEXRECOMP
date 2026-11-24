@@ -16,3 +16,7 @@ The catalogue publication regression uses a temporary directory and requires no 
 ## Budget-aware scratch pool
 
 The existing scratch pool now bounds idle allocations using one quarter of the smallest reported available DXGI segment budget, capped at 128 MiB. Zero-budget segments are ignored; an unavailable query leaves the previous policy intact. Oldest idle entries are released outside the pool lock. Active allocations and their fence lifetimes are unchanged. `VORTEX_SCRATCH_BUDGET=0` restores the fixed cap. This is an original implementation informed by [AMD's RDNA performance guide](https://gpuopen.com/learn/rdna-performance-guide/) and [DXGI budget documentation](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_4/ns-dxgi1_4-dxgi_query_video_memory_info), not a port of D3D12MA. The threshold is a conservative policy choice, not a measured optimum.
+
+## Isolated GPU comparison validation
+
+The WARP regression executes both memory comparison kernels on synthetic device-local buffers, verifies all dirty flags and measures each dispatch using Direct3D timestamp queries. The optional ignored hardware test repeats the test with 16 MiB buffers on the default physical adapter. It does not launch a title or load proprietary data. Run explicitly with `cargo test --release -p vortex-gpu --locked -- --ignored --nocapture card_compare_hardware_benchmark`. The reported median covers five comparisons, not total frame time; use the result to evaluate the algorithm before changing its default.

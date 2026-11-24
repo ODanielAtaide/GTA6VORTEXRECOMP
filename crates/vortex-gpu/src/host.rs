@@ -709,25 +709,48 @@ mod tests {
     /// pages, unchanged pages, repeated comparisons and hash updates.
     #[test]
     fn card_compare_dispatch_matches_expected_flags_on_warp() {
+        compare_dispatch(true, 2 * 65536);
+    }
+
+    /// Explicitly opt in on a physical adapter. Uses only synthetic data.
+    #[test]
+    #[ignore = "requires a physical D3D12 adapter; synthetic GPU timing"]
+    fn card_compare_hardware_benchmark() {
+        compare_dispatch(false, 16 << 20);
+    }
+
+    fn compare_dispatch(warp: bool, size: usize) {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-        const SIZE: usize = 2 * 65536;
-        const PIECES: u32 = 3;
-        const RESULT_BYTES: u64 = 5 * PIECES as u64 * 4;
+        let pieces = (size + 16).div_ceil(65536) as u32;
+        let result_bytes = 5 * u64::from(pieces) * 4;
+        const STAMPS: u32 = 12;
         // SAFETY: test-owned D3D12 resources; all root addresses and
         // mapped ranges fit their allocations. No CPU access while a
         // submitted command list uses these resources.
         unsafe {
-            let adapter = warp_adapter().expect("software WARP adapter");
             let mut device: Option<ID3D12Device> = None;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+            if warp {
+                let adapter = warp_adapter().expect("software WARP adapter");
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+            } else {
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+            }
             let device = device.unwrap();
+            if !warp {
+                let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+                let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(device.GetAdapterLuid()).unwrap();
+                assert_eq!(adapter.GetDesc1().unwrap().Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0,
+                    "physical adapter required");
+            }
             let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                 Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
                 ..Default::default()
             }).unwrap();
             let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let frequency = queue.GetTimestampFrequency().unwrap();
+            assert_ne!(frequency, 0);
             let buffer = |size, kind, state, flags| -> ID3D12Resource {
                 let mut resource = None;
                 device.CreateCommittedResource(
@@ -749,15 +772,15 @@ mod tests {
                 resource.unwrap()
             };
             let input = |changed: bool| {
-                let resource = buffer(SIZE as u64, D3D12_HEAP_TYPE_UPLOAD,
+                let resource = buffer(size as u64, D3D12_HEAP_TYPE_UPLOAD,
                     D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE);
                 let mut data = std::ptr::null_mut();
                 resource.Map(0, None, Some(&mut data)).unwrap();
-                let bytes = std::slice::from_raw_parts_mut(data.cast::<u8>(), SIZE);
+                let bytes = std::slice::from_raw_parts_mut(data.cast::<u8>(), size);
                 bytes.fill(0);
                 if changed {
                     bytes[7] = 0x5a;
-                    bytes[SIZE - 1] = 0xc3;
+                    bytes[size - 1] = 0xc3;
                 }
                 resource.Unmap(0, None);
                 resource
@@ -779,25 +802,45 @@ mod tests {
                     },
                     ..Default::default()
                 }).unwrap();
-                let hashes = buffer(u64::from(PIECES) * if parallel { 1024 } else { 16 },
+                let hashes = buffer(u64::from(pieces) * if parallel { 1024 } else { 16 },
                     D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-                let flags = buffer(RESULT_BYTES, D3D12_HEAP_TYPE_DEFAULT,
+                let flags = buffer(result_bytes, D3D12_HEAP_TYPE_DEFAULT,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-                let readback = buffer(RESULT_BYTES, D3D12_HEAP_TYPE_READBACK,
+                let readback = buffer(result_bytes, D3D12_HEAP_TYPE_READBACK,
                     D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
                 let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
                 let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
                     &allocator, None).unwrap();
+                let mut query: Option<ID3D12QueryHeap> = None;
+                device.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC {
+                    Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: STAMPS, NodeMask: 0
+                }, &mut query).unwrap();
+                let query = query.unwrap();
+                let times = buffer(u64::from(STAMPS) * 8, D3D12_HEAP_TYPE_READBACK,
+                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+                // Measure reads from device-local buffers, not from PCIe
+                // upload memory. The initialization copies are not timed.
+                let local = |source: &ID3D12Resource| {
+                    let r = buffer(size as u64, D3D12_HEAP_TYPE_DEFAULT,
+                        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+                    list.CopyBufferRegion(&r, 0, source, 0, size as u64);
+                    list.ResourceBarrier(&[transition(&r, D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+                    r
+                };
+                let (local_a, local_b) = (local(&a), local(&b));
                 list.SetComputeRootSignature(&root);
                 list.SetPipelineState(&pso);
                 list.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
                 list.SetComputeRootUnorderedAccessView(3, flags.GetGPUVirtualAddress());
-                for (pass, (input, mode)) in [(&a, 0u32), (&a, 1), (&b, 1), (&b, 2), (&b, 1), (&a, 1)].into_iter().enumerate() {
-                    let constants = [0, 16, SIZE as u32, PIECES, pass.saturating_sub(1) as u32 * PIECES * 4, mode];
+                for (pass, (input, mode)) in [(&local_a, 0u32), (&local_a, 1), (&local_b, 1), (&local_b, 2), (&local_b, 1), (&local_a, 1)].into_iter().enumerate() {
+                    let constants = [0, 16, size as u32, pieces, pass.saturating_sub(1) as u32 * pieces * 4, mode];
                     list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                     list.SetComputeRootShaderResourceView(1, input.GetGPUVirtualAddress());
-                    list.Dispatch(card_compare_groups(PIECES, parallel), 1, 1);
+                    list.EndQuery(&query, D3D12_QUERY_TYPE_TIMESTAMP, pass as u32 * 2);
+                    list.Dispatch(card_compare_groups(pieces, parallel), 1, 1);
+                    list.EndQuery(&query, D3D12_QUERY_TYPE_TIMESTAMP, pass as u32 * 2 + 1);
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
                         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -809,7 +852,8 @@ mod tests {
                     }]);
                 }
                 list.ResourceBarrier(&[transition(&flags, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                list.CopyBufferRegion(&readback, 0, &flags, 0, RESULT_BYTES);
+                list.CopyBufferRegion(&readback, 0, &flags, 0, result_bytes);
+                list.ResolveQueryData(&query, D3D12_QUERY_TYPE_TIMESTAMP, 0, STAMPS, &times, 0);
                 list.Close().unwrap();
                 queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
                 let value = i as u64 + 1;
@@ -821,9 +865,25 @@ mod tests {
                 assert_eq!(waited, WAIT_OBJECT_0, "WARP compare timed out");
                 let mut data = std::ptr::null_mut();
                 readback.Map(0, None, Some(&mut data)).unwrap();
-                let actual = std::slice::from_raw_parts(data.cast::<u32>(), RESULT_BYTES as usize / 4).to_vec();
+                let actual = std::slice::from_raw_parts(data.cast::<u32>(), result_bytes as usize / 4).to_vec();
                 readback.Unmap(0, None);
-                assert_eq!(actual, [0,0,0, 1,0,1, 1,0,1, 0,0,0, 1,0,1], "parallel={parallel}");
+                let mut dirty = vec![0u32; pieces as usize];
+                dirty[0] = 1;
+                dirty[pieces as usize - 1] = 1;
+                let clean = vec![0; pieces as usize];
+                let expected = [&clean[..], &dirty, &dirty, &clean, &dirty].concat();
+                assert_eq!(actual, expected, "parallel={parallel}");
+                let mut data = std::ptr::null_mut();
+                times.Map(0, None, Some(&mut data)).unwrap();
+                assert!(!data.is_null());
+                let ticks = std::slice::from_raw_parts(data.cast::<u64>(), STAMPS as usize).to_vec();
+                times.Unmap(0, None);
+                let mut compare_ms: Vec<f64> = ticks.chunks_exact(2).skip(1).map(|t| {
+                    assert!(t[1] >= t[0], "nonmonotonic timestamps");
+                    (t[1] - t[0]) as f64 * 1000.0 / frequency as f64
+                }).collect();
+                compare_ms.sort_by(f64::total_cmp);
+                println!("synthetic GPU comparison: warp={warp}, parallel={parallel}, bytes={size}, median of five comparisons={:.3} ms", compare_ms[2]);
             }
         }
     }
