@@ -16,6 +16,8 @@ pub enum Op {
     Shl(usize, usize),
     Shr(usize, usize),
     SelectUlt(usize, usize, usize, usize),
+    // If a < b, x+y; otherwise x-y, merged by OpPhi.
+    BranchAddSub(usize, usize, usize, usize),
     // All SSA values remain 32-bit words; these interpret words as IEEE f32.
     UToF(usize),
     FAdd(usize, usize),
@@ -42,13 +44,13 @@ pub fn emit(ops: &[Op], result: usize) -> crate::Result<Vec<u32>> {
         if let Op::UToF(a) = *op {
             if a >= i { return Err("Invalid conversion SSA reference".into()); }
         }
-        if let Op::SelectUlt(a,b,t,f) = *op {
+        if let Op::SelectUlt(a,b,t,f) | Op::BranchAddSub(a,b,t,f) = *op {
             if [a,b,t,f].iter().any(|&v| v >= i) { return Err("Invalid select SSA reference".into()); }
         }
     }
     // IDs 17..19 are bool type, shift mask and f32 type.
-    // Each node reserves a result plus three temporary IDs.
-    let id = |i: usize| 20 + 4 * i as u32;
+    // Each node reserves a result plus six temporary/label IDs.
+    let id = |i: usize| 20 + 7 * i as u32;
     let ptr = id(ops.len());
     let mut out = vec![0x07230203, 0x00010300, 0, ptr + 1, 0];
     let op = |out: &mut Vec<u32>, code, args: &[u32]| instruction(out, code, args);
@@ -112,6 +114,26 @@ pub fn emit(ops: &[Op], result: usize) -> crate::Result<Vec<u32>> {
                 let opcode = match node { Op::FAdd(..) => 129, Op::FSub(..) => 131, _ => 133 };
                 op(&mut out, opcode, &[19, tmp+2, tmp, tmp+1]);
                 op(&mut out, 124, &[3, id(i), tmp+2]);
+            }
+            Op::BranchAddSub(a,b,x,y) => {
+                let r = id(i);
+                let cond = r+1;
+                let yes = r+2;
+                let no = r+3;
+                let merge = r+4;
+                let sum = r+5;
+                let diff = r+6;
+                op(&mut out, 176, &[17, cond, id(a), id(b)]);
+                op(&mut out, 247, &[merge, 0]); // SelectionMerge
+                op(&mut out, 250, &[cond, yes, no]); // BranchConditional
+                op(&mut out, 248, &[yes]);
+                op(&mut out, 128, &[3, sum, id(x), id(y)]);
+                op(&mut out, 249, &[merge]);
+                op(&mut out, 248, &[no]);
+                op(&mut out, 130, &[3, diff, id(x), id(y)]);
+                op(&mut out, 249, &[merge]);
+                op(&mut out, 248, &[merge]);
+                op(&mut out, 245, &[3, r, sum, yes, diff, no]); // Phi
             }
             Op::SelectUlt(a,b,t,f) => {
                 let tmp = id(i) + 1;
@@ -202,11 +224,36 @@ pub fn write_float(path: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+// Two consecutive structured selections, with divergent predicates and
+// a value produced by the first merge consumed by the second.
+pub const BRANCH: [Op; 9] = [
+    Op::Index, Op::Constant(1), Op::And(0,1), Op::Constant(0xf1234567),
+    Op::Xor(0,3), Op::BranchAddSub(2,1,4,3),
+    Op::Constant(524288), Op::BranchAddSub(0,6,5,1), Op::Xor(7,0),
+];
+
+pub fn branch_expected(index: u32) -> u32 {
+    let x = index ^ 0xf1234567;
+    let y = if index & 1 == 0 { x.wrapping_add(0xf1234567) }
+        else { x.wrapping_sub(0xf1234567) };
+    let z = if index < 524288 { y.wrapping_add(1) } else { y.wrapping_sub(1) };
+    z ^ index
+}
+
+pub fn write_branch(path: &Path) -> crate::Result<()> {
+    let words = emit(&BRANCH, BRANCH.len()-1)?;
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    std::fs::write(path, &bytes)?;
+    println!("PASS: emitted {} SPIR-V words from {} structured-branch SSA nodes", words.len(), BRANCH.len());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn rejects_invalid_ssa() {
+        assert!(emit(&[Op::Index, Op::BranchAddSub(0,0,0,1)], 1).is_err());
         assert!(emit(&[Op::UToF(0)], 0).is_err());
         assert!(emit(&[Op::Index, Op::FAdd(0,1)], 1).is_err());
         assert!(emit(&[Op::Index, Op::SelectUlt(0,0,0,1)], 1).is_err());
@@ -223,6 +270,24 @@ mod tests {
         assert_eq!(float_expected(3), 2.5f32.to_bits());
         assert_eq!(float_expected(1_048_575), 524288.5f32.to_bits());
         assert!(emit(&FLOAT, FLOAT.len()-1).is_ok());
+    }
+    #[test]
+    fn structured_branch_has_two_merges_and_phis() {
+        let module = emit(&BRANCH, BRANCH.len()-1).unwrap();
+        let mut at = 5;
+        let mut counts = [0; 3];
+        while at < module.len() {
+            match module[at] & 0xffff {
+                247 => counts[0] += 1,
+                250 => counts[1] += 1,
+                245 => counts[2] += 1,
+                _ => {}
+            }
+            let n = (module[at] >> 16) as usize;
+            assert!(n > 0 && at + n <= module.len());
+            at += n;
+        }
+        assert_eq!(counts, [2,2,2]);
     }
     #[test]
     fn encodes_complete_instruction_stream() {
