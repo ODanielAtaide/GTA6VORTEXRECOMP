@@ -60,6 +60,12 @@ impl Context {
             spirv::conditional_expected)
     }
 
+    /// Verify the synthetic finite FP32 arithmetic shader bit for bit.
+    pub fn compute_float(&mut self, path: &Path) -> Result<()> {
+        compute::run(&self.instance, self.physical, &self.device, self.family, path,
+            spirv::float_expected)
+    }
+
     /// Execute and verify the original synthetic full-screen graphics workload.
     /// Inputs must be trusted, validated versions of the supplied shaders.
     pub fn graphics(&mut self, vert: &Path, frag: &Path) -> Result<()> {
