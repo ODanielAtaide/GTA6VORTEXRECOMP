@@ -47,6 +47,31 @@ impl Drop for Resources<'_> {
 
 pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Device,
            family: u32, path: &Path, expected_value: fn(u32) -> u32) -> crate::Result<()> {
+    run_with_wave(instance, physical, d, family, path, expected_value, None)
+}
+
+pub fn run_with_wave(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Device,
+           family: u32, path: &Path, expected_value: fn(u32) -> u32, wave: Option<u32>) -> crate::Result<()> {
+    if let Some(size) = wave {
+        let mut features13 = vk::PhysicalDeviceVulkan13Features::default();
+        let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut features13);
+        unsafe { instance.get_physical_device_features2(physical, &mut features) };
+        let mut sizes = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+        let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
+        let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut sizes).push_next(&mut subgroup);
+        unsafe { instance.get_physical_device_properties2(physical, &mut props) };
+        if !matches!(size, 32 | 64)
+            || features13.subgroup_size_control == 0 || features13.compute_full_subgroups == 0
+            || size < sizes.min_subgroup_size || size > sizes.max_subgroup_size
+            || !sizes.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE)
+            || !subgroup.supported_stages.contains(vk::ShaderStageFlags::COMPUTE)
+            || !subgroup.supported_operations.contains(vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC)
+            || sizes.max_compute_workgroup_subgroups < 64 / size
+        {
+            return Err(format!("Required full compute subgroup size {size} unsupported").into());
+        }
+        println!("required compute subgroup size: {size}");
+    }
     let mode = std::env::var("AMD_VK_MEMORY").unwrap_or_else(|_| "host".to_owned());
     if !matches!(mode.as_str(), "host" | "bar" | "local") {
         return Err("AMD_VK_MEMORY must be host, bar or local".into());
@@ -111,9 +136,13 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Devi
         r.pipeline_layout = d.create_pipeline_layout(
             &vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts), None)?;
         r.shader = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)?;
-        let stage = vk::PipelineShaderStageCreateInfo::default()
+        let mut required_size = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(wave.unwrap_or(32));
+        let mut stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE).module(r.shader)
             .name(CStr::from_bytes_with_nul(b"main\0")?);
+        if wave.is_some() {
+            stage = stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS).push_next(&mut required_size);
+        }
         let info = vk::ComputePipelineCreateInfo::default().stage(stage).layout(r.pipeline_layout);
         let cache = crate::pipeline_cache::Cache::open(d, &props);
         let pipeline_start = Instant::now();
