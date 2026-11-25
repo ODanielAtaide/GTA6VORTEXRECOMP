@@ -16,6 +16,11 @@ pub enum Op {
     Shl(usize, usize),
     Shr(usize, usize),
     SelectUlt(usize, usize, usize, usize),
+    // All SSA values remain 32-bit words; these interpret words as IEEE f32.
+    UToF(usize),
+    FAdd(usize, usize),
+    FSub(usize, usize),
+    FMul(usize, usize),
 }
 
 fn instruction(out: &mut Vec<u32>, opcode: u16, args: &[u32]) {
@@ -31,16 +36,19 @@ pub fn emit(ops: &[Op], result: usize) -> crate::Result<Vec<u32>> {
         return Err("Invalid IR size or result".into());
     }
     for (i, op) in ops.iter().enumerate() {
-        if let Op::Add(a, b) | Op::Mul(a, b) | Op::Sub(a, b) | Op::And(a, b) | Op::Or(a, b) | Op::Xor(a, b) | Op::Shl(a, b) | Op::Shr(a, b) = *op {
+        if let Op::Add(a, b) | Op::Mul(a, b) | Op::Sub(a, b) | Op::And(a, b) | Op::Or(a, b) | Op::Xor(a, b) | Op::Shl(a, b) | Op::Shr(a, b) | Op::FAdd(a,b) | Op::FSub(a,b) | Op::FMul(a,b) = *op {
             if a >= i || b >= i { return Err("Invalid forward SSA reference".into()); }
+        }
+        if let Op::UToF(a) = *op {
+            if a >= i { return Err("Invalid conversion SSA reference".into()); }
         }
         if let Op::SelectUlt(a,b,t,f) = *op {
             if [a,b,t,f].iter().any(|&v| v >= i) { return Err("Invalid select SSA reference".into()); }
         }
     }
-    // IDs 17 and 18 are bool type and shift mask; each node reserves
-    // a result and a temporary ID for lowering compound operations.
-    let id = |i: usize| 19 + 2 * i as u32;
+    // IDs 17..19 are bool type, shift mask and f32 type.
+    // Each node reserves a result plus three temporary IDs.
+    let id = |i: usize| 20 + 4 * i as u32;
     let ptr = id(ops.len());
     let mut out = vec![0x07230203, 0x00010300, 0, ptr + 1, 0];
     let op = |out: &mut Vec<u32>, code, args: &[u32]| instruction(out, code, args);
@@ -59,6 +67,7 @@ pub fn emit(ops: &[Op], result: usize) -> crate::Result<Vec<u32>> {
     op(&mut out, 33, &[2, 1]); // function type
     op(&mut out, 21, &[3, 32, 0]); // uint
     op(&mut out, 20, &[17]); // bool
+    op(&mut out, 22, &[19, 32]); // f32
     op(&mut out, 23, &[4, 3, 3]); // uvec3
     op(&mut out, 32, &[5, 1, 4]); // Input pointer
     op(&mut out, 29, &[6, 3]); // runtime array
@@ -91,6 +100,18 @@ pub fn emit(ops: &[Op], result: usize) -> crate::Result<Vec<u32>> {
                 op(&mut out, 199, &[3, tmp, id(b), 18]);
                 let opcode = if matches!(node, Op::Shl(..)) { 196 } else { 194 };
                 op(&mut out, opcode, &[3, id(i), id(a), tmp]);
+            }
+            Op::UToF(a) => {
+                op(&mut out, 112, &[19, id(i)+1, id(a)]); // ConvertUToF
+                op(&mut out, 124, &[3, id(i), id(i)+1]); // Bitcast
+            }
+            Op::FAdd(a,b) | Op::FSub(a,b) | Op::FMul(a,b) => {
+                let tmp = id(i)+1;
+                op(&mut out, 124, &[19, tmp, id(a)]);
+                op(&mut out, 124, &[19, tmp+1, id(b)]);
+                let opcode = match node { Op::FAdd(..) => 129, Op::FSub(..) => 131, _ => 133 };
+                op(&mut out, opcode, &[19, tmp+2, tmp, tmp+1]);
+                op(&mut out, 124, &[3, id(i), tmp+2]);
             }
             Op::SelectUlt(a,b,t,f) => {
                 let tmp = id(i) + 1;
@@ -161,11 +182,33 @@ pub fn write_conditional(path: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+// Exact binary fractions over the bounded invocation domain; no NaNs,
+// denormals or rounding-mode assumptions are exercised by this test.
+pub const FLOAT: [Op; 8] = [
+    Op::Index, Op::UToF(0), Op::Constant(0x3f000000), Op::FMul(1,2),
+    Op::Constant(0x3fa00000), Op::FAdd(3,4),
+    Op::Constant(0x3e800000), Op::FSub(5,6),
+];
+
+pub fn float_expected(index: u32) -> u32 {
+    ((index as f32) * 0.5 + 1.25 - 0.25).to_bits()
+}
+
+pub fn write_float(path: &Path) -> crate::Result<()> {
+    let words = emit(&FLOAT, FLOAT.len()-1)?;
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    std::fs::write(path, &bytes)?;
+    println!("PASS: emitted {} SPIR-V words from {} FP32 SSA nodes", words.len(), FLOAT.len());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn rejects_invalid_ssa() {
+        assert!(emit(&[Op::UToF(0)], 0).is_err());
+        assert!(emit(&[Op::Index, Op::FAdd(0,1)], 1).is_err());
         assert!(emit(&[Op::Index, Op::SelectUlt(0,0,0,1)], 1).is_err());
         assert!(emit(&[Op::Index, Op::Shl(0,1)], 1).is_err());
         assert!(emit(&[Op::Xor(0,0)], 0).is_err());
@@ -173,6 +216,13 @@ mod tests {
         assert!(emit(&[], 0).is_err());
         assert!(emit(&[Op::Add(0,0)], 0).is_err());
         assert!(emit(&[Op::Index], 1).is_err());
+    }
+    #[test]
+    fn exact_float_reference() {
+        assert_eq!(float_expected(0), 1.0f32.to_bits());
+        assert_eq!(float_expected(3), 2.5f32.to_bits());
+        assert_eq!(float_expected(1_048_575), 524288.5f32.to_bits());
+        assert!(emit(&FLOAT, FLOAT.len()-1).is_ok());
     }
     #[test]
     fn encodes_complete_instruction_stream() {
