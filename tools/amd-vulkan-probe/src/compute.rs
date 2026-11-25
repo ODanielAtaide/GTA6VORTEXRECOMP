@@ -115,7 +115,9 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Devi
             .stage(vk::ShaderStageFlags::COMPUTE).module(r.shader)
             .name(CStr::from_bytes_with_nul(b"main\0")?);
         let info = vk::ComputePipelineCreateInfo::default().stage(stage).layout(r.pipeline_layout);
-        r.pipeline = match d.create_compute_pipelines(vk::PipelineCache::null(), &[info], None) {
+        let cache = crate::pipeline_cache::Cache::open(d, &props);
+        let pipeline_start = Instant::now();
+        r.pipeline = match d.create_compute_pipelines(cache.handle(), &[info], None) {
             Ok(pipelines) => pipelines[0],
             Err((pipelines, err)) => {
                 for p in pipelines { d.destroy_pipeline(p, None); }
@@ -123,6 +125,8 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Devi
             }
         };
 
+        println!("compute pipeline creation: {:.3} ms", pipeline_start.elapsed().as_secs_f64() * 1000.);
+        cache.save();
         r.commands = d.create_command_pool(&vk::CommandPoolCreateInfo::default()
             .queue_family_index(family), None)?;
         let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default()
