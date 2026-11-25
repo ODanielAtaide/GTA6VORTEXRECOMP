@@ -1,0 +1,12 @@
+[package]
+name = "amd-vulkan-probe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+license = "GPL-3.0-or-later"
+
+[workspace]
+
+[dependencies]
+ash = "=0.38.0"
