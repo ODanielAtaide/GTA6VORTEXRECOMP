@@ -10,3 +10,4 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 ash = "=0.38.0"
+vortex-shader = { path = "../../crates/vortex-shader", default-features = false }
