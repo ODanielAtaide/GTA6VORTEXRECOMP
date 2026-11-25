@@ -89,6 +89,11 @@ impl Context {
             self.family, path, expected, Some(size))
     }
 
+    /// Verify upload and sampling of an original synthetic RGBA8 texture.
+    pub fn graphics_texture(&mut self, vert: &Path, frag: &Path) -> Result<()> {
+        graphics::run_texture(&self.instance, self.physical, &self.device, self.family, vert, frag)
+    }
+
     /// Execute and verify the original synthetic full-screen graphics workload.
     /// Inputs must be trusted, validated versions of the supplied shaders.
     pub fn graphics(&mut self, vert: &Path, frag: &Path) -> Result<()> {
