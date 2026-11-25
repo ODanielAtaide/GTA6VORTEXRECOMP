@@ -89,6 +89,11 @@ impl Context {
             self.family, path, expected, Some(size))
     }
 
+    /// Verify indexed original geometry with sampled UV attributes.
+    pub fn graphics_indexed(&mut self, vert: &Path, frag: &Path) -> Result<()> {
+        graphics::run_indexed(&self.instance, self.physical, &self.device, self.family, vert, frag)
+    }
+
     /// Verify upload and sampling of an original synthetic RGBA8 texture.
     pub fn graphics_texture(&mut self, vert: &Path, frag: &Path) -> Result<()> {
         graphics::run_texture(&self.instance, self.physical, &self.device, self.family, vert, frag)
