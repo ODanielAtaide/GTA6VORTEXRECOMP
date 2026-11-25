@@ -137,8 +137,10 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Devi
             .viewport_state(&viewport).rasterization_state(&raster)
             .multisample_state(&multisample).color_blend_state(&blend)
             .layout(h.layout).push_next(&mut rendering);
+        let props = instance.get_physical_device_properties(physical);
+        let cache = crate::pipeline_cache::Cache::open(d, &props);
         let pipeline_start = Instant::now();
-        h.pipeline = match d.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline], None) {
+        h.pipeline = match d.create_graphics_pipelines(cache.handle(), &[pipeline], None) {
             Ok(pipelines) => pipelines[0],
             Err((pipelines, err)) => {
                 for p in pipelines { d.destroy_pipeline(p, None); }
@@ -147,6 +149,7 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Devi
         };
 
         println!("graphics pipeline creation: {:.3} ms", pipeline_start.elapsed().as_secs_f64() * 1000.);
+        cache.save();
         h.commands = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None)?;
         let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default()
             .command_pool(h.commands).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1))?[0];
