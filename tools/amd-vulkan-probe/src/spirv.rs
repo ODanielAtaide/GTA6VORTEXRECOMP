@@ -9,6 +9,10 @@ pub enum Op {
     Constant(u32),
     Add(usize, usize),
     Mul(usize, usize),
+    Sub(usize, usize),
+    And(usize, usize),
+    Or(usize, usize),
+    Xor(usize, usize),
 }
 
 fn instruction(out: &mut Vec<u32>, opcode: u16, args: &[u32]) {
@@ -24,7 +28,7 @@ pub fn emit(ops: &[Op], result: usize) -> crate::Result<Vec<u32>> {
         return Err("Invalid IR size or result".into());
     }
     for (i, op) in ops.iter().enumerate() {
-        if let Op::Add(a, b) | Op::Mul(a, b) = *op {
+        if let Op::Add(a, b) | Op::Mul(a, b) | Op::Sub(a, b) | Op::And(a, b) | Op::Or(a, b) | Op::Xor(a, b) = *op {
             if a >= i || b >= i { return Err("Invalid forward SSA reference".into()); }
         }
     }
@@ -70,6 +74,10 @@ pub fn emit(ops: &[Op], result: usize) -> crate::Result<Vec<u32>> {
             Op::Constant(_) => {}
             Op::Add(a,b) => op(&mut out, 128, &[3, id(i), id(a), id(b)]),
             Op::Mul(a,b) => op(&mut out, 132, &[3, id(i), id(a), id(b)]),
+            Op::Sub(a,b) => op(&mut out, 130, &[3, id(i), id(a), id(b)]),
+            Op::And(a,b) => op(&mut out, 199, &[3, id(i), id(a), id(b)]),
+            Op::Or(a,b) => op(&mut out, 197, &[3, id(i), id(a), id(b)]),
+            Op::Xor(a,b) => op(&mut out, 198, &[3, id(i), id(a), id(b)]),
         }
     }
     op(&mut out, 65, &[9, ptr, 11, 13, 16]); // AccessChain
@@ -89,11 +97,37 @@ pub fn write_demo(path: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+// Original workload exercising every supported operation and wrapping arithmetic.
+pub const MIXED: [Op; 12] = [
+    Op::Index, Op::Constant(0xdeadbeef), Op::Xor(0, 1),
+    Op::Constant(1664525), Op::Mul(2, 3),
+    Op::Constant(0x00ffffff), Op::And(4, 5),
+    Op::Constant(0xa5000000), Op::Or(6, 7),
+    Op::Sub(8, 0), Op::Constant(1013904223), Op::Add(9, 10),
+];
+
+/// A CPU oracle for the fixed test program. Keep it independent of the emitter.
+pub fn mixed_expected(index: u32) -> u32 {
+    let v = (index ^ 0xdeadbeef).wrapping_mul(1664525);
+    ((v & 0x00ffffff) | 0xa5000000)
+        .wrapping_sub(index).wrapping_add(1013904223)
+}
+
+pub fn write_mixed(path: &Path) -> crate::Result<()> {
+    let words = emit(&MIXED, MIXED.len() - 1)?;
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    std::fs::write(path, &bytes)?;
+    println!("PASS: emitted {} SPIR-V words from {} mixed SSA nodes", words.len(), MIXED.len());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn rejects_invalid_ssa() {
+        assert!(emit(&[Op::Xor(0,0)], 0).is_err());
+        assert!(emit(&[Op::Constant(3), Op::Sub(0,1)], 1).is_err());
         assert!(emit(&[], 0).is_err());
         assert!(emit(&[Op::Add(0,0)], 0).is_err());
         assert!(emit(&[Op::Index], 1).is_err());
