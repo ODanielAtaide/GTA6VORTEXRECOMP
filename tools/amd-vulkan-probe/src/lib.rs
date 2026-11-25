@@ -3,6 +3,7 @@
 mod compute;
 mod graphics;
 mod pipeline_cache;
+pub mod spirv;
 use ash::{vk, Entry};
 use std::{error::Error, ffi::CStr, path::Path};
 
