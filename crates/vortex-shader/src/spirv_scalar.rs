@@ -34,7 +34,10 @@ pub fn emit_scalar(program: &ir::Program, output: Reg) -> Result<Vec<u32>, Shade
         let Fields::Sop { dst: Some(Operand::Scalar { code: dst @ 0..=105, dwords: 1 }), src, imm: None } = &inst.fields else {
             return Err(reject());
         };
-        if inst.reads.iter().any(|(r,_)| !matches!(r, Reg::S(0..=105))) {
+        let uses_scc = matches!(inst.name(), "s_addc_u32" | "s_subb_u32" | "s_cselect_b32");
+        if inst.reads.iter().any(|(r,_)| !matches!(r, Reg::S(0..=105)) && !(*r == Reg::Scc && uses_scc))
+            || inst.read(Reg::Scc).is_some() != uses_scc
+        {
             return Err(reject());
         }
         let mut args = Vec::new();
@@ -53,6 +56,45 @@ pub fn emit_scalar(program: &ir::Program, output: Reg) -> Result<Vec<u32>, Shade
         }
         let (result, scc) = match (inst.name(), args.as_slice()) {
             ("s_mov_b32", &[a]) => (a, None),
+            ("s_sub_u32", &[a,b]) => {
+                let result = push(&mut ops, Op::Sub(a,b));
+                let one = push(&mut ops, Op::Constant(1));
+                let zero = push(&mut ops, Op::Constant(0));
+                let borrow = push(&mut ops, Op::SelectUlt(a,b,one,zero));
+                (result, Some(borrow))
+            }
+            (name @ ("s_addc_u32" | "s_subb_u32"), &[a,b]) => {
+                let cin = *values.get(&inst.read(Reg::Scc).ok_or_else(reject)?).ok_or_else(reject)?;
+                let one = push(&mut ops, Op::Constant(1));
+                let zero = push(&mut ops, Op::Constant(0));
+                let (result, c0, c1) = if name == "s_addc_u32" {
+                    let partial = push(&mut ops, Op::Add(a,b));
+                    let result = push(&mut ops, Op::Add(partial,cin));
+                    let c0 = push(&mut ops, Op::SelectUlt(partial,a,one,zero));
+                    let c1 = push(&mut ops, Op::SelectUlt(result,partial,one,zero));
+                    (result,c0,c1)
+                } else {
+                    let partial = push(&mut ops, Op::Sub(a,b));
+                    let result = push(&mut ops, Op::Sub(partial,cin));
+                    let c0 = push(&mut ops, Op::SelectUlt(a,b,one,zero));
+                    let c1 = push(&mut ops, Op::SelectUlt(partial,cin,one,zero));
+                    (result,c0,c1)
+                };
+                (result, Some(push(&mut ops, Op::Or(c0,c1))))
+            }
+            ("s_cselect_b32", &[a,b]) => {
+                let cin = *values.get(&inst.read(Reg::Scc).ok_or_else(reject)?).ok_or_else(reject)?;
+                let zero = push(&mut ops, Op::Constant(0));
+                (push(&mut ops, Op::SelectUlt(zero,cin,a,b)), None)
+            }
+            ("s_mul_i32", &[a,b]) => (push(&mut ops, Op::Mul(a,b)), None),
+            (name @ ("s_lshl_b32" | "s_lshr_b32"), &[a,b]) => {
+                let result = push(&mut ops, if name == "s_lshl_b32" { Op::Shl(a,b) } else { Op::Shr(a,b) });
+                let one = push(&mut ops, Op::Constant(1));
+                let zero = push(&mut ops, Op::Constant(0));
+                let flag = push(&mut ops, Op::SelectUlt(zero,result,one,zero));
+                (result, Some(flag))
+            }
             ("s_add_u32", &[a,b]) => {
                 let result = push(&mut ops, Op::Add(a,b));
                 let one = push(&mut ops, Op::Constant(1));
@@ -100,9 +142,29 @@ pub fn demo() -> Result<Vec<u32>, ShaderError> {
     emit_scalar(&program, Reg::S(3))
 }
 
+/// Original scalar test with carry, borrow, SCC selection, and shifts.
+/// s0=-1; s1=s0+1=0 carry; s2=7+2+carry=10;
+/// s3=0-1=MAX borrow; s4=10-2-borrow=7; SCC=0;
+/// s5=3 if SCC else 7; s6=s5*3=21; s7=s6<<2=84;
+/// s8=s7>>1=42.  Each instruction uses the original decoder.
+pub fn carry_demo() -> Result<Vec<u32>, ShaderError> {
+    let code: Vec<u8> = [
+        0xbe80_03c1u32, 0x8001_8100, 0x8202_8287,
+        0x8083_8180, 0x8284_8202 | (1 << 23),
+        0x8505_8783, 0x9306_8305, 0x8f07_8206,
+        0x9008_8107, 0xbf81_0000,
+    ].into_iter().flat_map(u32::to_le_bytes).collect();
+    let program = ir::build(&code, false, 0)?;
+    emit_scalar(&program, Reg::S(8))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn carry_fixture_emits() {
+        assert_eq!(carry_demo().unwrap()[0], 0x07230203);
+    }
     #[test]
     fn decoded_scalar_fixture_emits() {
         let words = demo().unwrap();
