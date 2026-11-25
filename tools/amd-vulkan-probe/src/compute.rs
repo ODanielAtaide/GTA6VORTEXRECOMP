@@ -46,7 +46,7 @@ impl Drop for Resources<'_> {
 }
 
 pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Device,
-           family: u32, path: &Path) -> crate::Result<()> {
+           family: u32, path: &Path, expected_value: fn(u32) -> u32) -> crate::Result<()> {
     let mode = std::env::var("AMD_VK_MEMORY").unwrap_or_else(|_| "host".to_owned());
     if !matches!(mode.as_str(), "host" | "bar" | "local") {
         return Err("AMD_VK_MEMORY must be host, bar or local".into());
@@ -189,7 +189,7 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Devi
         r.mapped_memory = readable;
         let output = std::slice::from_raw_parts(ptr.cast::<u32>(), WORDS);
         for (i, &actual) in output.iter().enumerate() {
-            let expected = (i as u32).wrapping_mul(1664525).wrapping_add(1013904223);
+            let expected = expected_value(i as u32);
             if actual != expected {
                 return Err(format!("mismatch at {i}: {actual} != {expected}").into());
             }
