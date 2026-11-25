@@ -10,7 +10,9 @@ struct Resources<'a> {
     device: &'a ash::Device,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
-    mapped: bool,
+    readback: vk::Buffer,
+    readback_memory: vk::DeviceMemory,
+    mapped_memory: vk::DeviceMemory,
     layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
     pipeline_layout: vk::PipelineLayout,
@@ -26,7 +28,7 @@ impl Drop for Resources<'_> {
         let d = self.device;
         unsafe {
             let _ = d.device_wait_idle();
-            if self.mapped { d.unmap_memory(self.memory); }
+            if self.mapped_memory != vk::DeviceMemory::null() { d.unmap_memory(self.mapped_memory); }
             d.destroy_query_pool(self.queries, None);
             d.destroy_semaphore(self.timeline, None);
             d.destroy_command_pool(self.commands, None);
@@ -35,6 +37,8 @@ impl Drop for Resources<'_> {
             d.destroy_pipeline_layout(self.pipeline_layout, None);
             d.destroy_descriptor_pool(self.pool, None);
             d.destroy_descriptor_set_layout(self.layout, None);
+            d.destroy_buffer(self.readback, None);
+            d.free_memory(self.readback_memory, None);
             d.destroy_buffer(self.buffer, None);
             d.free_memory(self.memory, None);
         }
@@ -43,10 +47,17 @@ impl Drop for Resources<'_> {
 
 pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Device,
            family: u32, path: &Path) -> crate::Result<()> {
+    let mode = std::env::var("AMD_VK_MEMORY").unwrap_or_else(|_| "host".to_owned());
+    if !matches!(mode.as_str(), "host" | "bar" | "local") {
+        return Err("AMD_VK_MEMORY must be host, bar or local".into());
+    }
+    let staged = mode == "local";
+    println!("memory mode: {mode}");
     let words = ash::util::read_spv(&mut Cursor::new(std::fs::read(path)?))?;
     let mut r = Resources {
         device: d, buffer: vk::Buffer::null(), memory: vk::DeviceMemory::null(),
-        mapped: false, layout: vk::DescriptorSetLayout::null(),
+        readback: vk::Buffer::null(), readback_memory: vk::DeviceMemory::null(),
+        mapped_memory: vk::DeviceMemory::null(), layout: vk::DescriptorSetLayout::null(),
         pool: vk::DescriptorPool::null(), pipeline_layout: vk::PipelineLayout::null(),
         shader: vk::ShaderModule::null(), pipeline: vk::Pipeline::null(),
         commands: vk::CommandPool::null(), timeline: vk::Semaphore::null(),
@@ -61,25 +72,27 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Devi
 
     unsafe {
         r.buffer = d.create_buffer(&vk::BufferCreateInfo::default()
-            .size(BYTES).usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .size(BYTES).usage(vk::BufferUsageFlags::STORAGE_BUFFER | if staged { vk::BufferUsageFlags::TRANSFER_SRC } else { vk::BufferUsageFlags::empty() })
             .sharing_mode(vk::SharingMode::EXCLUSIVE), None)?;
         let req = d.get_buffer_memory_requirements(r.buffer);
-        let required = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let excluded = vk::MemoryPropertyFlags::DEVICE_COHERENT_AMD
-            | vk::MemoryPropertyFlags::DEVICE_UNCACHED_AMD;
-        let index = (0..mem.memory_type_count)
-            .filter(|&i| (req.memory_type_bits & (1u32 << i)) != 0)
-            .filter(|&i| {
-                let f = mem.memory_types[i as usize].property_flags;
-                f.contains(required) && !f.intersects(excluded)
-            })
-            .max_by_key(|&i| mem.memory_types[i as usize].property_flags
-                .contains(vk::MemoryPropertyFlags::HOST_CACHED))
-            .ok_or("No compatible host-coherent memory")?;
+        let index = memory_type(&mem, req.memory_type_bits, &mode)
+            .ok_or_else(|| format!("No compatible memory for mode {mode}"))?;
         println!("compute memory type: {index}; {:?}", mem.memory_types[index as usize].property_flags);
         r.memory = d.allocate_memory(&vk::MemoryAllocateInfo::default()
             .allocation_size(req.size).memory_type_index(index), None)?;
         d.bind_buffer_memory(r.buffer, r.memory, 0)?;
+        if staged {
+            r.readback = d.create_buffer(&vk::BufferCreateInfo::default()
+                .size(BYTES).usage(vk::BufferUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE), None)?;
+            let req = d.get_buffer_memory_requirements(r.readback);
+            let index = memory_type(&mem, req.memory_type_bits, "host")
+                .ok_or("No host-coherent staging memory")?;
+            r.readback_memory = d.allocate_memory(&vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size).memory_type_index(index), None)?;
+            d.bind_buffer_memory(r.readback, r.readback_memory, 0)?;
+            println!("readback memory type: {index}");
+        }
 
         let bindings = [vk::DescriptorSetLayoutBinding::default().binding(0)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1)
@@ -132,9 +145,18 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Devi
         if bits > 0 {
             d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::ALL_COMMANDS, r.queries, 1);
         }
+        if staged {
+            let transfer = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)];
+            d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&transfer));
+            d.cmd_copy_buffer(cmd, r.buffer, r.readback, &[vk::BufferCopy::default().size(BYTES)]);
+        }
         let barrier = [vk::MemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-            .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+            .src_stage_mask(if staged { vk::PipelineStageFlags2::COPY } else { vk::PipelineStageFlags2::COMPUTE_SHADER })
+            .src_access_mask(if staged { vk::AccessFlags2::TRANSFER_WRITE } else { vk::AccessFlags2::SHADER_WRITE })
             .dst_stage_mask(vk::PipelineStageFlags2::HOST)
             .dst_access_mask(vk::AccessFlags2::HOST_READ)];
         d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&barrier));
@@ -157,8 +179,10 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Devi
             println!("GPU dispatch timestamp interval: {:.3} ms", ticks as f64 * props.limits.timestamp_period as f64 / 1e6);
         }
 
-        let ptr = d.map_memory(r.memory, 0, BYTES, vk::MemoryMapFlags::empty())?;
-        r.mapped = true;
+        let read_start = Instant::now();
+        let readable = if staged { r.readback_memory } else { r.memory };
+        let ptr = d.map_memory(readable, 0, BYTES, vk::MemoryMapFlags::empty())?;
+        r.mapped_memory = readable;
         let output = std::slice::from_raw_parts(ptr.cast::<u32>(), WORDS);
         for (i, &actual) in output.iter().enumerate() {
             let expected = (i as u32).wrapping_mul(1664525).wrapping_add(1013904223);
@@ -166,7 +190,29 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Devi
                 return Err(format!("mismatch at {i}: {actual} != {expected}").into());
             }
         }
+        println!("CPU map + verify: {:.3} ms", read_start.elapsed().as_secs_f64() * 1000.0);
         println!("PASS: verified {WORDS} SPIR-V compute outputs ({BYTES} bytes)");
     }
     Ok(())
+}
+
+fn memory_type(mem: &vk::PhysicalDeviceMemoryProperties, bits: u32, mode: &str) -> Option<u32> {
+    use vk::MemoryPropertyFlags as F;
+    let host = F::HOST_VISIBLE | F::HOST_COHERENT;
+    let excluded = F::DEVICE_COHERENT_AMD | F::DEVICE_UNCACHED_AMD;
+    let required = match mode {
+        "host" => host,
+        "bar" => host | F::DEVICE_LOCAL,
+        "local" => F::DEVICE_LOCAL,
+        _ => return None,
+    };
+    (0..mem.memory_type_count)
+        .filter(|&i| (bits & (1u32 << i)) != 0)
+        .filter(|&i| {
+            let f = mem.memory_types[i as usize].property_flags;
+            f.contains(required) && !f.intersects(excluded)
+                && (mode != "host" || !f.contains(F::DEVICE_LOCAL))
+                && (mode != "local" || !f.contains(F::HOST_VISIBLE))
+        })
+        .max_by_key(|&i| mem.memory_types[i as usize].property_flags.contains(F::HOST_CACHED))
 }
