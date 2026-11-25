@@ -1,0 +1,11 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) buffer Output {
+    uint values[];
+} output_data;
+void main() {
+    uint sum = subgroupAdd(1u);
+    output_data.values[gl_GlobalInvocationID.x] = (gl_SubgroupSize << 16) | sum;
+}
