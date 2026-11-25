@@ -66,6 +66,11 @@ fn memory_type(mem: &vk::PhysicalDeviceMemoryProperties, bits: u32,
 
 pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Device,
            family: u32, vert_path: &Path, frag_path: &Path) -> crate::Result<()> {
+    let draws: u32 = std::env::var("AMD_VK_DRAWS").unwrap_or_else(|_| "1".to_owned()).parse()?;
+    if !(1..=4096).contains(&draws) { return Err("AMD_VK_DRAWS must be 1..=4096".into()); }
+    let mode = std::env::var("AMD_VK_DRAW_MODE").unwrap_or_else(|_| "direct".to_owned());
+    if !matches!(mode.as_str(), "direct" | "instanced") { return Err("Unknown AMD_VK_DRAW_MODE".into()); }
+    println!("draw mode: {mode}; triangles: {draws}");
     let vert_words = ash::util::read_spv(&mut Cursor::new(std::fs::read(vert_path)?))?;
     let frag_words = ash::util::read_spv(&mut Cursor::new(std::fs::read(frag_path)?))?;
     let mut resources = Resources { d, h: Handles::default() };
@@ -132,6 +137,7 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Devi
             .viewport_state(&viewport).rasterization_state(&raster)
             .multisample_state(&multisample).color_blend_state(&blend)
             .layout(h.layout).push_next(&mut rendering);
+        let pipeline_start = Instant::now();
         h.pipeline = match d.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline], None) {
             Ok(pipelines) => pipelines[0],
             Err((pipelines, err)) => {
@@ -140,10 +146,12 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Devi
             }
         };
 
+        println!("graphics pipeline creation: {:.3} ms", pipeline_start.elapsed().as_secs_f64() * 1000.);
         h.commands = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None)?;
         let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default()
             .command_pool(h.commands).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1))?[0];
         h.fence = d.create_fence(&vk::FenceCreateInfo::default(), None)?;
+        let record_start = Instant::now();
         d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
         let to_color = [vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::NONE)
@@ -160,7 +168,13 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Devi
             .clear_value(vk::ClearValue { color: vk::ClearColorValue { float32: [0., 0., 0., 1.] } })];
         d.cmd_begin_rendering(cmd, &vk::RenderingInfo::default().render_area(area).layer_count(1).color_attachments(&colors));
         d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, h.pipeline);
-        d.cmd_draw(cmd, 3, 1, 0, 0);
+        let draw_start = Instant::now();
+        if mode == "instanced" {
+            d.cmd_draw(cmd, 3, draws, 0, 0);
+        } else {
+            for _ in 0..draws { d.cmd_draw(cmd, 3, 1, 0, 0); }
+        }
+        let draw_record_ms = draw_start.elapsed().as_secs_f64() * 1000.;
         d.cmd_end_rendering(cmd);
 
         let to_copy = [vk::ImageMemoryBarrier2::default()
@@ -180,6 +194,8 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Devi
             .dst_stage_mask(vk::PipelineStageFlags2::HOST).dst_access_mask(vk::AccessFlags2::HOST_READ)];
         d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&host));
         d.end_command_buffer(cmd)?;
+        println!("draw recording: {:.3} ms", draw_record_ms);
+        println!("total command recording: {:.3} ms", record_start.elapsed().as_secs_f64() * 1000.);
         let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
         let submit = [vk::SubmitInfo2::default().command_buffer_infos(&commands)];
         let queue = d.get_device_queue(family, 0);
