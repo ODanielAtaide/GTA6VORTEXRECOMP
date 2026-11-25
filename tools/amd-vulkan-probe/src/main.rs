@@ -4,6 +4,11 @@ use std::path::Path;
 
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if let [flag, output] = args.as_slice() {
+        if flag == "--emit-demo" {
+            return amd_vulkan_probe::spirv::write_demo(Path::new(output));
+        }
+    }
     let mut context = Context::new()?;
     match args.as_slice() {
         [flag, vert, frag] if flag == "--graphics" => context.graphics(Path::new(vert), Path::new(frag)),
