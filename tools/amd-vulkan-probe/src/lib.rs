@@ -44,7 +44,14 @@ impl Context {
     /// Execute and verify the original synthetic compute shader.
     /// The shader input must be a trusted, validated version of write.comp.
     pub fn compute(&mut self, path: &Path) -> Result<()> {
-        compute::run(&self.instance, self.physical, &self.device, self.family, path)
+        compute::run(&self.instance, self.physical, &self.device, self.family, path,
+            |i| i.wrapping_mul(1664525).wrapping_add(1013904223))
+    }
+
+    /// Verify the original mixed arithmetic and bitwise shader.
+    pub fn compute_mixed(&mut self, path: &Path) -> Result<()> {
+        compute::run(&self.instance, self.physical, &self.device, self.family, path,
+            spirv::mixed_expected)
     }
 
     /// Execute and verify the original synthetic full-screen graphics workload.
