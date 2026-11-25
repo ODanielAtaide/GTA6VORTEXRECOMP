@@ -66,6 +66,17 @@ impl Context {
             spirv::float_expected)
     }
 
+    /// Verify subgroup size and reduction on the supplied original wave.comp shader.
+    pub fn compute_wave(&mut self, path: &Path, size: u32) -> Result<()> {
+        let expected: fn(u32) -> u32 = match size {
+            32 => |_| (32 << 16) | 32,
+            64 => |_| (64 << 16) | 64,
+            _ => return Err("Wave size must be 32 or 64".into()),
+        };
+        compute::run_with_wave(&self.instance, self.physical, &self.device,
+            self.family, path, expected, Some(size))
+    }
+
     /// Execute and verify the original synthetic full-screen graphics workload.
     /// Inputs must be trusted, validated versions of the supplied shaders.
     pub fn graphics(&mut self, vert: &Path, frag: &Path) -> Result<()> {
@@ -135,7 +146,9 @@ fn select_device(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, ash::D
     let priority = [1.0];
     let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priority)];
     let mut enabled12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
-    let mut enabled13 = vk::PhysicalDeviceVulkan13Features::default().synchronization2(true).dynamic_rendering(true);
+    let mut enabled13 = vk::PhysicalDeviceVulkan13Features::default().synchronization2(true).dynamic_rendering(true)
+        .subgroup_size_control(f13.subgroup_size_control != 0)
+        .compute_full_subgroups(f13.compute_full_subgroups != 0);
     let device_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queues).push_next(&mut enabled12).push_next(&mut enabled13);
     let device = unsafe { instance.create_device(physical, &device_info, None)? };
