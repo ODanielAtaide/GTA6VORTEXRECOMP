@@ -5,6 +5,9 @@ use std::path::Path;
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if let [flag, output] = args.as_slice() {
+        if flag == "--emit-float" {
+            return amd_vulkan_probe::spirv::write_float(Path::new(output));
+        }
         if flag == "--emit-conditional" {
             return amd_vulkan_probe::spirv::write_conditional(Path::new(output));
         }
@@ -24,10 +27,11 @@ fn main() -> Result<()> {
             println!("PASS: compute and graphics on the same Vulkan device");
             Ok(())
         }
+        [flag, path] if flag == "--verify-float" => context.compute_float(Path::new(path)),
         [flag, path] if flag == "--verify-conditional" => context.compute_conditional(Path::new(path)),
         [flag, path] if flag == "--verify-mixed" => context.compute_mixed(Path::new(path)),
         [path] => context.compute(Path::new(path)),
         [] => Ok(()),
-        _ => Err("Usage: amd-vulkan-probe [--emit-conditional out.spv | --verify-conditional in.spv | --emit-demo out.spv | --emit-mixed out.spv | --verify-mixed mixed.spv | compute.spv | --graphics vertex.spv fragment.spv | --combined compute.spv vertex.spv fragment.spv]".into()),
+        _ => Err("Usage: amd-vulkan-probe [--emit-float out.spv | --verify-float in.spv | --emit-conditional out.spv | --verify-conditional in.spv | --emit-demo out.spv | --emit-mixed out.spv | --verify-mixed mixed.spv | compute.spv | --graphics vertex.spv fragment.spv | --combined compute.spv vertex.spv fragment.spv]".into()),
     }
 }
