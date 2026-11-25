@@ -2,6 +2,7 @@
 // Independent synthetic capability probe; does not load a title.
 mod compute;
 mod graphics;
+mod pipeline_cache;
 use ash::{vk, Entry};
 use std::{error::Error, ffi::CStr};
 
