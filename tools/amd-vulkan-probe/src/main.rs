@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Independent synthetic capability probe; does not load a title.
 mod compute;
+mod graphics;
 use ash::{vk, Entry};
 use std::{error::Error, ffi::CStr};
 
@@ -78,9 +79,13 @@ fn probe(instance: &ash::Instance) -> Result<()> {
         .queue_create_infos(&queues).push_next(&mut enabled12).push_next(&mut enabled13);
     let device = unsafe { instance.create_device(physical, &device_info, None)? };
     println!("PASS: AMD Vulkan logical device initialized");
-    let result = match std::env::args_os().nth(1) {
-        Some(path) => compute::run(instance, physical, &device, family, std::path::Path::new(&path)),
-        None => Ok(()),
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let result = match args.as_slice() {
+        [flag, vert, frag] if flag == "--graphics" => graphics::run(
+            instance, physical, &device, family, std::path::Path::new(vert), std::path::Path::new(frag)),
+        [path] => compute::run(instance, physical, &device, family, std::path::Path::new(path)),
+        [] => Ok(()),
+        _ => Err("Usage: amd-vulkan-probe [compute.spv | --graphics vertex.spv fragment.spv]".into()),
     };
     unsafe { device.destroy_device(None) };
     result
