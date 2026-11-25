@@ -54,6 +54,12 @@ impl Context {
             spirv::mixed_expected)
     }
 
+    /// Verify the synthetic shift and unsigned conditional-selection shader.
+    pub fn compute_conditional(&mut self, path: &Path) -> Result<()> {
+        compute::run(&self.instance, self.physical, &self.device, self.family, path,
+            spirv::conditional_expected)
+    }
+
     /// Execute and verify the original synthetic full-screen graphics workload.
     /// Inputs must be trusted, validated versions of the supplied shaders.
     pub fn graphics(&mut self, vert: &Path, frag: &Path) -> Result<()> {
