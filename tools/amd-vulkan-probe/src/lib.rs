@@ -66,6 +66,12 @@ impl Context {
             spirv::float_expected)
     }
 
+    /// Verify the original synthetic bounded-loop shader.
+    pub fn compute_loop(&mut self, path: &Path) -> Result<()> {
+        compute::run(&self.instance, self.physical, &self.device, self.family, path,
+            spirv::loop_expected)
+    }
+
     /// Verify structured control flow in the original synthetic shader.
     pub fn compute_branch(&mut self, path: &Path) -> Result<()> {
         compute::run(&self.instance, self.physical, &self.device, self.family, path,
