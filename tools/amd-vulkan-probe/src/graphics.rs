@@ -9,6 +9,13 @@ const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const TW: u32 = 64;
 const TH: u32 = 64;
 const TEXTURE_BYTES: u64 = (TW * TH * 4) as u64;
+const INDEX_OFFSET: u64 = 64;
+const GEOMETRY_BYTES: u64 = INDEX_OFFSET + 12;
+const VERTICES: [[f32;4];4] = [
+    [-1., -1., 0., 0.], [1., -1., 1., 0.],
+    [1., 1., 1., 1.], [-1., 1., 0., 1.],
+];
+const INDICES: [u16;6] = [0,1,2,0,2,3];
 
 fn texel(x: u32, y: u32) -> [u8; 4] {
     [(x * 3 + y) as u8, (y * 5 + x) as u8, (x ^ y) as u8, 255]
@@ -36,6 +43,10 @@ struct Handles {
     sampler: vk::Sampler,
     descriptor_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
+    geometry: vk::Buffer,
+    geometry_memory: vk::DeviceMemory,
+    geometry_upload: vk::Buffer,
+    geometry_upload_memory: vk::DeviceMemory,
 }
 
 struct Resources<'a> {
@@ -60,6 +71,10 @@ impl Drop for Resources<'_> {
             d.destroy_image_view(h.texture_view, None);
             d.destroy_image(h.texture, None);
             d.free_memory(h.texture_memory, None);
+            d.destroy_buffer(h.geometry, None);
+            d.free_memory(h.geometry_memory, None);
+            d.destroy_buffer(h.geometry_upload, None);
+            d.free_memory(h.geometry_upload_memory, None);
             d.destroy_buffer(h.upload, None);
             d.free_memory(h.upload_memory, None);
             d.destroy_shader_module(h.vert, None);
@@ -89,21 +104,26 @@ fn memory_type(mem: &vk::PhysicalDeviceMemoryProperties, bits: u32,
 
 pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Device,
            family: u32, vert_path: &Path, frag_path: &Path) -> crate::Result<()> {
-    run_inner(instance, physical, d, family, vert_path, frag_path, false)
+    run_inner(instance, physical, d, family, vert_path, frag_path, false, false)
 }
 
 pub fn run_texture(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Device,
            family: u32, vert_path: &Path, frag_path: &Path) -> crate::Result<()> {
-    run_inner(instance, physical, d, family, vert_path, frag_path, true)
+    run_inner(instance, physical, d, family, vert_path, frag_path, true, false)
+}
+
+pub fn run_indexed(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Device,
+           family: u32, vert_path: &Path, frag_path: &Path) -> crate::Result<()> {
+    run_inner(instance, physical, d, family, vert_path, frag_path, true, true)
 }
 
 fn run_inner(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Device,
-           family: u32, vert_path: &Path, frag_path: &Path, textured: bool) -> crate::Result<()> {
+           family: u32, vert_path: &Path, frag_path: &Path, textured: bool, indexed: bool) -> crate::Result<()> {
     let draws: u32 = std::env::var("AMD_VK_DRAWS").unwrap_or_else(|_| "1".to_owned()).parse()?;
     if !(1..=4096).contains(&draws) { return Err("AMD_VK_DRAWS must be 1..=4096".into()); }
     let mode = std::env::var("AMD_VK_DRAW_MODE").unwrap_or_else(|_| "direct".to_owned());
     if !matches!(mode.as_str(), "direct" | "instanced") { return Err("Unknown AMD_VK_DRAW_MODE".into()); }
-    println!("draw mode: {mode}; triangles: {draws}");
+    println!("draw mode: {mode}; triangles: {}", if indexed { draws * 2 } else { draws });
     let vert_words = ash::util::read_spv(&mut Cursor::new(std::fs::read(vert_path)?))?;
     let frag_words = ash::util::read_spv(&mut Cursor::new(std::fs::read(frag_path)?))?;
     let mut resources = Resources { d, h: Handles::default() };
@@ -211,7 +231,42 @@ fn run_inner(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::De
         } else {
             h.layout = d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)?;
         }
-        let vertex = vk::PipelineVertexInputStateCreateInfo::default();
+        let bindings = [vk::VertexInputBindingDescription {
+            binding: 0, stride: 16, input_rate: vk::VertexInputRate::VERTEX,
+        }];
+        let attributes = [
+            vk::VertexInputAttributeDescription { location: 0, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 0 },
+            vk::VertexInputAttributeDescription { location: 1, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 8 },
+        ];
+        let mut vertex = vk::PipelineVertexInputStateCreateInfo::default();
+        if indexed {
+            vertex = vertex.vertex_binding_descriptions(&bindings).vertex_attribute_descriptions(&attributes);
+            h.geometry = d.create_buffer(&vk::BufferCreateInfo::default().size(GEOMETRY_BYTES)
+                .usage(vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE), None)?;
+            let req = d.get_buffer_memory_requirements(h.geometry);
+            let index = memory_type(&mem, req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+            h.geometry_memory = d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(index), None)?;
+            d.bind_buffer_memory(h.geometry, h.geometry_memory, 0)?;
+            h.geometry_upload = d.create_buffer(&vk::BufferCreateInfo::default().size(GEOMETRY_BYTES)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC).sharing_mode(vk::SharingMode::EXCLUSIVE), None)?;
+            let req = d.get_buffer_memory_requirements(h.geometry_upload);
+            let index = memory_type(&mem, req.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                vk::MemoryPropertyFlags::HOST_CACHED)?;
+            h.geometry_upload_memory = d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(index), None)?;
+            d.bind_buffer_memory(h.geometry_upload, h.geometry_upload_memory, 0)?;
+            let ptr = d.map_memory(h.geometry_upload_memory, 0, GEOMETRY_BYTES, vk::MemoryMapFlags::empty())?;
+            let data = std::slice::from_raw_parts_mut(ptr.cast::<u8>(), GEOMETRY_BYTES as usize);
+            for (dst, value) in data[..INDEX_OFFSET as usize].chunks_exact_mut(4).zip(VERTICES.iter().flatten()) {
+                dst.copy_from_slice(&value.to_le_bytes());
+            }
+            for (dst, value) in data[INDEX_OFFSET as usize..].chunks_exact_mut(2).zip(INDICES) {
+                dst.copy_from_slice(&value.to_le_bytes());
+            }
+            d.unmap_memory(h.geometry_upload_memory);
+            println!("geometry upload: 4 vertices, 6 uint16 indices, {GEOMETRY_BYTES} bytes");
+        }
         let assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(vk::PrimitiveTopology::TRIANGLE_LIST);
         let viewports = [vk::Viewport { x: 0., y: 0., width: W as f32, height: H as f32, min_depth: 0., max_depth: 1. }];
         let scissors = [area];
@@ -269,6 +324,17 @@ fn run_inner(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::De
                 .image(h.texture).subresource_range(range)];
             d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&to_sample));
         }
+        if indexed {
+            let region = [vk::BufferCopy::default().size(GEOMETRY_BYTES)];
+            d.cmd_copy_buffer(cmd, h.geometry_upload, h.geometry, &region);
+            let ready = [vk::BufferMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY).src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
+                .dst_access_mask(vk::AccessFlags2::VERTEX_ATTRIBUTE_READ | vk::AccessFlags2::INDEX_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(h.geometry).offset(0).size(GEOMETRY_BYTES)];
+            d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().buffer_memory_barriers(&ready));
+        }
         let to_color = [vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::NONE)
             .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -288,7 +354,15 @@ fn run_inner(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::De
             d.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, h.layout, 0, &[texture_set], &[]);
         }
         let draw_start = Instant::now();
-        if mode == "instanced" {
+        if indexed {
+            d.cmd_bind_vertex_buffers(cmd, 0, &[h.geometry], &[0]);
+            d.cmd_bind_index_buffer(cmd, h.geometry, INDEX_OFFSET, vk::IndexType::UINT16);
+            if mode == "instanced" {
+                d.cmd_draw_indexed(cmd, 6, draws, 0, 0, 0);
+            } else {
+                for _ in 0..draws { d.cmd_draw_indexed(cmd, 6, 1, 0, 0, 0); }
+            }
+        } else if mode == "instanced" {
             d.cmd_draw(cmd, 3, draws, 0, 0);
         } else {
             for _ in 0..draws { d.cmd_draw(cmd, 3, 1, 0, 0); }
@@ -335,6 +409,7 @@ fn run_inner(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::De
         }
         println!("PASS: verified {} pixels ({}x{}) via Vulkan dynamic rendering", W * H, W, H);
         if textured { println!("PASS: texture upload, descriptor, nearest sampling and render verified"); }
+        if indexed { println!("PASS: indexed geometry, vertex attributes and interpolated UV verified"); }
     }
     Ok(())
 }
