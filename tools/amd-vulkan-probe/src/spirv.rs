@@ -18,6 +18,8 @@ pub enum Op {
     SelectUlt(usize, usize, usize, usize),
     // If a < b, x+y; otherwise x-y, merged by OpPhi.
     BranchAddSub(usize, usize, usize, usize),
+    // Repeat acc = acc * factor + counter, for count & 31 iterations.
+    LoopFold(usize, usize, usize),
     // All SSA values remain 32-bit words; these interpret words as IEEE f32.
     UToF(usize),
     FAdd(usize, usize),
@@ -41,6 +43,9 @@ pub fn emit(ops: &[Op], result: usize) -> crate::Result<Vec<u32>> {
         if let Op::Add(a, b) | Op::Mul(a, b) | Op::Sub(a, b) | Op::And(a, b) | Op::Or(a, b) | Op::Xor(a, b) | Op::Shl(a, b) | Op::Shr(a, b) | Op::FAdd(a,b) | Op::FSub(a,b) | Op::FMul(a,b) = *op {
             if a >= i || b >= i { return Err("Invalid forward SSA reference".into()); }
         }
+        if let Op::LoopFold(seed,count,factor) = *op {
+            if [seed,count,factor].iter().any(|&v| v >= i) { return Err("Invalid loop SSA reference".into()); }
+        }
         if let Op::UToF(a) = *op {
             if a >= i { return Err("Invalid conversion SSA reference".into()); }
         }
@@ -48,9 +53,9 @@ pub fn emit(ops: &[Op], result: usize) -> crate::Result<Vec<u32>> {
             if [a,b,t,f].iter().any(|&v| v >= i) { return Err("Invalid select SSA reference".into()); }
         }
     }
-    // IDs 17..19 are bool type, shift mask and f32 type.
-    // Each node reserves a result plus six temporary/label IDs.
-    let id = |i: usize| 20 + 7 * i as u32;
+    // IDs 17..20 are bool type, shift mask, f32 type and constant one.
+    // Each node reserves a result plus twelve temporary/label IDs.
+    let id = |i: usize| 21 + 13 * i as u32;
     let ptr = id(ops.len());
     let mut out = vec![0x07230203, 0x00010300, 0, ptr + 1, 0];
     let op = |out: &mut Vec<u32>, code, args: &[u32]| instruction(out, code, args);
@@ -80,6 +85,7 @@ pub fn emit(ops: &[Op], result: usize) -> crate::Result<Vec<u32>> {
     op(&mut out, 59, &[8, 11, 12]); // StorageBuffer global
     op(&mut out, 43, &[3, 13, 0]); // member index zero
     op(&mut out, 43, &[3, 18, 31]); // defined modulo-32 shift count
+    op(&mut out, 43, &[3, 20, 1]); // loop increment
     for (i, node) in ops.iter().enumerate() {
         if let Op::Constant(v) = *node { op(&mut out, 43, &[3, id(i), v]); }
     }
@@ -114,6 +120,40 @@ pub fn emit(ops: &[Op], result: usize) -> crate::Result<Vec<u32>> {
                 let opcode = match node { Op::FAdd(..) => 129, Op::FSub(..) => 131, _ => 133 };
                 op(&mut out, opcode, &[19, tmp+2, tmp, tmp+1]);
                 op(&mut out, 124, &[3, id(i), tmp+2]);
+            }
+            Op::LoopFold(seed,count,factor) => {
+                let r = id(i);
+                let pre = r+1;
+                let header = r+2;
+                let body = r+3;
+                let cont = r+4;
+                let merge = r+5;
+                let counter = r+6;
+                let acc = r+7;
+                let cond = r+8;
+                let next_counter = r+9;
+                let product = r+10;
+                let next_acc = r+11;
+                let bound = r+12;
+                op(&mut out, 199, &[3, bound, id(count), 18]);
+                op(&mut out, 249, &[pre]);
+                op(&mut out, 248, &[pre]);
+                op(&mut out, 249, &[header]);
+                op(&mut out, 248, &[header]);
+                op(&mut out, 245, &[3, counter, 13, pre, next_counter, cont]);
+                op(&mut out, 245, &[3, acc, id(seed), pre, next_acc, cont]);
+                op(&mut out, 176, &[17, cond, counter, bound]);
+                op(&mut out, 246, &[merge, cont, 0]); // LoopMerge
+                op(&mut out, 250, &[cond, body, merge]);
+                op(&mut out, 248, &[body]);
+                op(&mut out, 132, &[3, product, acc, id(factor)]);
+                op(&mut out, 128, &[3, next_acc, product, counter]);
+                op(&mut out, 249, &[cont]);
+                op(&mut out, 248, &[cont]);
+                op(&mut out, 128, &[3, next_counter, counter, 20]);
+                op(&mut out, 249, &[header]);
+                op(&mut out, 248, &[merge]);
+                op(&mut out, 83, &[3, r, acc]);
             }
             Op::BranchAddSub(a,b,x,y) => {
                 let r = id(i);
@@ -248,11 +288,35 @@ pub fn write_branch(path: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+// Two bounded loops with divergent iteration counts and dependent results.
+pub const LOOP: [Op; 8] = [
+    Op::Index, Op::Constant(0xdeadbeef), Op::Xor(0,1),
+    Op::Constant(3), Op::LoopFold(2,0,3), Op::Constant(5),
+    Op::LoopFold(4,4,5), Op::Xor(6,0),
+];
+
+pub fn loop_expected(index: u32) -> u32 {
+    let mut acc = index ^ 0xdeadbeef;
+    for n in 0..(index & 31) { acc = acc.wrapping_mul(3).wrapping_add(n); }
+    let count = acc & 31;
+    for n in 0..count { acc = acc.wrapping_mul(5).wrapping_add(n); }
+    acc ^ index
+}
+
+pub fn write_loop(path: &Path) -> crate::Result<()> {
+    let words = emit(&LOOP, LOOP.len()-1)?;
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    std::fs::write(path, &bytes)?;
+    println!("PASS: emitted {} SPIR-V words from {} loop SSA nodes", words.len(), LOOP.len());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn rejects_invalid_ssa() {
+        assert!(emit(&[Op::Index, Op::LoopFold(0,0,1)], 1).is_err());
         assert!(emit(&[Op::Index, Op::BranchAddSub(0,0,0,1)], 1).is_err());
         assert!(emit(&[Op::UToF(0)], 0).is_err());
         assert!(emit(&[Op::Index, Op::FAdd(0,1)], 1).is_err());
@@ -288,6 +352,23 @@ mod tests {
             at += n;
         }
         assert_eq!(counts, [2,2,2]);
+    }
+    #[test]
+    fn loop_has_two_merges_and_four_phis() {
+        let module = emit(&LOOP, LOOP.len()-1).unwrap();
+        let mut at = 5;
+        let mut counts = [0; 2];
+        while at < module.len() {
+            match module[at] & 0xffff {
+                246 => counts[0] += 1,
+                245 => counts[1] += 1,
+                _ => {}
+            }
+            let n = (module[at] >> 16) as usize;
+            assert!(n > 0 && at+n <= module.len());
+            at += n;
+        }
+        assert_eq!(counts, [2,4]);
     }
     #[test]
     fn encodes_complete_instruction_stream() {
