@@ -5,6 +5,13 @@ use std::path::Path;
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if let [flag, output] = args.as_slice() {
+        if flag == "--emit-carry-demo" {
+            let words = vortex_shader::spirv_scalar::carry_demo()?;
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            std::fs::write(output, bytes)?;
+            println!("PASS: decoded GFX10 carry/borrow fixture and emitted {} SPIR-V words", words.len());
+            return Ok(());
+        }
         if flag == "--emit-scalar-demo" {
             let words = vortex_shader::spirv_scalar::demo()?;
             let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -46,6 +53,7 @@ fn main() -> Result<()> {
             println!("PASS: compute and graphics on the same Vulkan device");
             Ok(())
         }
+        [flag, path] if flag == "--verify-carry-demo" => context.compute_carry_demo(Path::new(path)),
         [flag, path] if flag == "--verify-scalar-demo" => context.compute_scalar_demo(Path::new(path)),
         [flag, path] if flag == "--verify-loop" => context.compute_loop(Path::new(path)),
         [flag, path] if flag == "--verify-branch" => context.compute_branch(Path::new(path)),
@@ -54,6 +62,6 @@ fn main() -> Result<()> {
         [flag, path] if flag == "--verify-mixed" => context.compute_mixed(Path::new(path)),
         [path] => context.compute(Path::new(path)),
         [] => Ok(()),
-        _ => Err("Usage: amd-vulkan-probe [--emit-scalar-demo out.spv | --verify-scalar-demo in.spv | --indexed vertex.spv fragment.spv | --texture vertex.spv texture.spv | --emit-loop out.spv | --verify-loop in.spv | --emit-branch out.spv | --verify-branch in.spv | --verify-wave 32|64 wave.spv | --emit-float out.spv | --verify-float in.spv | --emit-conditional out.spv | --verify-conditional in.spv | --emit-demo out.spv | --emit-mixed out.spv | --verify-mixed mixed.spv | compute.spv | --graphics vertex.spv fragment.spv | --combined compute.spv vertex.spv fragment.spv]".into()),
+        _ => Err("Usage: amd-vulkan-probe [--emit-carry-demo out.spv | --verify-carry-demo in.spv | --emit-scalar-demo out.spv | --verify-scalar-demo in.spv | --indexed vertex.spv fragment.spv | --texture vertex.spv texture.spv | --emit-loop out.spv | --verify-loop in.spv | --emit-branch out.spv | --verify-branch in.spv | --verify-wave 32|64 wave.spv | --emit-float out.spv | --verify-float in.spv | --emit-conditional out.spv | --verify-conditional in.spv | --emit-demo out.spv | --emit-mixed out.spv | --verify-mixed mixed.spv | compute.spv | --graphics vertex.spv fragment.spv | --combined compute.spv vertex.spv fragment.spv]".into()),
     }
 }
