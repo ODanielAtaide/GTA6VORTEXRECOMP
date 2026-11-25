@@ -6,6 +6,13 @@ const W: u32 = 512;
 const H: u32 = 512;
 const BYTES: u64 = W as u64 * H as u64 * 4;
 const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+const TW: u32 = 64;
+const TH: u32 = 64;
+const TEXTURE_BYTES: u64 = (TW * TH * 4) as u64;
+
+fn texel(x: u32, y: u32) -> [u8; 4] {
+    [(x * 3 + y) as u8, (y * 5 + x) as u8, (x ^ y) as u8, 255]
+}
 
 #[derive(Default)]
 struct Handles {
@@ -21,6 +28,14 @@ struct Handles {
     pipeline: vk::Pipeline,
     commands: vk::CommandPool,
     fence: vk::Fence,
+    texture: vk::Image,
+    texture_memory: vk::DeviceMemory,
+    texture_view: vk::ImageView,
+    upload: vk::Buffer,
+    upload_memory: vk::DeviceMemory,
+    sampler: vk::Sampler,
+    descriptor_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
 }
 
 struct Resources<'a> {
@@ -39,6 +54,14 @@ impl Drop for Resources<'_> {
             d.destroy_command_pool(h.commands, None);
             d.destroy_pipeline(h.pipeline, None);
             d.destroy_pipeline_layout(h.layout, None);
+            d.destroy_descriptor_pool(h.descriptor_pool, None);
+            d.destroy_descriptor_set_layout(h.descriptor_layout, None);
+            d.destroy_sampler(h.sampler, None);
+            d.destroy_image_view(h.texture_view, None);
+            d.destroy_image(h.texture, None);
+            d.free_memory(h.texture_memory, None);
+            d.destroy_buffer(h.upload, None);
+            d.free_memory(h.upload_memory, None);
             d.destroy_shader_module(h.vert, None);
             d.destroy_shader_module(h.frag, None);
             d.destroy_image_view(h.view, None);
@@ -66,6 +89,16 @@ fn memory_type(mem: &vk::PhysicalDeviceMemoryProperties, bits: u32,
 
 pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Device,
            family: u32, vert_path: &Path, frag_path: &Path) -> crate::Result<()> {
+    run_inner(instance, physical, d, family, vert_path, frag_path, false)
+}
+
+pub fn run_texture(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Device,
+           family: u32, vert_path: &Path, frag_path: &Path) -> crate::Result<()> {
+    run_inner(instance, physical, d, family, vert_path, frag_path, true)
+}
+
+fn run_inner(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Device,
+           family: u32, vert_path: &Path, frag_path: &Path, textured: bool) -> crate::Result<()> {
     let draws: u32 = std::env::var("AMD_VK_DRAWS").unwrap_or_else(|_| "1".to_owned()).parse()?;
     if !(1..=4096).contains(&draws) { return Err("AMD_VK_DRAWS must be 1..=4096".into()); }
     let mode = std::env::var("AMD_VK_DRAW_MODE").unwrap_or_else(|_| "direct".to_owned());
@@ -79,6 +112,9 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Devi
     let format = unsafe { instance.get_physical_device_format_properties(physical, FORMAT) };
     if !format.optimal_tiling_features.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT | vk::FormatFeatureFlags::TRANSFER_SRC) {
         return Err("RGBA8 render target unsupported".into());
+    }
+    if textured && !format.optimal_tiling_features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::TRANSFER_DST) {
+        return Err("RGBA8 sampled texture unsupported".into());
     }
     let extent = vk::Extent2D { width: W, height: H };
     let area = vk::Rect2D { offset: vk::Offset2D::default(), extent };
@@ -118,7 +154,63 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Devi
             vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::VERTEX).module(h.vert).name(entry),
             vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::FRAGMENT).module(h.frag).name(entry),
         ];
-        h.layout = d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)?;
+        let mut texture_set = vk::DescriptorSet::null();
+        if textured {
+            h.texture = d.create_image(&vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D).format(FORMAT)
+                .extent(vk::Extent3D { width: TW, height: TH, depth: 1 })
+                .mip_levels(1).array_layers(1).samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE).initial_layout(vk::ImageLayout::UNDEFINED), None)?;
+            let req = d.get_image_memory_requirements(h.texture);
+            let index = memory_type(&mem, req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+            h.texture_memory = d.allocate_memory(&vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size).memory_type_index(index), None)?;
+            d.bind_image_memory(h.texture, h.texture_memory, 0)?;
+            h.texture_view = d.create_image_view(&vk::ImageViewCreateInfo::default().image(h.texture)
+                .view_type(vk::ImageViewType::TYPE_2D).format(FORMAT).subresource_range(range), None)?;
+            h.upload = d.create_buffer(&vk::BufferCreateInfo::default().size(TEXTURE_BYTES)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC).sharing_mode(vk::SharingMode::EXCLUSIVE), None)?;
+            let req = d.get_buffer_memory_requirements(h.upload);
+            let index = memory_type(&mem, req.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                vk::MemoryPropertyFlags::HOST_CACHED)?;
+            h.upload_memory = d.allocate_memory(&vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size).memory_type_index(index), None)?;
+            d.bind_buffer_memory(h.upload, h.upload_memory, 0)?;
+            let ptr = d.map_memory(h.upload_memory, 0, TEXTURE_BYTES, vk::MemoryMapFlags::empty())?;
+            let data = std::slice::from_raw_parts_mut(ptr.cast::<u8>(), TEXTURE_BYTES as usize);
+            for (i, pixel) in data.chunks_exact_mut(4).enumerate() {
+                pixel.copy_from_slice(&texel(i as u32 % TW, i as u32 / TW));
+            }
+            d.unmap_memory(h.upload_memory);
+            h.sampler = d.create_sampler(&vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::NEAREST).min_filter(vk::Filter::NEAREST)
+                .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .min_lod(0.).max_lod(0.), None)?;
+            let bindings = [vk::DescriptorSetLayoutBinding::default().binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+            h.descriptor_layout = d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)?;
+            let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 1 }];
+            h.descriptor_pool = d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None)?;
+            let layouts = [h.descriptor_layout];
+            texture_set = d.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(h.descriptor_pool).set_layouts(&layouts))?[0];
+            let images = [vk::DescriptorImageInfo::default().sampler(h.sampler).image_view(h.texture_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let writes = [vk::WriteDescriptorSet::default().dst_set(texture_set).dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&images)];
+            d.update_descriptor_sets(&writes, &[]);
+            h.layout = d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts), None)?;
+            println!("texture upload: {}x{} RGBA8, {} bytes", TW, TH, TEXTURE_BYTES);
+        } else {
+            h.layout = d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)?;
+        }
         let vertex = vk::PipelineVertexInputStateCreateInfo::default();
         let assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(vk::PrimitiveTopology::TRIANGLE_LIST);
         let viewports = [vk::Viewport { x: 0., y: 0., width: W as f32, height: H as f32, min_depth: 0., max_depth: 1. }];
@@ -156,6 +248,27 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Devi
         h.fence = d.create_fence(&vk::FenceCreateInfo::default(), None)?;
         let record_start = Instant::now();
         d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+        if textured {
+            let to_upload = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(h.texture).subresource_range(range)];
+            d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&to_upload));
+            let copy = [vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
+                .image_extent(vk::Extent3D { width: TW, height: TH, depth: 1 })];
+            d.cmd_copy_buffer_to_image(cmd, h.upload, h.texture, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &copy);
+            let to_sample = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY).src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER).dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL).new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(h.texture).subresource_range(range)];
+            d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&to_sample));
+        }
         let to_color = [vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::NONE)
             .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -171,6 +284,9 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Devi
             .clear_value(vk::ClearValue { color: vk::ClearColorValue { float32: [0., 0., 0., 1.] } })];
         d.cmd_begin_rendering(cmd, &vk::RenderingInfo::default().render_area(area).layer_count(1).color_attachments(&colors));
         d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, h.pipeline);
+        if textured {
+            d.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, h.layout, 0, &[texture_set], &[]);
+        }
         let draw_start = Instant::now();
         if mode == "instanced" {
             d.cmd_draw(cmd, 3, draws, 0, 0);
@@ -210,11 +326,15 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice, d: &ash::Devi
         h.mapped = true;
         let pixels = std::slice::from_raw_parts(ptr.cast::<u8>(), BYTES as usize);
         for (i, pixel) in pixels.chunks_exact(4).enumerate() {
-            if pixel != [255, 0, 255, 255] {
+            let expected = if textured {
+                texel((i as u32 % W) * TW / W, (i as u32 / W) * TH / H)
+            } else { [255, 0, 255, 255] };
+            if pixel != expected {
                 return Err(format!("Pixel mismatch at {i}: {pixel:?}").into());
             }
         }
         println!("PASS: verified {} pixels ({}x{}) via Vulkan dynamic rendering", W * H, W, H);
+        if textured { println!("PASS: texture upload, descriptor, nearest sampling and render verified"); }
     }
     Ok(())
 }
