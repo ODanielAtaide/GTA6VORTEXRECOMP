@@ -66,6 +66,12 @@ impl Context {
             spirv::float_expected)
     }
 
+    /// Verify structured control flow in the original synthetic shader.
+    pub fn compute_branch(&mut self, path: &Path) -> Result<()> {
+        compute::run(&self.instance, self.physical, &self.device, self.family, path,
+            spirv::branch_expected)
+    }
+
     /// Verify subgroup size and reduction on the supplied original wave.comp shader.
     pub fn compute_wave(&mut self, path: &Path, size: u32) -> Result<()> {
         let expected: fn(u32) -> u32 = match size {
