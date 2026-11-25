@@ -30,6 +30,7 @@ fn main() -> Result<()> {
             let size: u32 = size.to_str().ok_or("Invalid wave size")?.parse()?;
             context.compute_wave(Path::new(path), size)
         }
+        [flag, vert, frag] if flag == "--indexed" => context.graphics_indexed(Path::new(vert), Path::new(frag)),
         [flag, vert, frag] if flag == "--texture" => context.graphics_texture(Path::new(vert), Path::new(frag)),
         [flag, vert, frag] if flag == "--graphics" => context.graphics(Path::new(vert), Path::new(frag)),
         [flag, compute, vert, frag] if flag == "--combined" => {
@@ -45,6 +46,6 @@ fn main() -> Result<()> {
         [flag, path] if flag == "--verify-mixed" => context.compute_mixed(Path::new(path)),
         [path] => context.compute(Path::new(path)),
         [] => Ok(()),
-        _ => Err("Usage: amd-vulkan-probe [--texture vertex.spv texture.spv | --emit-loop out.spv | --verify-loop in.spv | --emit-branch out.spv | --verify-branch in.spv | --verify-wave 32|64 wave.spv | --emit-float out.spv | --verify-float in.spv | --emit-conditional out.spv | --verify-conditional in.spv | --emit-demo out.spv | --emit-mixed out.spv | --verify-mixed mixed.spv | compute.spv | --graphics vertex.spv fragment.spv | --combined compute.spv vertex.spv fragment.spv]".into()),
+        _ => Err("Usage: amd-vulkan-probe [--indexed vertex.spv fragment.spv | --texture vertex.spv texture.spv | --emit-loop out.spv | --verify-loop in.spv | --emit-branch out.spv | --verify-branch in.spv | --verify-wave 32|64 wave.spv | --emit-float out.spv | --verify-float in.spv | --emit-conditional out.spv | --verify-conditional in.spv | --emit-demo out.spv | --emit-mixed out.spv | --verify-mixed mixed.spv | compute.spv | --graphics vertex.spv fragment.spv | --combined compute.spv vertex.spv fragment.spv]".into()),
     }
 }
