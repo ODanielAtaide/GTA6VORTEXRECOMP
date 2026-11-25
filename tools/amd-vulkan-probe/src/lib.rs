@@ -66,6 +66,11 @@ impl Context {
             spirv::float_expected)
     }
 
+    /// Verify original scalar arithmetic and condition flags.
+    pub fn compute_carry_demo(&mut self, path: &Path) -> Result<()> {
+        compute::run(&self.instance, self.physical, &self.device, self.family, path, |_| 42)
+    }
+
     /// Verify the closed scalar fixture decoded by vortex-shader.
     pub fn compute_scalar_demo(&mut self, path: &Path) -> Result<()> {
         compute::run(&self.instance, self.physical, &self.device, self.family, path, |_| 15)
