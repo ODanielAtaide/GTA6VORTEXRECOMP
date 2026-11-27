@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared experimental AMD Vulkan host library. Not yet a title graphics backend.
+pub mod commands;
 mod compute;
 mod graphics;
 mod transfer;
@@ -46,6 +47,16 @@ impl Context {
                 Err(error)
             }
         }
+    }
+
+    /// Create a reusable buffer command session with exclusive device access.
+    pub fn command_session(&mut self) -> Result<commands::Session<'_>> {
+        commands::Session::new(self)
+    }
+
+    /// Verify the ordered buffer command executor.
+    pub fn verify_commands(&mut self) -> Result<()> {
+        commands::verify(self)
     }
 
     /// Verify sparse non-uniform runtime descriptor arrays on supported hardware.
