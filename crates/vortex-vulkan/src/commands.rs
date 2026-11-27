@@ -5,7 +5,7 @@
 
 use ash::vk;
 use std::collections::BTreeMap;
-use crate::{Context,Result};
+use crate::{Context,Result,pipeline_cache::Cache};
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq,PartialOrd,Ord)]
 pub struct BufferId(u64);
@@ -284,7 +284,7 @@ impl Drop for GraphicsPipeline<'_> {
     }
 }
 impl<'a> GraphicsPipeline<'a> {
-    fn new(d:&'a ash::Device,vert:&[u32],frag:&[u32],texture:Option<(ImageId,vk::ImageView)>,state:GraphicsState) -> Result<Self> {
+    fn new(d:&'a ash::Device,vert:&[u32],frag:&[u32],texture:Option<(ImageId,vk::ImageView)>,state:GraphicsState,cache:vk::PipelineCache) -> Result<Self> {
         let mut p = Self { d,vert:vk::ShaderModule::null(),frag:vk::ShaderModule::null(),
             texture:texture.map(|(id,_)|id),linear_filter:state.linear_filter,sampler:vk::Sampler::null(),
             descriptor_layout:vk::DescriptorSetLayout::null(),descriptor_pool:vk::DescriptorPool::null(),
@@ -357,7 +357,7 @@ impl<'a> GraphicsPipeline<'a> {
                 .rasterization_state(&raster).multisample_state(&samples).depth_stencil_state(&depth)
                 .color_blend_state(&blend).dynamic_state(&dynamic).layout(p.layout)
                 .push_next(&mut rendering);
-            p.pipeline = match d.create_graphics_pipelines(vk::PipelineCache::null(),&[info],None) {
+            p.pipeline = match d.create_graphics_pipelines(cache,&[info],None) {
                 Ok(pipelines) => pipelines[0],
                 Err((pipelines,e)) => {
                     for pipeline in pipelines { d.destroy_pipeline(pipeline,None); }
@@ -406,7 +406,7 @@ impl Drop for ComputePipeline<'_> {
     }
 }
 impl<'a> ComputePipeline<'a> {
-    fn new(d:&'a ash::Device,words:&[u32],wave:Option<u32>,resource_count:u32) -> Result<Self> {
+    fn new(d:&'a ash::Device,words:&[u32],wave:Option<u32>,resource_count:u32,cache:vk::PipelineCache) -> Result<Self> {
         let mut p = Self { d,stride_words:1,resource_count,shader:vk::ShaderModule::null(),descriptors:vk::DescriptorSetLayout::null(),
             layout:vk::PipelineLayout::null(),pipeline:vk::Pipeline::null() };
         unsafe {
@@ -431,7 +431,7 @@ impl<'a> ComputePipeline<'a> {
                     .push_next(&mut required);
             }
             let info = vk::ComputePipelineCreateInfo::default().stage(stage).layout(p.layout);
-            p.pipeline = match d.create_compute_pipelines(vk::PipelineCache::null(),&[info],None) {
+            p.pipeline = match d.create_compute_pipelines(cache,&[info],None) {
                 Ok(pipelines) => pipelines[0],
                 Err((pipelines,e)) => {
                     for pipeline in pipelines { d.destroy_pipeline(pipeline,None); }
@@ -503,6 +503,7 @@ pub struct Session<'a> {
     completed: u64,
     next_id: u64,
     poisoned: bool,
+    cache: Cache<'a>,
     compute_bindings: BTreeMap<ComputeBindingId,ComputeBinding<'a>>,
     compute_pipelines: BTreeMap<ComputeId,ComputePipeline<'a>>,
     buffers: BTreeMap<BufferId,Buffer<'a>>,
@@ -518,6 +519,7 @@ impl Drop for Session<'_> {
             self.d.destroy_command_pool(self.pool,None);
             self.d.destroy_semaphore(self.timeline,None);
         }
+        if !self.poisoned {self.cache.save();}
         // Buffers drop after the device is idle; Context outlives the session.
     }
 }
@@ -527,6 +529,7 @@ impl<'a> Session<'a> {
         let d = &context.device;
         let mut session = Self {
             d, instance:&context.instance, physical:context.physical,
+            cache:Cache::open(d,&unsafe{context.instance.get_physical_device_properties(context.physical)}),
             memory:unsafe { context.instance.get_physical_device_memory_properties(context.physical) },
             queue:unsafe { d.get_device_queue(context.family,0) },
             pool:vk::CommandPool::null(),command:vk::CommandBuffer::null(),
@@ -623,7 +626,7 @@ impl<'a> Session<'a> {
         self.ready()?;
         let id = PipelineId(self.next_id);
         self.next_id = self.next_id.checked_add(1).ok_or("pipeline ID exhausted")?;
-        let p = GraphicsPipeline::new(self.d,vert,frag,None,GraphicsState::default())?;
+        let p = GraphicsPipeline::new(self.d,vert,frag,None,GraphicsState::default(),self.cache.handle())?;
         self.pipelines.insert(id,p);
         Ok(id)
     }
@@ -659,7 +662,7 @@ impl<'a> Session<'a> {
         if state.linear_filter&&!props.optimal_tiling_features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR){
             return Err("linear texture filtering unsupported".into());
         }
-        let p=GraphicsPipeline::new(self.d,&v,&f,Some((texture,image.view)),state)?;
+        let p=GraphicsPipeline::new(self.d,&v,&f,Some((texture,image.view)),state,self.cache.handle())?;
         let id=PipelineId(self.next_id);self.next_id=self.next_id.checked_add(1).ok_or("pipeline ID exhausted")?;
         self.pipelines.insert(id,p);Ok(id)
     }
@@ -731,7 +734,7 @@ impl<'a> Session<'a> {
         }
         let id = ComputeId(self.next_id);
         self.next_id = self.next_id.checked_add(1).ok_or("compute ID exhausted")?;
-        let p = ComputePipeline::new(self.d,words,wave,resource_count)?;
+        let p = ComputePipeline::new(self.d,words,wave,resource_count,self.cache.handle())?;
         self.compute_pipelines.insert(id,p);
         Ok(id)
     }
