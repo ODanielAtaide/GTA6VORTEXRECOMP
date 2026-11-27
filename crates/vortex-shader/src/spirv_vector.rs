@@ -1,7 +1,8 @@
 //! Experimental straight-line vector arithmetic diagnostic.
 //! The fixture defines logical lane = GlobalInvocationId.x % wave_size;
 //! it does not assume that the physical Vulkan subgroup has this lane order.
-//! No EXEC writes, cross-lane instructions, memory operations or modifiers.
+//! Supports immediate EXEC dword writes; no cross-lane instructions,
+//! memory operations or modifiers.
 use crate::{ShaderError, gfx10::{Encoding, Fields, Operand}, ir::{self, Reg, Value, EXEC}, spirv::{self, Op}};
 use std::collections::BTreeMap;
 
@@ -15,7 +16,8 @@ fn push(ops: &mut Vec<Op>, op: Op) -> usize {
 }
 
 /// Diagnostic inputs: v0 = invocation index, v1/v2 = sentinels,
-/// EXEC = fixed alternating mask. All other live inputs are rejected.
+/// EXEC starts with an alternating mask. Immediate s_mov_b32 may change it.
+/// All other live inputs are rejected.
 pub fn emit_vector(program: &ir::Program, output: Reg) -> Result<Vec<u32>, ShaderError> {
     let unsupported = |offset, what| ShaderError::Unsupported { offset, what };
     if program.blocks.len() != 1 || !matches!(output, Reg::V(0..=2)) {
@@ -33,23 +35,20 @@ pub fn emit_vector(program: &ir::Program, output: Reg) -> Result<Vec<u32>, Shade
     let lane = push(&mut ops, Op::And(idx,mask));
     let lo = push(&mut ops, Op::Constant(LO));
     let hi = push(&mut ops, Op::Constant(HI));
-    let wave_mask = if program.wave64 {
+    let half = if program.wave64 {
         let m = push(&mut ops, Op::Constant(32));
-        let half = push(&mut ops, Op::And(idx,m));
-        push(&mut ops, Op::SelectUlt(zero,half,hi,lo))
-    } else { lo };
-    let shifted = push(&mut ops, Op::Shr(wave_mask,lane));
-    let active = push(&mut ops, Op::And(shifted,one));
+        Some(push(&mut ops, Op::And(idx,m)))
+    } else { None };
     let mut values = BTreeMap::<Value,usize>::new();
     let mut regs = BTreeMap::<Reg,usize>::new();
-    let mut exec_inputs = BTreeMap::<Reg,Value>::new();
+    let mut exec_values = BTreeMap::<Reg,Value>::new();
     for &(reg, value) in &program.inputs {
         let id = match reg {
             Reg::V(0) => idx,
             Reg::V(1) => push(&mut ops, Op::Constant(OLD_V1)),
             Reg::V(2) => push(&mut ops, Op::Constant(OLD_V2)),
-            Reg::S(EXEC) => { exec_inputs.insert(reg,value); continue; }
-            Reg::S(r) if program.wave64 && r == EXEC+1 => { exec_inputs.insert(reg,value); continue; }
+            Reg::S(EXEC) => { exec_values.insert(reg,value); lo }
+            Reg::S(r) if program.wave64 && r == EXEC+1 => { exec_values.insert(reg,value); hi }
             _ => return Err(unsupported(0, "unsupported vector diagnostic input")),
         };
         if values.insert(value,id).is_some() { return Err(unsupported(0,"duplicate SSA input")); }
@@ -58,6 +57,23 @@ pub fn emit_vector(program: &ir::Program, output: Reg) -> Result<Vec<u32>, Shade
     for inst in &block.insts {
         let reject = || unsupported(inst.machine.offset, "unsupported vector instruction or modifier");
         if inst.name() == "s_endpgm" && inst.reads.is_empty() && inst.writes.is_empty() { continue; }
+        if inst.name() == "s_mov_b32" {
+            let Fields::Sop { dst: Some(Operand::Scalar { code, dwords: 1 }), src, imm: None } = &inst.fields else { return Err(reject()); };
+            if !(*code == EXEC || (program.wave64 && *code == EXEC+1)) || !inst.reads.is_empty() || inst.writes.len()!=1 { return Err(reject()); }
+            let immediate = match src.as_slice() {
+                [Operand::Literal(n)] => *n,
+                [Operand::Const(n @ 128..=192)] => u32::from(*n-128),
+                [Operand::Const(n @ 193..=208)] => 0u32.wrapping_sub(u32::from(*n-192)),
+                _ => return Err(reject()),
+            };
+            let reg = Reg::S(*code);
+            let value = inst.write(reg).ok_or_else(reject)?;
+            let node = push(&mut ops, Op::Constant(immediate));
+            if values.insert(value,node).is_some() { return Err(reject()); }
+            exec_values.insert(reg,value);
+            if ops.len() > 4096 { return Err(reject()); }
+            continue;
+        }
         let Fields::Valu(v) = &inst.fields else { return Err(reject()); };
         if !matches!(inst.machine.encoding, Encoding::Vop1 | Encoding::Vop2)
             || v.carry.is_some() || v.neg != 0 || v.abs != 0 || v.neg_hi != 0
@@ -65,9 +81,16 @@ pub fn emit_vector(program: &ir::Program, output: Reg) -> Result<Vec<u32>, Shade
             || v.sdwa.is_some() || v.dpp.is_some()
         { return Err(reject()); }
         for r in [Reg::S(EXEC), Reg::S(EXEC+1)].into_iter().take(if program.wave64 {2} else {1}) {
-            if exec_inputs.get(&r).copied().is_none() || inst.read(r) != exec_inputs.get(&r).copied() { return Err(reject()); }
+            if exec_values.get(&r).copied().is_none() || inst.read(r) != exec_values.get(&r).copied() { return Err(reject()); }
         }
-        if inst.reads.iter().any(|(r,_)| !matches!(r, Reg::V(0..=2)) && !exec_inputs.contains_key(r)) { return Err(reject()); }
+        if inst.reads.iter().any(|(r,_)| !matches!(r, Reg::V(0..=2)) && !exec_values.contains_key(r)) { return Err(reject()); }
+        let lo_value = *values.get(&inst.read(Reg::S(EXEC)).ok_or_else(reject)?).ok_or_else(reject)?;
+        let wave_mask = if let Some(half) = half {
+            let hi_value = *values.get(&inst.read(Reg::S(EXEC+1)).ok_or_else(reject)?).ok_or_else(reject)?;
+            push(&mut ops, Op::SelectUlt(zero,half,hi_value,lo_value))
+        } else { lo_value };
+        let shifted = push(&mut ops, Op::Shr(wave_mask,lane));
+        let active = push(&mut ops, Op::And(shifted,one));
         let Some(Operand::Vector { reg: dst @ 0..=2, dwords: 1 }) = v.dst else { return Err(reject()); };
         let dest = Reg::V(dst);
         let old = *values.get(&inst.read(dest).ok_or_else(reject)?).ok_or_else(reject)?;
@@ -120,9 +143,33 @@ pub fn expected64(index: u32) -> u32 {
     } else { OLD_V2 }
 }
 
+/// v1 receives v0 under the original mask, v2 receives v0 under its
+/// complement; after restoring all lanes, add the two vectors.
+pub fn exec_demo(wave64: bool) -> Result<Vec<u32>, ShaderError> {
+    let mut words = vec![0x7e02_0300u32, 0xbefe_03ff, HI];
+    if wave64 { words.extend([0xbeff_03ff, LO]); }
+    words.extend([0x7e04_0300, 0xbefe_03c1]);
+    if wave64 { words.push(0xbeff_03c1); }
+    words.extend([0x4a04_0501, 0xbf81_0000]);
+    let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    emit_vector(&ir::build(&code,wave64,3)?,Reg::V(2))
+}
+
+pub fn exec_expected32(index: u32) -> u32 {
+    index.wrapping_add(if index & 1 == 0 { OLD_V2 } else { OLD_V1 })
+}
+
+pub fn exec_expected64(index: u32) -> u32 {
+    index.wrapping_add(if (index & 1 == 0) == (index & 32 == 0) { OLD_V2 } else { OLD_V1 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn decoded_exec_updates_emit() {
+        for wave64 in [false,true] { assert_eq!(exec_demo(wave64).unwrap()[0],0x07230203); }
+    }
     #[test]
     fn decoded_vector_fixtures_emit() {
         for wave64 in [false,true] { assert_eq!(demo(wave64).unwrap()[0],0x07230203); }
