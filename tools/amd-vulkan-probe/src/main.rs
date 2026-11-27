@@ -5,6 +5,14 @@ use std::path::Path;
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if let [flag, output] = args.as_slice() {
+        if flag == "--emit-exec32" || flag == "--emit-exec64" {
+            let wave64 = flag == "--emit-exec64";
+            let words = vortex_shader::spirv_vector::exec_demo(wave64)?;
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            std::fs::write(output, bytes)?;
+            println!("PASS: decoded EXEC updates for wave{}, {} SPIR-V words", if wave64 {64} else {32}, words.len());
+            return Ok(());
+        }
         if flag == "--emit-vector32" || flag == "--emit-vector64" {
             let wave64 = flag == "--emit-vector64";
             let words = vortex_shader::spirv_vector::demo(wave64)?;
@@ -61,6 +69,8 @@ fn main() -> Result<()> {
             println!("PASS: compute and graphics on the same Vulkan device");
             Ok(())
         }
+        [flag, path] if flag == "--verify-exec32" => context.compute_exec_demo(Path::new(path), false),
+        [flag, path] if flag == "--verify-exec64" => context.compute_exec_demo(Path::new(path), true),
         [flag, path] if flag == "--verify-vector32" => context.compute_vector_demo(Path::new(path), false),
         [flag, path] if flag == "--verify-vector64" => context.compute_vector_demo(Path::new(path), true),
         [flag, path] if flag == "--verify-carry-demo" => context.compute_carry_demo(Path::new(path)),
@@ -72,6 +82,6 @@ fn main() -> Result<()> {
         [flag, path] if flag == "--verify-mixed" => context.compute_mixed(Path::new(path)),
         [path] => context.compute(Path::new(path)),
         [] => Ok(()),
-        _ => Err("Usage: amd-vulkan-probe [--emit-vector32 out.spv | --emit-vector64 out.spv | --verify-vector32 in.spv | --verify-vector64 in.spv | --emit-carry-demo out.spv | --verify-carry-demo in.spv | --emit-scalar-demo out.spv | --verify-scalar-demo in.spv | --indexed vertex.spv fragment.spv | --texture vertex.spv texture.spv | --emit-loop out.spv | --verify-loop in.spv | --emit-branch out.spv | --verify-branch in.spv | --verify-wave 32|64 wave.spv | --emit-float out.spv | --verify-float in.spv | --emit-conditional out.spv | --verify-conditional in.spv | --emit-demo out.spv | --emit-mixed out.spv | --verify-mixed mixed.spv | compute.spv | --graphics vertex.spv fragment.spv | --combined compute.spv vertex.spv fragment.spv]".into()),
+        _ => Err("Usage: amd-vulkan-probe [--emit-exec32 out.spv | --emit-exec64 out.spv | --verify-exec32 in.spv | --verify-exec64 in.spv | --emit-vector32 out.spv | --emit-vector64 out.spv | --verify-vector32 in.spv | --verify-vector64 in.spv | --emit-carry-demo out.spv | --verify-carry-demo in.spv | --emit-scalar-demo out.spv | --verify-scalar-demo in.spv | --indexed vertex.spv fragment.spv | --texture vertex.spv texture.spv | --emit-loop out.spv | --verify-loop in.spv | --emit-branch out.spv | --verify-branch in.spv | --verify-wave 32|64 wave.spv | --emit-float out.spv | --verify-float in.spv | --emit-conditional out.spv | --verify-conditional in.spv | --emit-demo out.spv | --emit-mixed out.spv | --verify-mixed mixed.spv | compute.spv | --graphics vertex.spv fragment.spv | --combined compute.spv vertex.spv fragment.spv]".into()),
     }
 }
