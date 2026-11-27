@@ -3,6 +3,9 @@
 mod compute;
 mod graphics;
 mod transfer;
+mod descriptors;
+#[path = "../../../crates/vortex-gpu/src/vulkan_descriptors.rs"]
+mod descriptor_journal;
 // Share the exact tested planner without linking the legacy D3D12 runtime.
 #[path = "../../../crates/vortex-gpu/src/vulkan_upload.rs"]
 mod dirty_upload;
@@ -43,6 +46,11 @@ impl Context {
                 Err(error)
             }
         }
+    }
+
+    /// Verify selective Vulkan storage buffer descriptor publications.
+    pub fn verify_descriptors(&mut self, path: &Path) -> Result<()> {
+        descriptors::run(&self.instance, self.physical, &self.device, self.family, path)
     }
 
     /// Exercise real Vulkan transfers with the shared dirty upload planner.
