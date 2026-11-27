@@ -61,6 +61,11 @@ impl Context {
         commands::verify_attachments(self)
     }
 
+    /// Verify the reusable graphics pipeline with trusted fixture SPIR-V.
+    pub fn verify_draws(&mut self,vert:&Path,frag:&Path) -> Result<()> {
+        commands::verify_draws(self,vert,frag)
+    }
+
     /// Verify sparse non-uniform runtime descriptor arrays on supported hardware.
     pub fn verify_bindless(&mut self, path: &Path) -> Result<()> {
         descriptors::run_bindless(&self.instance, self.physical, &self.device, self.family, path)
