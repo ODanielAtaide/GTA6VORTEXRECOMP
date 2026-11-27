@@ -78,6 +78,9 @@ pub enum Command {
         vertices: BufferId, offset: u64, indices: IndexId, first: u32, count: u32, base_vertex: i32 },
     Dispatch { binding: ComputeBindingId, groups: u32, constants: [u32;2] },
     UploadImage { src: BufferId, offset: u64, dst: ImageId, region: ImageRegion },
+    UploadMip { src: BufferId, offset: u64, dst: ImageId, mip:u32, region: ImageRegion },
+    ReadMip { src: ImageId, mip:u32, region:ImageRegion, dst:BufferId, offset:u64 },
+    GenerateMips { image:ImageId },
     ReadImage { src: ImageId, region: ImageRegion, dst: BufferId, offset: u64 },
     CopyImage { src: ImageId, region: ImageRegion, dst: ImageId, x: u32, y: u32 },
 }
@@ -182,6 +185,7 @@ struct Image<'a> {
     kind: ImageKind,
     width: u32,
     height: u32,
+    mips: u32,
     initialized: bool,
 }
 impl Drop for Image<'_> {
@@ -194,13 +198,13 @@ impl Drop for Image<'_> {
     }
 }
 impl<'a> Image<'a> {
-    fn new(d:&'a ash::Device,mem:&vk::PhysicalDeviceMemoryProperties,width:u32,height:u32,kind:ImageKind) -> Result<Self> {
+    fn new(d:&'a ash::Device,mem:&vk::PhysicalDeviceMemoryProperties,width:u32,height:u32,kind:ImageKind,mips:u32) -> Result<Self> {
         let mut image = Self { d,handle:vk::Image::null(),memory:vk::DeviceMemory::null(),
-            view:vk::ImageView::null(),kind,width,height,initialized:false };
+            view:vk::ImageView::null(),kind,width,height,mips,initialized:false };
         unsafe {
             image.handle = d.create_image(&vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D).format(kind.format())
-                .extent(vk::Extent3D { width,height,depth:1 }).mip_levels(1).array_layers(1)
+                .extent(vk::Extent3D { width,height,depth:1 }).mip_levels(mips).array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1).tiling(vk::ImageTiling::OPTIMAL)
                 .usage(kind.usage()).sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .initial_layout(vk::ImageLayout::UNDEFINED),None)?;
@@ -218,11 +222,18 @@ impl<'a> Image<'a> {
             d.bind_image_memory(image.handle,image.memory,0)?;
             image.view = d.create_image_view(&vk::ImageViewCreateInfo::default()
                 .image(image.handle).view_type(vk::ImageViewType::TYPE_2D)
-                .format(kind.format()).subresource_range(image_range(kind)),None)?;
+                .format(kind.format()).subresource_range(image_range(kind).level_count(mips)),None)?;
         }
         Ok(image)
     }
 
+    fn mip_dimensions(&self,mip:u32)->Result<(u32,u32)>{
+        if mip>=self.mips{return Err("invalid mip level".into());}
+        Ok(((self.width>>mip).max(1),(self.height>>mip).max(1)))
+    }
+    fn check_mip(&self,mip:u32,region:ImageRegion)->Result<u64>{
+        let (w,h)=self.mip_dimensions(mip)?;region_bytes(w,h,region)
+    }
     fn check(&self,region:ImageRegion) -> Result<u64> {
         region_bytes(self.width,self.height,region)
     }
@@ -239,7 +250,7 @@ fn initialize_layout(d:&ash::Device,cmd:vk::CommandBuffer,image:&Image<'_>) {
         .old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image.handle).subresource_range(image_range(image.kind))];
+        .image(image.handle).subresource_range(image_range(image.kind).level_count(image.mips))];
     unsafe { d.cmd_pipeline_barrier2(cmd,&vk::DependencyInfo::default().image_memory_barriers(&barriers)); }
 }
 
@@ -298,7 +309,7 @@ impl<'a> GraphicsPipeline<'a> {
                 let address=if state.repeat{vk::SamplerAddressMode::REPEAT}else{vk::SamplerAddressMode::CLAMP_TO_EDGE};
                 p.sampler=d.create_sampler(&vk::SamplerCreateInfo::default().mag_filter(filter).min_filter(filter)
                     .mipmap_mode(vk::SamplerMipmapMode::NEAREST).address_mode_u(address)
-                    .address_mode_v(address).address_mode_w(address).min_lod(0.).max_lod(0.),None)?;
+                    .address_mode_v(address).address_mode_w(address).min_lod(0.).max_lod(1000.),None)?;
                 let bindings=[vk::DescriptorSetLayoutBinding::default().binding(0)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(1)
                     .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
@@ -603,21 +614,30 @@ impl<'a> Session<'a> {
     }
 
     fn create_image_kind(&mut self,width:u32,height:u32,kind:ImageKind) -> Result<ImageId> {
+        self.create_image_levels(width,height,kind,1)
+    }
+    /// Allocate a sampled RGBA8 mip chain. Multi-mip views may not be bound
+    /// as render attachments. Each level is initialized before exposure.
+    pub fn create_mip_texture(&mut self,width:u32,height:u32,mips:u32)->Result<ImageId>{
+        self.create_image_levels(width,height,ImageKind::Rgba8,mips)
+    }
+    fn create_image_levels(&mut self,width:u32,height:u32,kind:ImageKind,mips:u32)->Result<ImageId>{
         self.ready()?;
         if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
             return Err("invalid image dimensions".into());
         }
+        if mips==0||mips>32-width.max(height).leading_zeros()||(kind==ImageKind::Depth32&&mips!=1){return Err("invalid mip chain length".into());}
         let properties = unsafe { self.instance.get_physical_device_image_format_properties(
             self.physical,kind.format(),vk::ImageType::TYPE_2D,vk::ImageTiling::OPTIMAL,
             kind.usage(),vk::ImageCreateFlags::empty())? };
         let limits = unsafe { self.instance.get_physical_device_properties(self.physical) }.limits;
-        if width > properties.max_extent.width || height > properties.max_extent.height
+        if mips>properties.max_mip_levels||width > properties.max_extent.width || height > properties.max_extent.height
             || width > limits.max_framebuffer_width || height > limits.max_framebuffer_height {
             return Err("image dimensions exceed device limits".into());
         }
         let id = ImageId(self.next_id);
         self.next_id = self.next_id.checked_add(1).ok_or("image ID exhausted")?;
-        let image = Image::new(self.d,&self.memory,width,height,kind)?;
+        let image = Image::new(self.d,&self.memory,width,height,kind,mips)?;
         self.images.insert(id,image);
         // The ID is not exposed until this one-command initial clear completes.
         let clear = match kind {
@@ -969,7 +989,7 @@ impl<'a> Session<'a> {
                 Command::ClearAttachments { color,depth,region,rgba,z } => {
                     let c = self.image(color)?;
                     let d = self.image(depth)?;
-                    if c.kind != ImageKind::Rgba8 || d.kind != ImageKind::Depth32
+                    if c.mips!=1||d.mips!=1||c.kind != ImageKind::Rgba8 || d.kind != ImageKind::Depth32
                         || (c.width,c.height) != (d.width,d.height)
                         || !valid_color(rgba) || !valid_depth(z) {
                         return Err("incompatible render attachments or clear values".into());
@@ -983,7 +1003,7 @@ impl<'a> Session<'a> {
                     if let Some(id)=p.texture{self.image(id)?;}
                     let c = self.image(color)?;
                     let d = self.image(depth)?;
-                    if c.kind != ImageKind::Rgba8 || d.kind != ImageKind::Depth32
+                    if c.mips!=1||d.mips!=1||c.kind != ImageKind::Rgba8 || d.kind != ImageKind::Depth32
                         || (c.width,c.height) != (d.width,d.height)
                         || count == 0 || count % 3 != 0 {
                         return Err("invalid draw attachments or triangle count".into());
@@ -998,7 +1018,7 @@ impl<'a> Session<'a> {
                     if let Some(id)=p.texture{self.image(id)?;}
                     let c = self.image(color)?;
                     let d = self.image(depth)?;
-                    if c.kind != ImageKind::Rgba8 || d.kind != ImageKind::Depth32
+                    if c.mips!=1||d.mips!=1||c.kind != ImageKind::Rgba8 || d.kind != ImageKind::Depth32
                         || (c.width,c.height) != (d.width,d.height) {
                         return Err("invalid indexed draw attachments".into());
                     }
@@ -1016,6 +1036,22 @@ impl<'a> Session<'a> {
                         dispatch_bytes(groups,limits.max_compute_work_group_count[0],b.bytes)?;
                     } else {
                         dispatch_record_bytes(groups,limits.max_compute_work_group_count[0],b.bytes,p.stride_words)?;
+                    }
+                }
+                Command::UploadMip{src,offset,dst,mip,region}=>{
+                    let image=self.image(dst)?;
+                    if image.kind!=ImageKind::Rgba8{return Err("mip upload requires RGBA8".into());}
+                    check_range(self.buffer(src)?.bytes,offset,image.check_mip(mip,region)?)?;
+                }
+                Command::ReadMip{src,mip,region,dst,offset}=>{
+                    check_range(self.buffer(dst)?.bytes,offset,self.image(src)?.check_mip(mip,region)?)?;
+                }
+                Command::GenerateMips{image}=>{
+                    let image=self.image(image)?;
+                    if image.kind!=ImageKind::Rgba8||image.mips<2{return Err("mip generation requires a multi-level RGBA8 image".into());}
+                    let p=unsafe{self.instance.get_physical_device_format_properties(self.physical,image.kind.format())};
+                    if !p.optimal_tiling_features.contains(vk::FormatFeatureFlags::BLIT_SRC|vk::FormatFeatureFlags::BLIT_DST|vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR){
+                        return Err("linear mip generation unsupported".into());
                     }
                 }
                 Command::UploadImage { src,offset,dst,region } => {
@@ -1096,7 +1132,7 @@ impl<'a> Session<'a> {
                         let image = self.image(dst)?;
                         initialize_layout(d,cmd,image);
                         d.cmd_clear_color_image(cmd,image.handle,vk::ImageLayout::GENERAL,
-                            &vk::ClearColorValue { float32:rgba },&[image_range(image.kind)]);
+                            &vk::ClearColorValue { float32:rgba },&[image_range(image.kind).level_count(image.mips)]);
                     }
                     Command::ClearDepth { dst,depth } => {
                         let image = self.image(dst)?;
@@ -1170,6 +1206,34 @@ impl<'a> Session<'a> {
                         d.cmd_bind_descriptor_sets(cmd,vk::PipelineBindPoint::COMPUTE,p.layout,0,&[b.set],&[]);
                         d.cmd_push_constants(cmd,p.layout,vk::ShaderStageFlags::COMPUTE,0,&bytes);
                         d.cmd_dispatch(cmd,groups,1,1);
+                    }
+                    Command::UploadMip{src,offset,dst,mip,region}=>{
+                        let image=self.image(dst)?;
+                        let copy=buffer_image_copy(offset,region,image.kind).image_subresource(image_layers(image.kind).mip_level(mip));
+                        d.cmd_copy_buffer_to_image(cmd,self.buffer(src)?.handle,image.handle,vk::ImageLayout::GENERAL,&[copy]);
+                    }
+                    Command::ReadMip{src,mip,region,dst,offset}=>{
+                        let image=self.image(src)?;
+                        let copy=buffer_image_copy(offset,region,image.kind).image_subresource(image_layers(image.kind).mip_level(mip));
+                        d.cmd_copy_image_to_buffer(cmd,image.handle,vk::ImageLayout::GENERAL,self.buffer(dst)?.handle,&[copy]);
+                    }
+                    Command::GenerateMips{image}=>{
+                        let image=self.image(image)?;
+                        for mip in 1..image.mips{
+                            if mip>1{
+                                let barrier=[vk::MemoryBarrier2::default().src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER).dst_access_mask(vk::AccessFlags2::TRANSFER_READ)];
+                                d.cmd_pipeline_barrier2(cmd,&vk::DependencyInfo::default().memory_barriers(&barrier));
+                            }
+                            let (sw,sh)=image.mip_dimensions(mip-1)?;
+                            let (dw,dh)=image.mip_dimensions(mip)?;
+                            let blit=vk::ImageBlit::default().src_subresource(image_layers(image.kind).mip_level(mip-1))
+                                .src_offsets([vk::Offset3D::default(),vk::Offset3D{x:sw as i32,y:sh as i32,z:1}])
+                                .dst_subresource(image_layers(image.kind).mip_level(mip))
+                                .dst_offsets([vk::Offset3D::default(),vk::Offset3D{x:dw as i32,y:dh as i32,z:1}]);
+                            d.cmd_blit_image(cmd,image.handle,vk::ImageLayout::GENERAL,image.handle,vk::ImageLayout::GENERAL,&[blit],vk::Filter::LINEAR);
+                        }
                     }
                     Command::UploadImage { src,offset,dst,region } => {
                         d.cmd_copy_buffer_to_image(cmd,self.buffer(src)?.handle,self.image(dst)?.handle,
@@ -1903,6 +1967,15 @@ pub(crate) fn emit_native_graphics(dir:&std::path::Path) -> Result<()> {
         let prefix=format!("texture_{}_{}",if explicit{"lod"}else{"implicit"},if depth{"depth"}else{"color"});
         modules.push((format!("{prefix}.vert.spv"),v));modules.push((format!("{prefix}.frag.spv"),f));
     }}
+    for lod in 0..3{for packed in [false,true]{
+        let (v,f)=vortex_shader::spirv_graphics::mip_fixtures(lod,packed);
+        let (v,f)=vortex_shader::spirv_graphics::extra_modules(&v,&f)?;
+        let prefix=format!("mip_{lod}_packed_{packed}");
+        modules.push((format!("{prefix}.vert.spv"),v));modules.push((format!("{prefix}.frag.spv"),f));
+    }}
+    let (v,f)=vortex_shader::spirv_graphics::math_fixtures();
+    let (v,f)=vortex_shader::spirv_graphics::extra_modules(&v,&f)?;
+    modules.push(("math.vert.spv".to_owned(),v));modules.push(("math.frag.spv".to_owned(),f));
     for (name,words) in modules {
         let path=dir.join(name);
         std::fs::write(&path,words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>())?;
@@ -2072,6 +2145,71 @@ pub(crate) fn verify_native_textures(context:&mut Context)->Result<()> {
     s.destroy_graphics_pipeline(p)?;s.destroy_image(replacement)?;
     println!("PASS: texture rebound without pipeline recreation, retained resources and feedback rejection");
     println!("PASS: native VINTRP, MIMG sampling, fragment depth, samplers and alpha blending verified");
+    Ok(())
+}
+
+/// Verify actual sampled mip selection, packed component order and native ALU.
+pub(crate) fn verify_native_mips(context:&mut Context)->Result<()> {
+    let mut s=Session::new(context)?;
+    if s.create_mip_texture(4,4,4).is_ok(){return Err("invalid mip chain accepted".into());}
+    let tex=s.create_mip_texture(4,4,3)?;
+    let color=s.create_image(8,8)?;let depth=s.create_depth_image(8,8)?;
+    let upload=s.create_buffer(84,MemoryKind::HostVisible)?;
+    let staging=s.create_buffer(4*VERTEX_BYTES,MemoryKind::HostVisible)?;
+    let vertices=s.create_buffer(4*VERTEX_BYTES,MemoryKind::DeviceLocal)?;
+    let output=s.create_buffer(256,MemoryKind::HostVisible)?;
+    let indices=s.create_index_buffer(&[0,1,2,0,2,3])?;
+    let full=ImageRegion{x:0,y:0,width:8,height:8};
+    let region=|mip:u32|ImageRegion{x:0,y:0,width:4>>mip,height:4>>mip};
+    let palette=[[255u8,64,0,255],[0,255,128,255],[64,0,255,255]];
+    let mut words=Vec::new();
+    for mip in 0..3u32{words.extend(std::iter::repeat_n(u32::from_le_bytes(palette[mip as usize]),(16>>(2*mip)) as usize));}
+    s.write_words(upload,0,&words)?;
+    s.submit(&[
+        Command::UploadMip{src:upload,offset:0,dst:tex,mip:0,region:region(0)},
+        Command::UploadMip{src:upload,offset:64,dst:tex,mip:1,region:region(1)},
+        Command::UploadMip{src:upload,offset:80,dst:tex,mip:2,region:region(2)},
+    ])?;
+    let mut data=Vec::new();
+    for (x,y) in [(-1f32,-1f32),(1.,-1.),(1.,1.),(-1.,1.)]{
+        data.extend([x,y,0.5,(x+1.)*0.5,(y+1.)*0.5,0.,1.].map(f32::to_bits));
+    }
+    s.write_words(staging,0,&data)?;
+    s.submit(&[Command::Copy{src:staging,src_offset:0,dst:vertices,dst_offset:0,bytes:4*VERTEX_BYTES}])?;
+    for lod in 0..3u8{for packed in [false,true]{
+        let (v,f)=vortex_shader::spirv_graphics::mip_fixtures(lod,packed);
+        let p=s.create_native_textured_pipeline(&v,&f,[8,13],tex,GraphicsState::default())?;
+        s.submit(&[Command::ClearAttachments{color,depth,region:full,rgba:[0.;4],z:1.},
+            Command::DrawIndexed{pipeline:p,color,depth,region:full,vertices,offset:0,indices,first:0,count:6,base_vertex:0},
+            Command::ReadImage{src:color,region:full,dst:output,offset:0}])?;
+        let mut expected=palette[lod as usize];if packed{expected[1]=0;}
+        if s.read_words(output,0,64)?!=vec![u32::from_le_bytes(expected);64]{
+            return Err(format!("native mip/packed sample mismatch: lod={lod} packed={packed}").into());
+        }
+        s.destroy_graphics_pipeline(p)?;
+        println!("PASS: native mip LOD {lod}, packed channels={packed}");
+    }}
+    // Reject bad mip and invalid attachment before any GPU writes.
+    if s.submit(&[Command::UploadMip{src:upload,offset:0,dst:tex,mip:3,region:region(2)}]).is_ok(){
+        return Err("out-of-range mip accepted".into());
+    }
+    s.submit(&[Command::GenerateMips{image:tex},
+        Command::ReadMip{src:tex,mip:1,region:region(1),dst:output,offset:0},
+        Command::ReadMip{src:tex,mip:2,region:region(2),dst:output,offset:16}])?;
+    if s.read_words(output,0,5)?!=vec![u32::from_le_bytes(palette[0]);5]{return Err("mip generation mismatch".into());}
+    println!("PASS: GPU-generated mip chain and per-level readback");
+    let (v,f)=vortex_shader::spirv_graphics::math_fixtures();
+    let p=s.create_native_graphics_pipeline(&v,&f,[8,13])?;
+    s.submit(&[Command::ClearAttachments{color,depth,region:full,rgba:[0.;4],z:1.},
+        Command::DrawIndexed{pipeline:p,color,depth,region:full,vertices,offset:0,indices,first:0,count:6,base_vertex:0},
+        Command::ReadImage{src:color,region:full,dst:output,offset:0}])?;
+    for word in s.read_words(output,0,64)?{
+        if word.to_le_bytes().iter().zip([64,128,64,255]).any(|(&a,b)|i32::from(a).abs_diff(b)>1){
+            return Err(format!("native FP32 math mismatch: {word:#x}").into());
+        }
+    }
+    println!("PASS: native FP32 fract, sqrt, reciprocal, ceil and min");
+    s.destroy_graphics_pipeline(p)?;s.destroy_image(tex)?;
     Ok(())
 }
 
