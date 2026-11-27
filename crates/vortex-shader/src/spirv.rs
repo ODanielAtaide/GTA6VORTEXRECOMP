@@ -7,6 +7,10 @@ use crate::ShaderError;
 #[derive(Clone, Copy, Debug)]
 pub enum Op {
     Index,
+    /// Read this invocation's original uint in storage buffer 0:0.
+    LoadSelf,
+    /// Read one of the two uniform u32 push constants.
+    Push(u8),
     Constant(u32),
     Add(usize, usize),
     Mul(usize, usize),
@@ -40,6 +44,10 @@ pub fn emit(ops: &[Op], result: usize) -> Result<Vec<u32>, ShaderError> {
     if ops.is_empty() || ops.len() > 4096 || result >= ops.len() {
         return Err(ShaderError::Malformed("Invalid IR size or result"));
     }
+    let has_push = ops.iter().any(|op| matches!(op, Op::Push(_)));
+    if ops.iter().any(|op| matches!(op, Op::Push(n) if *n > 1)) {
+        return Err(ShaderError::Malformed("Invalid push constant index"));
+    }
     for (i, op) in ops.iter().enumerate() {
         if let Op::Add(a, b) | Op::Mul(a, b) | Op::Sub(a, b) | Op::And(a, b) | Op::Or(a, b) | Op::Xor(a, b) | Op::Shl(a, b) | Op::Shr(a, b) | Op::FAdd(a,b) | Op::FSub(a,b) | Op::FMul(a,b) = *op {
             if a >= i || b >= i { return Err(ShaderError::Malformed("Invalid forward SSA reference")); }
@@ -55,8 +63,9 @@ pub fn emit(ops: &[Op], result: usize) -> Result<Vec<u32>, ShaderError> {
         }
     }
     // IDs 17..20 are bool type, shift mask, f32 type and constant one.
+    // IDs 21..24 are push block type, block pointer, uint pointer, global.
     // Each node reserves a result plus twelve temporary/label IDs.
-    let id = |i: usize| 21 + 13 * i as u32;
+    let id = |i: usize| 25 + 13 * i as u32;
     let ptr = id(ops.len());
     let mut out = vec![0x07230203, 0x00010300, 0, ptr + 1, 0];
     let op = |out: &mut Vec<u32>, code, args: &[u32]| instruction(out, code, args);
@@ -71,6 +80,11 @@ pub fn emit(ops: &[Op], result: usize) -> Result<Vec<u32>, ShaderError> {
     op(&mut out, 72, &[7, 0, 35, 0]); // member Offset
     op(&mut out, 71, &[11, 34, 0]); // DescriptorSet
     op(&mut out, 71, &[11, 33, 0]); // Binding
+    if has_push {
+        op(&mut out, 71, &[21, 2]); // Block
+        op(&mut out, 72, &[21, 0, 35, 0]); // member 0 offset
+        op(&mut out, 72, &[21, 1, 35, 4]); // member 1 offset
+    }
     op(&mut out, 19, &[1]); // void
     op(&mut out, 33, &[2, 1]); // function type
     op(&mut out, 21, &[3, 32, 0]); // uint
@@ -82,8 +96,14 @@ pub fn emit(ops: &[Op], result: usize) -> Result<Vec<u32>, ShaderError> {
     op(&mut out, 30, &[7, 6]); // block struct
     op(&mut out, 32, &[8, 12, 7]); // StorageBuffer block pointer
     op(&mut out, 32, &[9, 12, 3]); // StorageBuffer uint pointer
+    if has_push {
+        op(&mut out, 30, &[21, 3, 3]); // Push constant struct
+        op(&mut out, 32, &[22, 9, 21]); // PushConstant struct pointer
+        op(&mut out, 32, &[23, 9, 3]); // PushConstant uint pointer
+    }
     op(&mut out, 59, &[5, 10, 1]); // Input global
     op(&mut out, 59, &[8, 11, 12]); // StorageBuffer global
+    if has_push { op(&mut out, 59, &[22, 24, 9]); }
     op(&mut out, 43, &[3, 13, 0]); // member index zero
     op(&mut out, 43, &[3, 18, 31]); // defined modulo-32 shift count
     op(&mut out, 43, &[3, 20, 1]); // loop increment
@@ -97,6 +117,15 @@ pub fn emit(ops: &[Op], result: usize) -> Result<Vec<u32>, ShaderError> {
     for (i, node) in ops.iter().enumerate() {
         match *node {
             Op::Index => op(&mut out, 83, &[3, id(i), 16]), // CopyObject
+            Op::LoadSelf => {
+                op(&mut out, 65, &[9, id(i)+1, 11, 13, 16]);
+                op(&mut out, 61, &[3, id(i), id(i)+1]);
+            }
+            Op::Push(n) => {
+                let member = if n == 0 { 13 } else { 20 };
+                op(&mut out, 65, &[23, id(i)+1, 24, member]);
+                op(&mut out, 61, &[3, id(i), id(i)+1]);
+            }
             Op::Constant(_) => {}
             Op::Add(a,b) => op(&mut out, 128, &[3, id(i), id(a), id(b)]),
             Op::Mul(a,b) => op(&mut out, 132, &[3, id(i), id(a), id(b)]),
@@ -193,6 +222,11 @@ pub fn emit(ops: &[Op], result: usize) -> Result<Vec<u32>, ShaderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn buffer_and_push_inputs_emit() {
+        assert!(emit(&[Op::LoadSelf,Op::Push(0),Op::Add(0,1)],2).is_ok());
+        assert!(emit(&[Op::Push(2)],0).is_err());
+    }
     #[test]
     fn rejects_forward_reference() {
         assert!(matches!(emit(&[Op::Add(0,0)], 0), Err(ShaderError::Malformed(_))));
