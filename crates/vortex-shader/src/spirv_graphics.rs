@@ -337,9 +337,12 @@ pub fn texture_modules(explicit:bool,depth:bool)->Result<(Vec<u32>,Vec<u32>),Sha
 /// Original fixture with selectable integer mip LOD and optional packed RB
 /// sample (dmask 0101). The missing channels are supplied by native VALU.
 pub fn mip_fixtures(lod:u8,packed:bool)->(Vec<u8>,Vec<u8>){
+    mip_fixtures_lod(f32::from(lod),packed)
+}
+pub fn mip_fixtures_lod(lod:f32,packed:bool)->(Vec<u8>,Vec<u8>){
     let (vertex,_)=texture_fixtures(true,false);
     let mut pixel=vec![0xc810_0000u32,0xc811_0001,0xc814_0100,0xc815_0101,
-        0x7e0c_02ff,(lod as f32).to_bits(),
+        0x7e0c_02ff,lod.to_bits(),
         if packed{0xf090_0508}else{0xf090_0f08},0x0061_0804,0xbf8c_0000];
     if packed{
         // v8 = R, v9 = B; output R, 0, B, 1.
