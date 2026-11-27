@@ -38,6 +38,8 @@ const TEX:u32=20;
 const DEPTH_PTR:u32=21;
 const DEPTH:u32=22;
 const GLSL:u32=23;
+// IDs 24..30 are locations 1..7 of fragment color outputs.
+fn color_id(target:u8)->u32{if target==0{OUTPUT0}else{23+u32::from(target)}}
 
 fn op(out:&mut Vec<u32>,code:u16,a:&[u32]) {
     out.push(((a.len() as u32+1)<<16)|u32::from(code));out.extend_from_slice(a);
@@ -99,7 +101,7 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
     let interp=b.insts.iter().any(|i|matches!(i.fields,Fields::Vintrp{..}));
     let depth=b.insts.iter().any(|i|matches!(i.fields,Fields::Exp{target:8,..}));
     if stage!=Stage::Fragment&&(sampled||interp||depth){return Err(err(0,"fragment-only graphics effect"));}
-    let mut e=Emit{next:24,constants:BTreeMap::new(),declarations:vec![],body:vec![],
+    let mut e=Emit{next:31,constants:BTreeMap::new(),declarations:vec![],body:vec![],
         values:BTreeMap::new(),defined:BTreeSet::new()};
     op(&mut e.body,54,&[VOID,MAIN,0,FN]);op(&mut e.body,248,&[ENTRY]);
     let first=e.value(61,if stage==Stage::Vertex{VEC3}else{VEC4},&[INPUT0]);
@@ -238,7 +240,8 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
                 if *compr||!i.writes.is_empty()||!exports.insert(*target){return Err(reject());}
                 let output=match (stage,*target){
                     (Stage::Vertex,12)=>POSITION,
-                    (Stage::Vertex,32)|(Stage::Fragment,0)=>OUTPUT0,
+                    (Stage::Vertex,32)=>OUTPUT0,
+                    (Stage::Fragment,t @ 0..=7)=>color_id(t),
                     (Stage::Fragment,8)=>DEPTH,
                     _=>return Err(reject()),
                 };
@@ -258,8 +261,13 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
             _=>return Err(reject()),
         }
     }
-    let required=if stage==Stage::Vertex{BTreeSet::from([12,32])}else if depth{BTreeSet::from([0,8])}else{BTreeSet::from([0])};
-    if !done||exports!=required||!halves.is_empty(){return Err(err(0,"missing required graphics exports"));}
+    let colors=if stage==Stage::Fragment{exports.iter().filter(|&&t|t<8).count()}else{0};
+    let required=if stage==Stage::Vertex{BTreeSet::from([12,32])}else{
+        let mut set:BTreeSet<u8>=(0..colors as u8).collect();if depth{set.insert(8);}set
+    };
+    if !done||exports!=required||!halves.is_empty()||(stage==Stage::Fragment&&colors==0){
+        return Err(err(0,"missing or noncontiguous required graphics exports"));
+    }
     op(&mut e.body,253,&[]);op(&mut e.body,56,&[]);
     let mut out=vec![0x07230203,0x00010300,0,e.next,0];
     op(&mut out,17,&[1]);
@@ -267,6 +275,7 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
     op(&mut out,14,&[0,1]);
     let mut entry=vec![if stage==Stage::Vertex{0}else{4},MAIN,0x6e69616d,0,INPUT0,OUTPUT0];
     if stage==Stage::Vertex{entry.extend([INPUT1,POSITION]);}
+    if stage==Stage::Fragment{for target in 1..colors as u8{entry.push(color_id(target));}}
     if depth{entry.push(DEPTH);}
     op(&mut out,15,&entry);
     if stage==Stage::Fragment{op(&mut out,16,&[MAIN,7]);} // OriginUpperLeft
@@ -274,6 +283,7 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
     if sampled{op(&mut out,71,&[TEX,34,0]);op(&mut out,71,&[TEX,33,0]);}
     op(&mut out,71,&[INPUT0,30,0]);op(&mut out,71,&[OUTPUT0,30,0]);
     if stage==Stage::Vertex{op(&mut out,71,&[INPUT1,30,1]);op(&mut out,71,&[POSITION,11,0]);}
+    else{for t in 1..colors as u8{op(&mut out,71,&[color_id(t),30,u32::from(t)]);}}
     op(&mut out,19,&[VOID]);op(&mut out,33,&[FN,VOID]);op(&mut out,21,&[UINT,32,0]);op(&mut out,22,&[FLOAT,32]);
     op(&mut out,23,&[VEC3,FLOAT,3]);op(&mut out,23,&[VEC4,FLOAT,4]);
     for (id,storage,ty) in [(IN3,1,VEC3),(IN4,1,VEC4),(OUT4,3,VEC4)]{op(&mut out,32,&[id,storage,ty]);}
@@ -286,6 +296,7 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
     op(&mut out,59,&[if stage==Stage::Vertex{IN3}else{IN4},INPUT0,1]);
     op(&mut out,59,&[OUT4,OUTPUT0,3]);
     if stage==Stage::Vertex{op(&mut out,59,&[IN4,INPUT1,1]);op(&mut out,59,&[OUT4,POSITION,3]);}
+    if stage==Stage::Fragment{for t in 1..colors as u8{op(&mut out,59,&[OUT4,color_id(t),3]);}}
     if sampled{op(&mut out,59,&[TEX_PTR,TEX,0]);}
     if depth{op(&mut out,59,&[DEPTH_PTR,DEPTH,3]);}
     out.extend(e.body);Ok(out)
@@ -367,6 +378,29 @@ pub fn extra_modules(v:&[u8],f:&[u8])->Result<(Vec<u32>,Vec<u32>),ShaderError>{
     Ok((emit_graphics(&ir::build(v,false,8)?,Stage::Vertex)?,
         emit_graphics(&ir::build(f,false,13)?,Stage::Fragment)?))
 }
+/// Native contiguous MRT0..MRT(n-1) with distinct colors, optional depth.
+pub fn mrt_fixtures(count:u8,depth:bool)->(Vec<u8>,Vec<u8>){
+    assert!((1..=8).contains(&count));
+    let (vertex,_)=texture_fixtures(false,false);
+    let mut pixel=vec![0x7e08_0280u32,0x7e0a_02f2,0x7e0c_02f0,0x7e0e_02ff,0.25f32.to_bits()];
+    for t in 0..count{
+        let r=if t&1!=0{5}else{4};
+        let g=if t&2!=0{5}else{4};
+        let b=if t&4!=0{5}else{4};
+        let done=if t+1==count&&!depth{0x800}else{0};
+        pixel.extend([0xf800_000f|(u32::from(t)<<4)|done,r|(g<<8)|(b<<16)|(5<<24)]);
+    }
+    if depth{pixel.extend([0xf800_0881,7]);}
+    pixel.push(0xbf81_0000);
+    (vertex,pixel.into_iter().flat_map(u32::to_le_bytes).collect())
+}
+/// Report the validated contiguous color export count. Caller must still
+/// compile the same program with emit_graphics before using the result.
+pub fn color_export_count(p:&ir::Program)->u32{
+    p.blocks.iter().flat_map(|b|&b.insts).filter_map(|i|match i.fields{
+        Fields::Exp{target: t @ 0..=7,..}=>Some(t),_=>None
+    }).collect::<BTreeSet<_>>().len() as u32
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +419,13 @@ mod tests {
             let (v,f)=mip_fixtures(lod,packed);assert!(extra_modules(&v,&f).is_ok());
         }}
         let (v,f)=math_fixtures();assert!(extra_modules(&v,&f).is_ok());
+    }
+    #[test]
+    fn multiple_render_targets_emit(){
+        for n in 1..=8{for depth in [false,true]{
+            let(v,f)=mrt_fixtures(n,depth);
+            assert!(extra_modules(&v,&f).is_ok());
+        }}
     }
     #[test]
     fn wrong_stage_rejected(){
