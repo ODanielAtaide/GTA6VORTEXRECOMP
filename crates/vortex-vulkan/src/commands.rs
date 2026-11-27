@@ -479,7 +479,8 @@ impl<'a> Session<'a> {
             return Err("invalid index buffer length".into());
         }
         let limits = unsafe { self.instance.get_physical_device_properties(self.physical) }.limits;
-        if words.iter().any(|&i| i > limits.max_draw_indexed_index_value) {
+        // fullDrawIndexUint32 is not enabled by Context; respect the 24-bit baseline.
+        if words.iter().any(|&i| i > limits.max_draw_indexed_index_value.min(0x00ff_ffff)) {
             return Err("index exceeds physical device limit".into());
         }
         let id = IndexId(self.next_id);
