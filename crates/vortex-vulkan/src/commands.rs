@@ -610,6 +610,17 @@ impl<'a> Session<'a> {
         self.create_compute_pipeline(&words)
     }
 
+    /// Direct GFX10 compilation with the explicit in-place buffer kernel ABI.
+    /// v0 = invocation index, v1/v2 = original storage word, s0/s1 = push
+    /// constants. The selected VGPR is the final output word.
+    pub fn create_native_buffer_pipeline(&mut self,code:&[u8],wave64:bool,vgprs:u16,
+                                         output:vortex_shader::ir::Reg) -> Result<ComputeId> {
+        self.ready()?;
+        let program = vortex_shader::ir::build(code,wave64,vgprs)?;
+        let words = vortex_shader::spirv_vector::emit_buffer_kernel(&program,output)?;
+        self.create_compute_pipeline(&words)
+    }
+
     pub fn create_compute_binding(&mut self,pipeline:ComputeId,buffer:BufferId,offset:u64,bytes:u64) -> Result<ComputeBindingId> {
         self.ready()?;
         let p = self.compute_pipeline(pipeline)?;
@@ -1288,6 +1299,63 @@ pub(crate) fn verify_native_dispatch(context:&mut Context) -> Result<()> {
     }
     println!("PASS: unsupported native shader rejected before pipeline creation");
     println!("PASS: native GFX10 diagnostic compiler integrated with Vulkan command executor");
+    Ok(())
+}
+
+/// Exercise dynamic input values and parameter changes without recompilation.
+pub(crate) fn verify_native_buffers(context:&mut Context) -> Result<()> {
+    use vortex_shader::ir::Reg;
+    const N:usize = 4096;
+    const BYTES:u64 = N as u64*4;
+    let mut s = Session::new(context)?;
+    let staging = s.create_buffer(BYTES,MemoryKind::HostVisible)?;
+    let local = s.create_buffer(BYTES,MemoryKind::DeviceLocal)?;
+    let readback = s.create_buffer(BYTES,MemoryKind::HostVisible)?;
+    let encode = |words:&[u32]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
+    // v1 = v1 + s0; v2 = v1 XOR s1.
+    let arithmetic = encode(&[0x4a02_0200,0x3a04_0201,0xbf81_0000]);
+    // Keep original v2 when v0 >= s1. Active invocations add s0 to v1.
+    let masked = encode(&[0x7da8_0001,0x4a04_0200,0xbf81_0000]);
+    let initial:Vec<u32> = (0..N as u32)
+        .map(|i| i.wrapping_mul(0x9e3779b9) ^ 0xdeadbeef).collect();
+    s.write_words(staging,0,&initial)?;
+    for wave64 in [false,true] {
+        for (label,code) in [("arithmetic",arithmetic.as_slice()),("masked",masked.as_slice())] {
+            let p = s.create_native_buffer_pipeline(code,wave64,3,Reg::V(2))?;
+            let b = s.create_compute_binding(p,local,0,BYTES)?;
+            let params = if label == "masked" { [[0xfffffff0,2049],[33,1001]] }
+                else { [[0xfffffff0,0xa5a55a5a],[33,0x13579bdf]] };
+            let epoch = s.submit(&[
+                Command::Copy { src:staging,src_offset:0,dst:local,dst_offset:0,bytes:BYTES },
+                Command::Dispatch { binding:b,groups:64,constants:params[0] },
+                Command::Dispatch { binding:b,groups:32,constants:params[1] },
+                Command::Copy { src:local,src_offset:0,dst:readback,dst_offset:0,bytes:BYTES },
+            ])?;
+            let actual = s.read_words(readback,0,N)?;
+            for (i,&word) in actual.iter().enumerate() {
+                let mut expected = initial[i];
+                for (round,[add,x]) in params.into_iter().enumerate() {
+                    if round == 1 && i>=N/2 { continue; }
+                    if label == "masked" {
+                        if i < x as usize { expected = expected.wrapping_add(add); }
+                    } else {
+                        expected = expected.wrapping_add(add)^x;
+                    }
+                }
+                if word != expected { return Err(format!("{label}, wave64={wave64}: mismatch at {i}: {word:#x} != {expected:#x}").into()); }
+            }
+            println!("PASS: native {label}, logical wave{}; {N} storage words, two dispatches with dynamic parameters; timeline {epoch}",if wave64 {64} else {32});
+            s.destroy_compute_binding(b)?;
+            s.destroy_compute_pipeline(p)?;
+        }
+    }
+    // s2 is not a declared uniform input of this ABI.
+    let unsupported = encode(&[0x4a02_0202,0xbf81_0000]);
+    if s.create_native_buffer_pipeline(&unsupported,false,3,Reg::V(1)).is_ok() {
+        return Err("accepted undeclared SGPR input".into());
+    }
+    println!("PASS: undeclared native register input rejected");
+    println!("PASS: buffer-backed native GFX10 kernel and dynamic parameters verified");
     Ok(())
 }
 
