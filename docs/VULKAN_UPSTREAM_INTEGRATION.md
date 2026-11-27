@@ -31,3 +31,14 @@ All imports are pending local compilation and regression testing. These passes a
 5. Establish memory budgets and benchmark actual scenes only with authorized input. Measure CPU/GPU timings, p95 frame time, committed RAM/VRAM, and output correctness under equivalent settings. Do not infer FPS from synthetic compute timing.
 
 This is an initial selective import, not a full upstream merge or a complete Vulkan port. Current branch still includes the legacy Direct3D 12 backend.
+
+## Second import — SSA performance and register lifetime analysis
+
+The maintainer's local regression run after the first import (commit 0161767) reported 37 passed tests and zero failures: structure 13, IO 7, IR 8, SPIR-V 9. This is CPU-side validation, not a GPU benchmark.
+
+From the same Belobug IR source blob `410d97fb89f91effec66111b9599fbfc672cbbf0`:
+
+- `707a0a9927107bac0ba8294f9e8130d1d4686a9f`: iterate live registers by set bits, compress SSA Phi replacement paths, retain the upstream 4096-block stress test.
+- `8290601d79ec59177822d853dc891619a0db75ae`: import more precise unspill analysis for reused lanes and register lifetimes, including control-flow tracking and pairing. Adapt the instruction construction to the existing Vortex API instead of changing the public decoder struct.
+
+The second import is pending local validation. The new lowering is still a diagnostic subset; these optimizations are compiler-front-end work, not a replacement for Vulkan command submission. Decoder name caching and native/resource metadata changes remain separate candidates because they have wider dependencies. No FPS claim is made.
