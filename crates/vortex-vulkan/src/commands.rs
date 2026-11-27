@@ -340,6 +340,7 @@ fn indexed_vertex_bytes(words:&[u32],first:u32,count:u32,base_vertex:i32) -> Res
 struct ComputePipeline<'a> {
     d: &'a ash::Device,
     stride_words: u8,
+    resource_count: u32,
     shader: vk::ShaderModule,
     descriptors: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
@@ -356,14 +357,15 @@ impl Drop for ComputePipeline<'_> {
     }
 }
 impl<'a> ComputePipeline<'a> {
-    fn new(d:&'a ash::Device,words:&[u32],wave:Option<u32>) -> Result<Self> {
-        let mut p = Self { d,stride_words:1,shader:vk::ShaderModule::null(),descriptors:vk::DescriptorSetLayout::null(),
+    fn new(d:&'a ash::Device,words:&[u32],wave:Option<u32>,resource_count:u32) -> Result<Self> {
+        let mut p = Self { d,stride_words:1,resource_count,shader:vk::ShaderModule::null(),descriptors:vk::DescriptorSetLayout::null(),
             layout:vk::PipelineLayout::null(),pipeline:vk::Pipeline::null() };
         unsafe {
             p.shader = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words),None)?;
-            let bindings = [vk::DescriptorSetLayoutBinding::default().binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)];
+            let bindings:Vec<_> = (0..resource_count).map(|slot|
+                vk::DescriptorSetLayoutBinding::default().binding(slot)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)).collect();
             p.descriptors = d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default()
                 .bindings(&bindings),None)?;
             let sets = [p.descriptors];
@@ -398,26 +400,28 @@ struct ComputeBinding<'a> {
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
     pipeline: ComputeId,
-    buffer: BufferId,
+    buffers: Vec<BufferId>,
     bytes: u64,
 }
 impl Drop for ComputeBinding<'_> {
     fn drop(&mut self) { unsafe { self.d.destroy_descriptor_pool(self.pool,None); } }
 }
 impl<'a> ComputeBinding<'a> {
-    fn new(d:&'a ash::Device,pipeline:ComputeId,buffer:BufferId,layout:vk::DescriptorSetLayout,
-           handle:vk::Buffer,offset:u64,bytes:u64) -> Result<Self> {
+    fn new(d:&'a ash::Device,pipeline:ComputeId,buffers:Vec<BufferId>,layout:vk::DescriptorSetLayout,
+           infos:&[vk::DescriptorBufferInfo]) -> Result<Self> {
+        let bytes=infos.first().ok_or("empty descriptor set")?.range;
         let mut b = Self { d,pool:vk::DescriptorPool::null(),set:vk::DescriptorSet::null(),
-            pipeline,buffer,bytes };
+            pipeline,buffers,bytes };
         unsafe {
-            let sizes = [vk::DescriptorPoolSize { ty:vk::DescriptorType::STORAGE_BUFFER,descriptor_count:1 }];
+            let sizes = [vk::DescriptorPoolSize { ty:vk::DescriptorType::STORAGE_BUFFER,descriptor_count:infos.len() as u32 }];
             b.pool = d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default()
                 .max_sets(1).pool_sizes(&sizes),None)?;
             b.set = d.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(b.pool).set_layouts(&[layout]))?[0];
-            let infos = [vk::DescriptorBufferInfo::default().buffer(handle).offset(offset).range(bytes)];
-            d.update_descriptor_sets(&[vk::WriteDescriptorSet::default().dst_set(b.set).dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&infos)],&[]);
+            let writes:Vec<_>=infos.iter().enumerate().map(|(slot,info)|
+                vk::WriteDescriptorSet::default().dst_set(b.set).dst_binding(slot as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info))).collect();
+            d.update_descriptor_sets(&writes,&[]);
         }
         Ok(b)
     }
@@ -513,7 +517,7 @@ impl<'a> Session<'a> {
     pub fn destroy_buffer(&mut self,id:BufferId) -> Result<()> {
         self.ready()?;
         // Every successful submit has completed before this method returns.
-        if self.compute_bindings.values().any(|b| b.buffer == id) {
+        if self.compute_bindings.values().any(|b| b.buffers.contains(&id)) {
             return Err("buffer retained by a compute binding".into());
         }
         self.buffers.remove(&id).ok_or("unknown or retired buffer ID")?;
@@ -592,10 +596,10 @@ impl<'a> Session<'a> {
     /// Trusted, validated SPIR-V matching the initial compute ABI. The shader
     /// must restrict storage accesses to its own global invocation index.
     pub fn create_compute_pipeline(&mut self,words:&[u32]) -> Result<ComputeId> {
-        self.create_compute_pipeline_wave(words,None)
+        self.create_compute_pipeline_wave(words,None,1)
     }
 
-    fn create_compute_pipeline_wave(&mut self,words:&[u32],wave:Option<u32>) -> Result<ComputeId> {
+    fn create_compute_pipeline_wave(&mut self,words:&[u32],wave:Option<u32>,resource_count:u32) -> Result<ComputeId> {
         self.ready()?;
         if let Some(size) = wave {
             let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
@@ -609,7 +613,7 @@ impl<'a> Session<'a> {
                 || size<sizes.min_subgroup_size || size>sizes.max_subgroup_size
                 || !sizes.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE)
                 || !subgroup.supported_stages.contains(vk::ShaderStageFlags::COMPUTE)
-                || !subgroup.supported_operations.contains(vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::VOTE)
+                || !subgroup.supported_operations.contains(vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::VOTE | vk::SubgroupFeatureFlags::BALLOT)
                 || sizes.max_compute_workgroup_subgroups<64/size {
                 return Err(format!("Required physical compute subgroup size {size} unsupported").into());
             }
@@ -621,7 +625,7 @@ impl<'a> Session<'a> {
         }
         let id = ComputeId(self.next_id);
         self.next_id = self.next_id.checked_add(1).ok_or("compute ID exhausted")?;
-        let p = ComputePipeline::new(self.d,words,wave)?;
+        let p = ComputePipeline::new(self.d,words,wave,resource_count)?;
         self.compute_pipelines.insert(id,p);
         Ok(id)
     }
@@ -679,24 +683,43 @@ impl<'a> Session<'a> {
         self.ready()?;
         let program = vortex_shader::ir::build(code,wave64,vgprs)?;
         let words = vortex_shader::spirv_cfg::emit_cfg(&program)?;
-        self.create_compute_pipeline_wave(&words,Some(if wave64 {64}else{32}))
+        self.create_compute_pipeline_wave(&words,Some(if wave64 {64}else{32}),1)
+    }
+
+    /// Compile two separately mapped native buffer descriptors.
+    pub fn create_native_two_resource_pipeline(&mut self,code:&[u8],wave64:bool,vgprs:u16) -> Result<ComputeId> {
+        self.ready()?;
+        let program=vortex_shader::ir::build(code,wave64,vgprs)?;
+        let words=vortex_shader::spirv_cfg::emit_cfg_two_resources(&program)?;
+        self.create_compute_pipeline_wave(&words,Some(if wave64{64}else{32}),2)
     }
 
     pub fn create_compute_binding(&mut self,pipeline:ComputeId,buffer:BufferId,offset:u64,bytes:u64) -> Result<ComputeBindingId> {
+        self.create_compute_bindings(pipeline,&[(buffer,offset,bytes)])
+    }
+
+    /// Create immutable, separately bounded descriptors. All buffers are retained
+    /// until the descriptor set is retired. The first range sets dispatch bounds.
+    pub fn create_compute_bindings(&mut self,pipeline:ComputeId,ranges:&[(BufferId,u64,u64)]) -> Result<ComputeBindingId> {
         self.ready()?;
-        let p = self.compute_pipeline(pipeline)?;
-        let b = self.buffer(buffer)?;
-        check_range(b.bytes,offset,bytes)?;
-        let limits = unsafe { self.instance.get_physical_device_properties(self.physical) }.limits;
-        if offset % limits.min_storage_buffer_offset_alignment.max(1) != 0
-            || bytes > u64::from(limits.max_storage_buffer_range) {
-            return Err("invalid storage buffer descriptor range".into());
+        let p=self.compute_pipeline(pipeline)?;
+        if ranges.len()!=p.resource_count as usize {return Err("wrong compute descriptor count".into());}
+        let limits=unsafe{self.instance.get_physical_device_properties(self.physical)}.limits;
+        let mut infos=Vec::new();let mut ids=Vec::new();
+        for &(buffer,offset,bytes) in ranges {
+            let b=self.buffer(buffer)?;
+            check_range(b.bytes,offset,bytes)?;
+            if offset%limits.min_storage_buffer_offset_alignment.max(1)!=0 || bytes>u64::from(limits.max_storage_buffer_range) {
+                return Err("invalid storage buffer descriptor range".into());
+            }
+            if ids.contains(&buffer) {return Err("aliased compute resources not supported".into());}
+            infos.push(vk::DescriptorBufferInfo::default().buffer(b.handle).offset(offset).range(bytes));
+            ids.push(buffer);
         }
-        let binding = ComputeBinding::new(self.d,pipeline,buffer,p.descriptors,b.handle,offset,bytes)?;
-        let id = ComputeBindingId(self.next_id);
-        self.next_id = self.next_id.checked_add(1).ok_or("compute binding ID exhausted")?;
-        self.compute_bindings.insert(id,binding);
-        Ok(id)
+        let binding=ComputeBinding::new(self.d,pipeline,ids,p.descriptors,&infos)?;
+        let id=ComputeBindingId(self.next_id);
+        self.next_id=self.next_id.checked_add(1).ok_or("compute binding ID exhausted")?;
+        self.compute_bindings.insert(id,binding);Ok(id)
     }
 
     pub fn destroy_compute_binding(&mut self,id:ComputeBindingId) -> Result<()> {
@@ -857,7 +880,7 @@ impl<'a> Session<'a> {
                 Command::Dispatch { binding,groups,.. } => {
                     let b = self.compute_binding(binding)?;
                     let p = self.compute_pipeline(b.pipeline)?;
-                    self.buffer(b.buffer)?;
+                    for &buffer in &b.buffers {self.buffer(buffer)?;}
                     let limits = unsafe { self.instance.get_physical_device_properties(self.physical) }.limits;
                     if p.stride_words == 1 {
                         dispatch_bytes(groups,limits.max_compute_work_group_count[0],b.bytes)?;
@@ -1559,7 +1582,18 @@ fn advanced_fixtures(wave64:bool) -> Vec<(&'static str,Vec<u8>,u16)> {
         0xbf88_0003,0x4a06_0681,0x8002_8102,0xbf82_fffb,0xbefe_03c1];
     if wave64 {exec_branch.push(0xbeff_03c1);exec_loop.push(0xbeff_03c1);}
     for words in [&mut exec_branch,&mut exec_loop] {words.extend([0xe070_2000,0x8001_0300,0xbf81_0000]);}
+    // VCC from native compare, wave-wide branch, SAVEEXEC, masked ALU and
+    // restore of the original mask from s12[:13].
+    let save=if wave64{0xbe8c_246au32}else{0xbe8c_3c6a};
+    let restore=if wave64{0xbefe_040cu32}else{0xbefe_030c};
+    let vcc=vec![0x7e06_0289u32,0x7d88_0001,0xbf86_0002,
+        save,0x7e06_028b,0xbf82_0000,restore,0xe070_2000,0x8001_0300,0xbf81_0000];
+    // Avoid restoring an uninitialized mask on the VCCZ edge: save even when
+    // the mask is empty, branch over only the masked ALU.
+    let vcc=vec![vcc[0],vcc[1],save,0xbf86_0001,0x7e06_028b,restore,
+        0xe070_2000,0x8001_0300,0xbf81_0000];
     vec![
+        ("vcc_saveexec",make(&vcc),4),
         ("exec_branch",make(&exec_branch),4),
         ("exec_loop",make(&exec_loop),5),
         ("cfg_branch",make(&[0xbf06_8000,0xbf85_0002,0xbe82_0387,0xbf82_0001,
@@ -1601,7 +1635,21 @@ pub(crate) fn emit_advanced(dir:&std::path::Path) -> Result<()> {
             println!("PASS: emitted {}",path.display());
         }
     }
+    for wave64 in [false,true] {
+        let code=two_resource_fixture();
+        let p=vortex_shader::ir::build(&code,wave64,4)?;
+        let words=vortex_shader::spirv_cfg::emit_cfg_two_resources(&p)?;
+        let path=dir.join(format!("two_resources_wave{}.spv",if wave64{64}else{32}));
+        std::fs::write(&path,words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>())?;
+        println!("PASS: emitted {}",path.display());
+    }
     Ok(())
+}
+
+fn two_resource_fixture()->Vec<u8> {
+    // Load from s[8:11] (binding 1), add s0, store to s[4:7] (binding 0).
+    [0xe030_2000u32,0x8002_0300,0xbf8c_0000,0x4a06_0600,
+        0xe070_2000,0x8001_0300,0xbf81_0000].into_iter().flat_map(u32::to_le_bytes).collect()
 }
 
 pub(crate) fn verify_advanced(context:&mut Context) -> Result<()> {
@@ -1620,7 +1668,7 @@ pub(crate) fn verify_advanced(context:&mut Context) -> Result<()> {
             let groups=if label=="dynamic_address"{1}else{2};
             let mut expected=initial.clone();
             match label {
-                "exec_branch"=>{for (i,v) in expected.iter_mut().enumerate(){*v=if i<7{11}else{9};}},
+                "exec_branch"|"vcc_saveexec"=>{for (i,v) in expected.iter_mut().enumerate(){*v=if i<7{11}else{9};}},
                 "exec_loop"=>{for (i,v) in expected.iter_mut().enumerate(){*v=(i as u32)&3;}},
                 "cfg_loop"=>expected.fill(91),
                 "cfg_branch"=>expected.fill(7),
@@ -1670,6 +1718,26 @@ pub(crate) fn verify_advanced(context:&mut Context) -> Result<()> {
     }
     println!("PASS: unsafe dynamic store and wave-dependent barrier rejected");
     println!("PASS: bounded native scalar and EXEC control flow, dynamic addresses, five atomic operations, LDS/barrier and physical wave32/64 verified");
+    // The second source range is intentionally shorter than the destination.
+    // Out-of-range native loads become zero without touching another resource.
+    let src=s.create_buffer(BYTES/2,MemoryKind::DeviceLocal)?;
+    let source:Vec<u32>=(0..N as u32/2).map(|i|i*17).collect();
+    s.write_words(upload,0,&source)?;
+    s.submit(&[Command::Copy{src:upload,src_offset:0,dst:src,dst_offset:0,bytes:BYTES/2}])?;
+    for wave64 in [false,true] {
+        let p=s.create_native_two_resource_pipeline(&two_resource_fixture(),wave64,4)?;
+        if s.create_compute_binding(p,local,0,BYTES).is_ok(){return Err("accepted missing second resource".into());}
+        let b=s.create_compute_bindings(p,&[(local,0,BYTES),(src,0,BYTES/2)])?;
+        if s.destroy_buffer(src).is_ok(){return Err("retired retained second resource".into());}
+        s.submit(&[Command::Dispatch{binding:b,groups:2,constants:[23,0]},
+            Command::Copy{src:local,src_offset:0,dst:out,dst_offset:0,bytes:BYTES}])?;
+        let expected:Vec<u32>=(0..N).map(|i|source.get(i).copied().unwrap_or(0)+23).collect();
+        if s.read_words(out,0,N)?!=expected{return Err("two-resource native output mismatch".into());}
+        s.destroy_compute_binding(b)?;s.destroy_compute_pipeline(p)?;
+        println!("PASS: native independent two-resource descriptor mapping and bounds, physical wave{}",if wave64{64}else{32});
+    }
+    s.destroy_buffer(src)?;
+    println!("PASS: VCC/SAVEEXEC and two native resource descriptors verified");
     Ok(())
 }
 
