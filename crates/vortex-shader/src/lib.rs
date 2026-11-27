@@ -17,6 +17,7 @@ pub mod native;
 pub mod resource;
 pub mod spill;
 pub mod spirv;
+pub mod spirv_cfg;
 pub mod spirv_scalar;
 pub mod spirv_vector;
 pub mod structure;
