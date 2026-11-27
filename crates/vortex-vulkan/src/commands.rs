@@ -19,6 +19,16 @@ pub struct PipelineId(u64);
 #[derive(Debug,Clone,Copy,PartialEq,Eq,PartialOrd,Ord)]
 pub struct IndexId(u64);
 
+#[derive(Debug,Clone,Copy,PartialEq,Eq,PartialOrd,Ord)]
+pub struct ComputeId(u64);
+
+#[derive(Debug,Clone,Copy,PartialEq,Eq,PartialOrd,Ord)]
+pub struct ComputeBindingId(u64);
+
+/// Initial compute ABI: local_size_x=64, one read/write storage buffer,
+/// and two u32 push constants. No other descriptors.
+const COMPUTE_LANES: u32 = 64;
+
 /// Fixed initial graphics ABI: position xyz and color rgba, seven f32s.
 const VERTEX_BYTES: u64 = 28;
 
@@ -66,6 +76,7 @@ pub enum Command {
         vertices: BufferId, offset: u64, count: u32 },
     DrawIndexed { pipeline: PipelineId, color: ImageId, depth: ImageId, region: ImageRegion,
         vertices: BufferId, offset: u64, indices: IndexId, first: u32, count: u32, base_vertex: i32 },
+    Dispatch { binding: ComputeBindingId, groups: u32, constants: [u32;2] },
     UploadImage { src: BufferId, offset: u64, dst: ImageId, region: ImageRegion },
     ReadImage { src: ImageId, region: ImageRegion, dst: BufferId, offset: u64 },
     CopyImage { src: ImageId, region: ImageRegion, dst: ImageId, x: u32, y: u32 },
@@ -326,6 +337,92 @@ fn indexed_vertex_bytes(words:&[u32],first:u32,count:u32,base_vertex:i32) -> Res
     (max as u64 + 1).checked_mul(VERTEX_BYTES).ok_or_else(|| "vertex size overflow".into())
 }
 
+struct ComputePipeline<'a> {
+    d: &'a ash::Device,
+    shader: vk::ShaderModule,
+    descriptors: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+}
+impl Drop for ComputePipeline<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            self.d.destroy_pipeline(self.pipeline,None);
+            self.d.destroy_pipeline_layout(self.layout,None);
+            self.d.destroy_descriptor_set_layout(self.descriptors,None);
+            self.d.destroy_shader_module(self.shader,None);
+        }
+    }
+}
+impl<'a> ComputePipeline<'a> {
+    fn new(d:&'a ash::Device,words:&[u32]) -> Result<Self> {
+        let mut p = Self { d,shader:vk::ShaderModule::null(),descriptors:vk::DescriptorSetLayout::null(),
+            layout:vk::PipelineLayout::null(),pipeline:vk::Pipeline::null() };
+        unsafe {
+            p.shader = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words),None)?;
+            let bindings = [vk::DescriptorSetLayoutBinding::default().binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)];
+            p.descriptors = d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default()
+                .bindings(&bindings),None)?;
+            let sets = [p.descriptors];
+            let push = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .offset(0).size(8)];
+            p.layout = d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&sets).push_constant_ranges(&push),None)?;
+            let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE)
+                .module(p.shader).name(c"main");
+            let info = vk::ComputePipelineCreateInfo::default().stage(stage).layout(p.layout);
+            p.pipeline = match d.create_compute_pipelines(vk::PipelineCache::null(),&[info],None) {
+                Ok(pipelines) => pipelines[0],
+                Err((pipelines,e)) => {
+                    for pipeline in pipelines { d.destroy_pipeline(pipeline,None); }
+                    return Err(e.into());
+                }
+            };
+        }
+        Ok(p)
+    }
+}
+/// Immutable descriptor binding. Its buffer and pipeline may not be retired
+/// while this object exists. Every session submission completes synchronously.
+struct ComputeBinding<'a> {
+    d: &'a ash::Device,
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+    pipeline: ComputeId,
+    buffer: BufferId,
+    bytes: u64,
+}
+impl Drop for ComputeBinding<'_> {
+    fn drop(&mut self) { unsafe { self.d.destroy_descriptor_pool(self.pool,None); } }
+}
+impl<'a> ComputeBinding<'a> {
+    fn new(d:&'a ash::Device,pipeline:ComputeId,buffer:BufferId,layout:vk::DescriptorSetLayout,
+           handle:vk::Buffer,offset:u64,bytes:u64) -> Result<Self> {
+        let mut b = Self { d,pool:vk::DescriptorPool::null(),set:vk::DescriptorSet::null(),
+            pipeline,buffer,bytes };
+        unsafe {
+            let sizes = [vk::DescriptorPoolSize { ty:vk::DescriptorType::STORAGE_BUFFER,descriptor_count:1 }];
+            b.pool = d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default()
+                .max_sets(1).pool_sizes(&sizes),None)?;
+            b.set = d.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(b.pool).set_layouts(&[layout]))?[0];
+            let infos = [vk::DescriptorBufferInfo::default().buffer(handle).offset(offset).range(bytes)];
+            d.update_descriptor_sets(&[vk::WriteDescriptorSet::default().dst_set(b.set).dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&infos)],&[]);
+        }
+        Ok(b)
+    }
+}
+
+fn dispatch_bytes(groups:u32,limit:u32,bytes:u64) -> Result<()> {
+    if groups == 0 || groups > limit || u64::from(groups)*u64::from(COMPUTE_LANES)*4 > bytes {
+        return Err("dispatch exceeds group or storage buffer bounds".into());
+    }
+    Ok(())
+}
+
 /// Owns resources and a command queue while exclusively borrowing Context.
 /// IDs are valid only in the session that created them. Failed submissions
 /// poison the session; no resource is reused before completion is known.
@@ -341,6 +438,8 @@ pub struct Session<'a> {
     completed: u64,
     next_id: u64,
     poisoned: bool,
+    compute_bindings: BTreeMap<ComputeBindingId,ComputeBinding<'a>>,
+    compute_pipelines: BTreeMap<ComputeId,ComputePipeline<'a>>,
     buffers: BTreeMap<BufferId,Buffer<'a>>,
     images: BTreeMap<ImageId,Image<'a>>,
     pipelines: BTreeMap<PipelineId,GraphicsPipeline<'a>>,
@@ -366,7 +465,7 @@ impl<'a> Session<'a> {
             memory:unsafe { context.instance.get_physical_device_memory_properties(context.physical) },
             queue:unsafe { d.get_device_queue(context.family,0) },
             pool:vk::CommandPool::null(),command:vk::CommandBuffer::null(),
-            timeline:vk::Semaphore::null(),completed:0,next_id:1,poisoned:false,buffers:BTreeMap::new(),images:BTreeMap::new(),pipelines:BTreeMap::new(),indices:BTreeMap::new(),
+            timeline:vk::Semaphore::null(),completed:0,next_id:1,poisoned:false,buffers:BTreeMap::new(),images:BTreeMap::new(),pipelines:BTreeMap::new(),indices:BTreeMap::new(),compute_bindings:BTreeMap::new(),compute_pipelines:BTreeMap::new(),
         };
         unsafe {
             session.pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default()
@@ -402,6 +501,9 @@ impl<'a> Session<'a> {
     pub fn destroy_buffer(&mut self,id:BufferId) -> Result<()> {
         self.ready()?;
         // Every successful submit has completed before this method returns.
+        if self.compute_bindings.values().any(|b| b.buffer == id) {
+            return Err("buffer retained by a compute binding".into());
+        }
         self.buffers.remove(&id).ok_or("unknown or retired buffer ID")?;
         Ok(())
     }
@@ -464,6 +566,62 @@ impl<'a> Session<'a> {
     pub fn destroy_graphics_pipeline(&mut self,id:PipelineId) -> Result<()> {
         self.ready()?;
         self.pipelines.remove(&id).ok_or("unknown or retired graphics pipeline")?;
+        Ok(())
+    }
+
+    fn compute_pipeline(&self,id:ComputeId) -> Result<&ComputePipeline<'a>> {
+        self.compute_pipelines.get(&id).ok_or_else(|| "unknown or retired compute pipeline".into())
+    }
+
+    fn compute_binding(&self,id:ComputeBindingId) -> Result<&ComputeBinding<'a>> {
+        self.compute_bindings.get(&id).ok_or_else(|| "unknown or retired compute binding".into())
+    }
+
+    /// Trusted, validated SPIR-V matching the initial compute ABI. The shader
+    /// must restrict storage accesses to its own global invocation index.
+    pub fn create_compute_pipeline(&mut self,words:&[u32]) -> Result<ComputeId> {
+        self.ready()?;
+        let limits = unsafe { self.instance.get_physical_device_properties(self.physical) }.limits;
+        if limits.max_compute_work_group_invocations < COMPUTE_LANES
+            || limits.max_compute_work_group_size[0] < COMPUTE_LANES {
+            return Err("compute local size unsupported".into());
+        }
+        let id = ComputeId(self.next_id);
+        self.next_id = self.next_id.checked_add(1).ok_or("compute ID exhausted")?;
+        let p = ComputePipeline::new(self.d,words)?;
+        self.compute_pipelines.insert(id,p);
+        Ok(id)
+    }
+
+    pub fn create_compute_binding(&mut self,pipeline:ComputeId,buffer:BufferId,offset:u64,bytes:u64) -> Result<ComputeBindingId> {
+        self.ready()?;
+        let p = self.compute_pipeline(pipeline)?;
+        let b = self.buffer(buffer)?;
+        check_range(b.bytes,offset,bytes)?;
+        let limits = unsafe { self.instance.get_physical_device_properties(self.physical) }.limits;
+        if offset % limits.min_storage_buffer_offset_alignment.max(1) != 0
+            || bytes > u64::from(limits.max_storage_buffer_range) {
+            return Err("invalid storage buffer descriptor range".into());
+        }
+        let binding = ComputeBinding::new(self.d,pipeline,buffer,p.descriptors,b.handle,offset,bytes)?;
+        let id = ComputeBindingId(self.next_id);
+        self.next_id = self.next_id.checked_add(1).ok_or("compute binding ID exhausted")?;
+        self.compute_bindings.insert(id,binding);
+        Ok(id)
+    }
+
+    pub fn destroy_compute_binding(&mut self,id:ComputeBindingId) -> Result<()> {
+        self.ready()?;
+        self.compute_bindings.remove(&id).ok_or("unknown or retired compute binding")?;
+        Ok(())
+    }
+
+    pub fn destroy_compute_pipeline(&mut self,id:ComputeId) -> Result<()> {
+        self.ready()?;
+        if self.compute_bindings.values().any(|b| b.pipeline == id) {
+            return Err("pipeline retained by a compute binding".into());
+        }
+        self.compute_pipelines.remove(&id).ok_or("unknown or retired compute pipeline")?;
         Ok(())
     }
 
@@ -607,6 +765,13 @@ impl<'a> Session<'a> {
                     let bytes = indexed_vertex_bytes(&self.index(indices)?.words,first,count,base_vertex)?;
                     check_range(self.buffer(vertices)?.bytes,offset,bytes)?;
                 }
+                Command::Dispatch { binding,groups,.. } => {
+                    let b = self.compute_binding(binding)?;
+                    self.compute_pipeline(b.pipeline)?;
+                    self.buffer(b.buffer)?;
+                    let limits = unsafe { self.instance.get_physical_device_properties(self.physical) }.limits;
+                    dispatch_bytes(groups,limits.max_compute_work_group_count[0],b.bytes)?;
+                }
                 Command::UploadImage { src,offset,dst,region } => {
                     let image = self.image(dst)?;
                     if image.kind != ImageKind::Rgba8 { return Err("depth upload not implemented".into()); }
@@ -724,6 +889,17 @@ impl<'a> Session<'a> {
                             _ => d.cmd_draw(cmd,count,1,0,0),
                         }
                         d.cmd_end_rendering(cmd);
+                    }
+                    Command::Dispatch { binding,groups,constants } => {
+                        let b = self.compute_binding(binding)?;
+                        let p = self.compute_pipeline(b.pipeline)?;
+                        let mut bytes = [0u8;8];
+                        bytes[..4].copy_from_slice(&constants[0].to_ne_bytes());
+                        bytes[4..].copy_from_slice(&constants[1].to_ne_bytes());
+                        d.cmd_bind_pipeline(cmd,vk::PipelineBindPoint::COMPUTE,p.pipeline);
+                        d.cmd_bind_descriptor_sets(cmd,vk::PipelineBindPoint::COMPUTE,p.layout,0,&[b.set],&[]);
+                        d.cmd_push_constants(cmd,p.layout,vk::ShaderStageFlags::COMPUTE,0,&bytes);
+                        d.cmd_dispatch(cmd,groups,1,1);
                     }
                     Command::UploadImage { src,offset,dst,region } => {
                         d.cmd_copy_buffer_to_image(cmd,self.buffer(src)?.handle,self.image(dst)?.handle,
@@ -996,9 +1172,65 @@ pub(crate) fn verify_indexed(context:&mut Context,vert:&std::path::Path,frag:&st
     Ok(())
 }
 
+pub(crate) fn verify_dispatch(context:&mut Context,path:&std::path::Path) -> Result<()> {
+    let words = ash::util::read_spv(&mut std::io::Cursor::new(std::fs::read(path)?))?;
+    let mut s = Session::new(context)?;
+    const N:usize = 1024;
+    const BYTES:u64 = N as u64*4;
+    let p = s.create_compute_pipeline(&words)?;
+    let a = s.create_buffer(BYTES,MemoryKind::DeviceLocal)?;
+    let b = s.create_buffer(BYTES,MemoryKind::DeviceLocal)?;
+    let output = s.create_buffer(BYTES*2,MemoryKind::HostVisible)?;
+    let first = s.create_compute_binding(p,a,0,BYTES)?;
+    let second = s.create_compute_binding(p,b,0,BYTES)?;
+    let dispatch = |binding,groups,constants| Command::Dispatch { binding,groups,constants };
+    let epoch = s.submit(&[
+        Command::Fill { dst:a,offset:0,bytes:BYTES,value:3 },
+        Command::Fill { dst:b,offset:0,bytes:BYTES,value:7 },
+        dispatch(first,16,[5,11]),
+        dispatch(second,16,[2,19]),
+        dispatch(first,8,[3,1]),
+        Command::Copy { src:a,src_offset:0,dst:output,dst_offset:0,bytes:BYTES },
+        Command::Copy { src:b,src_offset:0,dst:output,dst_offset:BYTES,bytes:BYTES },
+    ])?;
+    let mut expected = Vec::with_capacity(2*N);
+    for i in 0..N as u32 {
+        let value = 3u32*5+11+i;
+        expected.push(if i<512 { value*3+1+i } else { value });
+    }
+    expected.extend((0..N as u32).map(|i| 7*2+19+i));
+    if s.read_words(output,0,2*N)? != expected { return Err("dispatch output mismatch".into()); }
+    println!("PASS: three dispatches, two immutable descriptor sets, one compute pipeline at timeline {epoch}");
+    if s.destroy_buffer(a).is_ok() || s.destroy_compute_pipeline(p).is_ok() {
+        return Err("destroyed retained compute resource".into());
+    }
+    if s.submit(&[Command::Fill { dst:a,offset:0,bytes:BYTES,value:0 },dispatch(first,17,[1,0])]).is_ok() {
+        return Err("accepted out-of-range dispatch".into());
+    }
+    s.submit(&[Command::Copy { src:a,src_offset:0,dst:output,dst_offset:0,bytes:BYTES }])?;
+    if s.read_words(output,0,N)? != expected[..N] { return Err("invalid list modified compute output".into()); }
+    s.destroy_compute_binding(first)?;
+    if s.submit(&[dispatch(first,1,[1,0])]).is_ok() { return Err("accepted retired compute binding".into()); }
+    s.destroy_compute_binding(second)?;
+    s.destroy_compute_pipeline(p)?;
+    s.destroy_buffer(a)?;
+    s.destroy_buffer(b)?;
+    println!("PASS: dispatch bounds and compute resource lifetime validation");
+    println!("PASS: reusable Vulkan compute pipeline and dispatch executor verified");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dispatch_validation() {
+        assert!(dispatch_bytes(16,65535,4096).is_ok());
+        assert!(dispatch_bytes(17,65535,4096).is_err());
+        assert!(dispatch_bytes(16,15,4096).is_err());
+        assert!(dispatch_bytes(0,65535,4096).is_err());
+    }
+
     #[test]
     fn indexed_vertex_validation() {
         let indices = [0,0,0,1,2,3,1,3,4];
