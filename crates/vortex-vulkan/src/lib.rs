@@ -54,9 +54,10 @@ impl Context {
         commands::Session::new(self)
     }
 
-    /// Verify the ordered buffer command executor.
+    /// Verify reusable buffer and image command execution.
     pub fn verify_commands(&mut self) -> Result<()> {
-        commands::verify(self)
+        commands::verify(self)?;
+        commands::verify_images(self)
     }
 
     /// Verify sparse non-uniform runtime descriptor arrays on supported hardware.
