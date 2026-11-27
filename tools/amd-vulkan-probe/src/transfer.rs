@@ -179,3 +179,155 @@ pub fn run(instance: &ash::Instance, physical: vk::PhysicalDevice,
     println!("PASS: full, sparse, late-write and zero-copy rounds verified on Vulkan");
     Ok(())
 }
+
+
+// Independent command pools allow simultaneous CPU recording. Queue
+// submission remains externally synchronized on the calling thread.
+const WORKERS: usize = 4;
+const CHUNK: usize = 4096;
+const FILLS: usize = BYTES / CHUNK;
+
+struct ParallelResources<'a> {
+    d: &'a ash::Device,
+    local: Buffer<'a>,
+    readback: Buffer<'a>,
+    pools: Vec<vk::CommandPool>,
+    timeline: vk::Semaphore,
+}
+impl Drop for ParallelResources<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.d.device_wait_idle();
+            for pool in self.pools.drain(..) { self.d.destroy_command_pool(pool,None); }
+            self.d.destroy_semaphore(self.timeline,None);
+        }
+    }
+}
+
+fn fill_value(index: usize, epoch: u64) -> u32 {
+    (index as u32).wrapping_mul(0x9e3779b9) ^ (epoch as u32).wrapping_mul(0x85ebca6b)
+}
+
+fn record_worker(d: &ash::Device, pool: vk::CommandPool, cmd: vk::CommandBuffer,
+                 buffer: vk::Buffer, worker: usize, epoch: u64) -> Result<(),vk::Result> {
+    let first = worker * (FILLS / WORKERS);
+    let end = first + FILLS / WORKERS;
+    // SAFETY: one worker exclusively owns this pool and command buffer;
+    // the prior submission has completed. Each writes a disjoint range.
+    unsafe {
+        d.reset_command_pool(pool,vk::CommandPoolResetFlags::empty())?;
+        d.begin_command_buffer(cmd,&vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+        for index in first..end {
+            d.cmd_fill_buffer(cmd,buffer,(index * CHUNK) as u64,CHUNK as u64,fill_value(index,epoch));
+        }
+        d.end_command_buffer(cmd)?;
+    }
+    Ok(())
+}
+
+/// Compare identical serial and parallel recording workloads. All submitted
+/// bytes are verified, including unchanged boundaries between worker regions.
+pub fn run_parallel(instance: &ash::Instance, physical: vk::PhysicalDevice,
+                    d: &ash::Device, family: u32) -> crate::Result<()> {
+    let mem = unsafe { instance.get_physical_device_memory_properties(physical) };
+    let mut r = ParallelResources {
+        d,
+        local: Buffer::new(d,&mem,vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,false)?,
+        readback: Buffer::new(d,&mem,vk::BufferUsageFlags::TRANSFER_DST,true)?,
+        pools: Vec::new(), timeline: vk::Semaphore::null(),
+    };
+    let mut commands = Vec::new();
+    let queue = unsafe {
+        for _ in 0..=WORKERS {
+            let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family),None)?;
+            r.pools.push(pool);
+            commands.push(d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default()
+                .command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1))?[0]);
+        }
+        let mut ty = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+        r.timeline = d.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut ty),None)?;
+        d.get_device_queue(family,0)
+    };
+    let mut serial = Vec::new();
+    let mut parallel = Vec::new();
+    for epoch in 1u64..=8 {
+        let is_parallel = epoch % 2 == 0;
+        let start = Instant::now();
+        let buffer = r.local.buffer;
+        if is_parallel {
+            std::thread::scope(|scope| -> crate::Result<()> {
+                let mut jobs = Vec::new();
+                for worker in 0..WORKERS {
+                    let pool = r.pools[worker];
+                    let cmd = commands[worker];
+                    jobs.push(scope.spawn(move || record_worker(d,pool,cmd,buffer,worker,epoch)));
+                }
+                let mut failure = None;
+                for job in jobs {
+                    match job.join() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => { failure = Some(format!("worker recording failed: {e:?}")); }
+                        Err(_) => { failure = Some("worker panicked".to_owned()); }
+                    }
+                }
+                if let Some(e) = failure { return Err(e.into()); }
+                Ok(())
+            })?;
+        } else {
+            for worker in 0..WORKERS {
+                record_worker(d,r.pools[worker],commands[worker],buffer,worker,epoch)?;
+            }
+        }
+        let record_ms = start.elapsed().as_secs_f64()*1000.;
+        unsafe {
+            let tail = commands[WORKERS];
+            d.reset_command_pool(r.pools[WORKERS],vk::CommandPoolResetFlags::empty())?;
+            d.begin_command_buffer(tail,&vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            // ALL_TRANSFER includes vkCmdFillBuffer (CLEAR stage), not just COPY.
+            let ready = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)];
+            d.cmd_pipeline_barrier2(tail,&vk::DependencyInfo::default().memory_barriers(&ready));
+            d.cmd_copy_buffer(tail,r.local.buffer,r.readback.buffer,&[vk::BufferCopy::default().size(BYTES as u64)]);
+            let host = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY).src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::HOST).dst_access_mask(vk::AccessFlags2::HOST_READ)];
+            d.cmd_pipeline_barrier2(tail,&vk::DependencyInfo::default().memory_barriers(&host));
+            d.end_command_buffer(tail)?;
+            let submit_commands: Vec<_> = commands.iter().map(|&cmd|
+                vk::CommandBufferSubmitInfo::default().command_buffer(cmd)).collect();
+            let wait = [vk::SemaphoreSubmitInfo::default().semaphore(r.timeline).value(epoch-1)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+            let signal = [vk::SemaphoreSubmitInfo::default().semaphore(r.timeline).value(epoch)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+            let submit = [vk::SubmitInfo2::default().command_buffer_infos(&submit_commands)
+                .wait_semaphore_infos(&wait).signal_semaphore_infos(&signal)];
+            let start = Instant::now();
+            d.queue_submit2(queue,&submit,vk::Fence::null())?;
+            d.wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&[r.timeline])
+                .values(&[epoch]),u64::MAX)?;
+            let submit_ms = start.elapsed().as_secs_f64()*1000.;
+            let ptr = d.map_memory(r.readback.memory,0,BYTES as u64,vk::MemoryMapFlags::empty())?;
+            let actual = std::slice::from_raw_parts(ptr.cast::<u32>(),BYTES/4);
+            let mismatch = actual.iter().enumerate().position(|(i,&v)| v != fill_value(i/(CHUNK/4),epoch));
+            d.unmap_memory(r.readback.memory);
+            if let Some(i) = mismatch { return Err(format!("parallel regression mismatch at word {i}, epoch {epoch}").into()); }
+            let mode = if is_parallel { "parallel" } else { "serial" };
+            println!("{mode} round {epoch}: {FILLS} fills, {WORKERS} command buffers; record {record_ms:.3} ms; submit+readback+wait {submit_ms:.3} ms");
+            println!("PASS: verified all {BYTES} bytes");
+        }
+        // First round of each mode is a warm-up, not included in the median.
+        if epoch > 2 {
+            if is_parallel { parallel.push(record_ms); } else { serial.push(record_ms); }
+        }
+    }
+    serial.sort_by(f64::total_cmp);
+    parallel.sort_by(f64::total_cmp);
+    println!("median serial recording: {:.3} ms; parallel recording: {:.3} ms",serial[1],parallel[1]);
+    println!("PASS: parallel Vulkan recording and ordered submission verified");
+    Ok(())
+}
