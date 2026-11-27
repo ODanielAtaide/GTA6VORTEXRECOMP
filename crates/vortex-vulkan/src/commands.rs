@@ -339,6 +339,7 @@ fn indexed_vertex_bytes(words:&[u32],first:u32,count:u32,base_vertex:i32) -> Res
 
 struct ComputePipeline<'a> {
     d: &'a ash::Device,
+    stride_words: u8,
     shader: vk::ShaderModule,
     descriptors: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
@@ -356,7 +357,7 @@ impl Drop for ComputePipeline<'_> {
 }
 impl<'a> ComputePipeline<'a> {
     fn new(d:&'a ash::Device,words:&[u32]) -> Result<Self> {
-        let mut p = Self { d,shader:vk::ShaderModule::null(),descriptors:vk::DescriptorSetLayout::null(),
+        let mut p = Self { d,stride_words:1,shader:vk::ShaderModule::null(),descriptors:vk::DescriptorSetLayout::null(),
             layout:vk::PipelineLayout::null(),pipeline:vk::Pipeline::null() };
         unsafe {
             p.shader = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words),None)?;
@@ -417,7 +418,12 @@ impl<'a> ComputeBinding<'a> {
 }
 
 fn dispatch_bytes(groups:u32,limit:u32,bytes:u64) -> Result<()> {
-    if groups == 0 || groups > limit || u64::from(groups)*u64::from(COMPUTE_LANES)*4 > bytes {
+    dispatch_record_bytes(groups,limit,bytes,1)
+}
+fn dispatch_record_bytes(groups:u32,limit:u32,bytes:u64,stride:u8) -> Result<()> {
+    let words = u64::from(groups)*u64::from(COMPUTE_LANES)*u64::from(stride);
+    if !(1..=16).contains(&stride) || groups == 0 || groups > limit
+        || words > u64::from(u32::MAX) || words*4 > bytes {
         return Err("dispatch exceeds group or storage buffer bounds".into());
     }
     Ok(())
@@ -630,6 +636,17 @@ impl<'a> Session<'a> {
         self.create_compute_pipeline(&words)
     }
 
+    /// Fixed-stride private record ABI. Pipeline metadata enforces the required
+    /// storage extent on every dispatch, including descriptor subranges.
+    pub fn create_native_record_pipeline(&mut self,code:&[u8],wave64:bool,vgprs:u16,stride:u8) -> Result<ComputeId> {
+        self.ready()?;
+        let program = vortex_shader::ir::build(code,wave64,vgprs)?;
+        let words = vortex_shader::spirv_vector::emit_record_kernel(&program,stride)?;
+        let id = self.create_compute_pipeline(&words)?;
+        self.compute_pipelines.get_mut(&id).ok_or("missing compute pipeline")?.stride_words = stride;
+        Ok(id)
+    }
+
     pub fn create_compute_binding(&mut self,pipeline:ComputeId,buffer:BufferId,offset:u64,bytes:u64) -> Result<ComputeBindingId> {
         self.ready()?;
         let p = self.compute_pipeline(pipeline)?;
@@ -804,10 +821,14 @@ impl<'a> Session<'a> {
                 }
                 Command::Dispatch { binding,groups,.. } => {
                     let b = self.compute_binding(binding)?;
-                    self.compute_pipeline(b.pipeline)?;
+                    let p = self.compute_pipeline(b.pipeline)?;
                     self.buffer(b.buffer)?;
                     let limits = unsafe { self.instance.get_physical_device_properties(self.physical) }.limits;
-                    dispatch_bytes(groups,limits.max_compute_work_group_count[0],b.bytes)?;
+                    if p.stride_words == 1 {
+                        dispatch_bytes(groups,limits.max_compute_work_group_count[0],b.bytes)?;
+                    } else {
+                        dispatch_record_bytes(groups,limits.max_compute_work_group_count[0],b.bytes,p.stride_words)?;
+                    }
                 }
                 Command::UploadImage { src,offset,dst,region } => {
                     let image = self.image(dst)?;
@@ -1428,6 +1449,73 @@ pub(crate) fn verify_native_memory(context:&mut Context) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn verify_native_records(context:&mut Context) -> Result<()> {
+    const N:usize = 1024;
+    const STRIDE:u8 = 8;
+    const WORDS:usize = N*STRIDE as usize;
+    const BYTES:u64 = WORDS as u64*4;
+    let mut s = Session::new(context)?;
+    let upload = s.create_buffer(BYTES,MemoryKind::HostVisible)?;
+    let local = s.create_buffer(BYTES,MemoryKind::DeviceLocal)?;
+    let readback = s.create_buffer(BYTES,MemoryKind::HostVisible)?;
+    let encode = |words:&[u32]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
+    // Load four dwords at byte offset 4 into v1..v4.
+    // Modify v1 and v4; store four at offset 16, then load three from
+    // that new location into v5..v7 and store at offset 0.
+    // Finally load two at offset 16 and conditionally store at offset 8.
+    let code = encode(&[
+        0xe038_2004,0x8001_0100,0xbf8c_0000,
+        0x4a02_0200,0x3a08_0800,
+        0xe078_2010,0x8001_0100,0xbf8c_0000,
+        0xe03c_2010,0x8001_0500,0xbf8c_0000,
+        0xe07c_2000,0x8001_0500,0xbf8c_0000,
+        0xe034_2010,0x8001_0800,0xbf8c_0000,
+        0x7da8_0001,
+        0xe074_2008,0x8001_0800,0xbf81_0000,
+    ]);
+    let initial:Vec<u32> = (0..WORDS as u32)
+        .map(|i| i.wrapping_mul(0x9e3779b9)^0xa5a55a5a).collect();
+    s.write_words(upload,0,&initial)?;
+    for wave64 in [false,true] {
+        let p = s.create_native_record_pipeline(&code,wave64,9,STRIDE)?;
+        let b = s.create_compute_binding(p,local,0,BYTES)?;
+        let epoch = s.submit(&[
+            Command::Copy { src:upload,src_offset:0,dst:local,dst_offset:0,bytes:BYTES },
+            Command::Dispatch { binding:b,groups:16,constants:[0xfffffff0,513] },
+            Command::Copy { src:local,src_offset:0,dst:readback,dst_offset:0,bytes:BYTES },
+        ])?;
+        let actual = s.read_words(readback,0,WORDS)?;
+        let mut expected = initial.clone();
+        for (i,r) in expected.chunks_exact_mut(STRIDE as usize).enumerate() {
+            let a = r[1].wrapping_add(0xfffffff0);
+            let c = r[2];
+            let d = r[3];
+            let e = r[4]^0xfffffff0;
+            r[4..8].copy_from_slice(&[a,c,d,e]);
+            r[0..3].copy_from_slice(&[a,c,d]);
+            if i<513 { r[2..4].copy_from_slice(&[a,c]); }
+        }
+        if actual != expected { return Err(format!("native record mismatch wave64={wave64}").into()); }
+        println!("PASS: native dwordx2/x3/x4 loads and stores; logical wave{}; {WORDS} words; timeline {epoch}",if wave64 {64} else {32});
+        let short = s.create_compute_binding(p,local,0,BYTES-4)?;
+        if s.submit(&[Command::Dispatch { binding:short,groups:16,constants:[0,0] }]).is_ok()
+            || s.submit(&[Command::Dispatch { binding:b,groups:17,constants:[0,0] }]).is_ok() {
+            return Err("accepted out-of-bounds record dispatch".into());
+        }
+        s.destroy_compute_binding(short)?;
+        s.destroy_compute_binding(b)?;
+        s.destroy_compute_pipeline(p)?;
+    }
+    // A four-word access starting at word 5 crosses the eight-word record.
+    let bad = encode(&[0xe038_2014,0x8001_0100,0xe078_2000,0x8001_0100,0xbf81_0000]);
+    if s.create_native_record_pipeline(&bad,false,9,STRIDE).is_ok() {
+        return Err("accepted cross-record access".into());
+    }
+    println!("PASS: record boundary and dispatch descriptor bounds enforced");
+    println!("PASS: native multi-dword memory instructions executed in Vulkan");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1437,6 +1525,8 @@ mod tests {
         assert!(dispatch_bytes(17,65535,4096).is_err());
         assert!(dispatch_bytes(16,15,4096).is_err());
         assert!(dispatch_bytes(0,65535,4096).is_err());
+        assert!(dispatch_record_bytes(16,65535,32768,8).is_ok());
+        assert!(dispatch_record_bytes(16,65535,32764,8).is_err());
     }
 
     #[test]
