@@ -53,6 +53,11 @@ impl Context {
         descriptors::run(&self.instance, self.physical, &self.device, self.family, path)
     }
 
+    /// Compare serial and parallel Vulkan command recording with full readback.
+    pub fn verify_parallel(&mut self) -> Result<()> {
+        transfer::run_parallel(&self.instance, self.physical, &self.device, self.family)
+    }
+
     /// Exercise real Vulkan transfers with the shared dirty upload planner.
     pub fn verify_transfers(&mut self) -> Result<()> {
         transfer::run(&self.instance, self.physical, &self.device, self.family)
