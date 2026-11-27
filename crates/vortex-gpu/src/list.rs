@@ -2298,7 +2298,7 @@ mod live_root_state{
     pub(super) extern "system" fn heaps(this:This,count:u32,heaps:*const This){
         if count==0{live_record(this).set_heaps(&[]);return;}
         if count>2||heaps.is_null(){crate::vulkan_live::stop("invalid guest heap array");}
-        let mut copied=[std::ptr::null();2];
+        let mut copied: [This; 2] = [std::ptr::null::<Object>(); 2];
         let mut actual=0usize;let bytes=count as usize*std::mem::size_of::<This>();
         use windows_sys::Win32::System::{Diagnostics::Debug::ReadProcessMemory,Threading::GetCurrentProcess};
         if unsafe{ReadProcessMemory(GetCurrentProcess(),heaps.cast(),copied.as_mut_ptr().cast(),bytes,&mut actual)}==0||actual!=bytes{

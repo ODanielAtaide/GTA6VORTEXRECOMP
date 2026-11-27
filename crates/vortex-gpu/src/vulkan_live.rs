@@ -83,7 +83,7 @@ impl Recording{
     }
     pub(crate) fn set_heaps(&mut self,heaps:&[This]){
         if self.closed||heaps.len()>2{stop("invalid descriptor heap binding");}
-        let mut retained=Vec::new();
+        let mut retained: Vec<crate::descriptor::LiveHeap> = Vec::new();
         for &heap in heaps{
             let h=crate::descriptor::LiveHeap::retain(heap).unwrap_or_else(||stop("unknown or non-shader-visible descriptor heap"));
             if retained.iter().any(|old:&crate::descriptor::LiveHeap|old.kind==h.kind){stop("duplicate descriptor heap type");}
