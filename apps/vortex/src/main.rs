@@ -104,6 +104,9 @@ enum Command {
     /// Verify the reusable compute dispatch executor.
     #[cfg(feature = "vulkan")]
     VulkanDispatch { shader: PathBuf },
+    /// Verify direct GFX10 diagnostic shader compilation and Vulkan dispatch.
+    #[cfg(feature = "vulkan")]
+    VulkanNative,
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -204,6 +207,12 @@ fn main() -> Result<()> {
             }
             println!("PASS: shared Vulkan host library verified from vortex CLI (not title execution)");
             Ok(())
+        }
+        #[cfg(feature = "vulkan")]
+        Command::VulkanNative => {
+            let mut host = vortex_vulkan::Context::new()
+                .map_err(|e| anyhow::anyhow!("Vulkan initialization: {e}"))?;
+            host.verify_native_dispatch().map_err(|e| anyhow::anyhow!("Native Vulkan shader executor: {e}"))
         }
         #[cfg(feature = "vulkan")]
         Command::VulkanDispatch { shader } => {
