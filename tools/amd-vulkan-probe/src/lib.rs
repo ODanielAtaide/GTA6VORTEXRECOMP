@@ -66,6 +66,15 @@ impl Context {
             spirv::float_expected)
     }
 
+    /// Verify per-invocation vector arithmetic and the diagnostic EXEC mask.
+    pub fn compute_vector_demo(&mut self, path: &Path, wave64: bool) -> Result<()> {
+        let expected: fn(u32) -> u32 = if wave64 {
+            vortex_shader::spirv_vector::expected64
+        } else { vortex_shader::spirv_vector::expected32 };
+        compute::run_with_wave(&self.instance, self.physical, &self.device, self.family, path,
+            expected, Some(if wave64 { 64 } else { 32 }))
+    }
+
     /// Verify original scalar arithmetic and condition flags.
     pub fn compute_carry_demo(&mut self, path: &Path) -> Result<()> {
         compute::run(&self.instance, self.physical, &self.device, self.family, path, |_| 42)
