@@ -3,8 +3,10 @@
 //! Vertex v0..v2 = location 0 xyz, v3..v6 = location 1 rgba.
 //! Pixel v0..v3 = interpolated location 0 rgba. This is NOT the console
 //! fetch/interpolation ABI; no inference of native shader signatures yet.
-//! Full EXEC, straight line, one POS0 + PARAM0 or MRT0 export, uncompressed.
-//! Reject unimplemented effects rather than silently skipping them.
+//! Full EXEC, straight line, POS0/PARAM0 or MRT0 and optional depth export.
+//! A restricted native P1/P2 interpolation pair maps attr0 to location 0;
+//! normalized 2D MIMG sampling maps s[4:11]/s[12:15] to combined binding 0.
+//! Explicit LOD currently targets a single-mip image. Reject unsupported effects.
 use crate::{ShaderError,gfx10::{Encoding,Fields,Operand},ir::{self,Reg,Value,EXEC}};
 use std::collections::{BTreeMap,BTreeSet};
 
@@ -94,6 +96,7 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
     let first=e.value(61,if stage==Stage::Vertex{VEC3}else{VEC4},&[INPUT0]);
     let second=if stage==Stage::Vertex{Some(e.value(61,VEC4,&[INPUT1]))}else{None};
     let mut masks=BTreeMap::new();
+    let entry_value=|reg:Reg|p.inputs.iter().find(|(r,_)|*r==reg).map(|(_,v)|*v);
     for &(r,v) in &p.inputs {
         let (vector,ch)=match r {
             Reg::V(n @ 0..=2) if stage==Stage::Vertex=>(first,n),
@@ -161,10 +164,15 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
                 let result=i.write(r).ok_or_else(reject)?;
                 match (i.name(),*src) {
                     ("v_interp_p1_f32",Operand::Vector{reg:0,dwords:1})=>{
+                        // Only the canonical entry barycentric pair is accepted.
+                        if entry_value(Reg::V(0)).is_none()||i.read(Reg::V(0))!=entry_value(Reg::V(0))
+                            ||reg<2||i.read(Reg::S(124))!=entry_value(Reg::S(124)){return Err(reject());}
                         // p1 is only a marker, never an independently usable value.
                         halves.insert(result,(reg,chan));e.defined.remove(&r);
                     }
                     ("v_interp_p2_f32",Operand::Vector{reg:1,dwords:1})=>{
+                        if entry_value(Reg::V(1)).is_none()||i.read(Reg::V(1))!=entry_value(Reg::V(1))
+                            ||i.read(Reg::S(124))!=entry_value(Reg::S(124)){return Err(reject());}
                         let old=i.read(r).ok_or_else(reject)?;
                         if halves.remove(&old)!=Some((reg,chan)){return Err(reject());}
                         let f=e.value(81,FLOAT,&[first,u32::from(chan)]);
@@ -179,6 +187,7 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
                     ||*a16||*d16||*tfe||*lwe||cache.glc||cache.slc||cache.dlc
                     ||*rsrc!=(Operand::Scalar{code:4,dwords:8})
                     ||*sampler!=Some(Operand::Scalar{code:12,dwords:4}){return Err(reject());}
+                if (4..=15).any(|r|entry_value(Reg::S(r)).is_none()||i.read(Reg::S(r))!=entry_value(Reg::S(r))){return Err(reject());}
                 let [Operand::Vector{reg:base,dwords:n}]=addr.as_slice() else{return Err(reject());};
                 if *n!=(if explicit{3}else{2})||*base>61{return Err(reject());}
                 let Operand::Vector{reg:dest,dwords:4}=*data else{return Err(reject());};
