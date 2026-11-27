@@ -243,6 +243,17 @@ impl Recording{
     pub(crate) fn write32(&mut self,address:u64,value:u32,flush:u32,flags:u32){
         self.write_marker(address,u64::from(value),4,flush,flags);
     }
+    pub(crate) fn copy_memory(&mut self,dst:u64,src:u64,len:u64,flags:u32){
+        if len==0{return;}
+        if flags!=0{stop(format_args!("unported CopyMemoryToMemoryX flags {flags:#x}"));}
+        let (from,to)={
+            let resources=RESOURCES.lock().unwrap_or_else(|e|e.into_inner());
+            (classify_address(&resources,src,len),classify_address(&resources,dst,len))
+        };
+        let (AddressClass::Unique{key:src_key,offset:src_offset,..},AddressClass::Unique{key:dst_key,offset:dst_offset,..})=(from,to)
+            else{stop(format_args!("CopyMemoryToMemoryX requires registered non-aliased spans: src={from:?}, dst={to:?}, bytes={len}"));};
+        self.push(Op::Copy{dst:Retained::new(dst_key as This),src:Retained::new(src_key as This),dst_offset,src_offset,len});
+    }
     pub(crate) fn wait_marker(&mut self,address:u64,comparison:u32,reference:u64,mask_or_flags:u64,bytes:usize){
         if comparison>8||!matches!(bytes,4|8)||address==0||address%(bytes as u64)!=0{
             stop(format_args!("unsupported guest wait address={address:#x} comparison={comparison} bytes={bytes}"));
