@@ -262,10 +262,11 @@ pub struct GraphicsState {
     pub depth_write: bool,
     pub alpha_blend: bool,
     pub linear_filter: bool,
+    pub linear_mipmap: bool,
     pub repeat: bool,
 }
 impl Default for GraphicsState {
-    fn default()->Self{Self{depth_test:true,depth_write:true,alpha_blend:false,linear_filter:false,repeat:false}}
+    fn default()->Self{Self{depth_test:true,depth_write:true,alpha_blend:false,linear_filter:false,linear_mipmap:false,repeat:false}}
 }
 
 struct GraphicsPipeline<'a> {
@@ -308,7 +309,7 @@ impl<'a> GraphicsPipeline<'a> {
                 let filter=if state.linear_filter{vk::Filter::LINEAR}else{vk::Filter::NEAREST};
                 let address=if state.repeat{vk::SamplerAddressMode::REPEAT}else{vk::SamplerAddressMode::CLAMP_TO_EDGE};
                 p.sampler=d.create_sampler(&vk::SamplerCreateInfo::default().mag_filter(filter).min_filter(filter)
-                    .mipmap_mode(vk::SamplerMipmapMode::NEAREST).address_mode_u(address)
+                    .mipmap_mode(if state.linear_mipmap{vk::SamplerMipmapMode::LINEAR}else{vk::SamplerMipmapMode::NEAREST}).address_mode_u(address)
                     .address_mode_v(address).address_mode_w(address).min_lod(0.).max_lod(1000.),None)?;
                 let bindings=[vk::DescriptorSetLayoutBinding::default().binding(0)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(1)
@@ -1973,6 +1974,9 @@ pub(crate) fn emit_native_graphics(dir:&std::path::Path) -> Result<()> {
         let prefix=format!("mip_{lod}_packed_{packed}");
         modules.push((format!("{prefix}.vert.spv"),v));modules.push((format!("{prefix}.frag.spv"),f));
     }}
+    let (v,f)=vortex_shader::spirv_graphics::mip_fixtures_lod(1.5,false);
+    let (v,f)=vortex_shader::spirv_graphics::extra_modules(&v,&f)?;
+    modules.push(("mip_fractional.vert.spv".to_owned(),v));modules.push(("mip_fractional.frag.spv".to_owned(),f));
     let (v,f)=vortex_shader::spirv_graphics::math_fixtures();
     let (v,f)=vortex_shader::spirv_graphics::extra_modules(&v,&f)?;
     modules.push(("math.vert.spv".to_owned(),v));modules.push(("math.frag.spv".to_owned(),f));
@@ -2189,15 +2193,44 @@ pub(crate) fn verify_native_mips(context:&mut Context)->Result<()> {
         s.destroy_graphics_pipeline(p)?;
         println!("PASS: native mip LOD {lod}, packed channels={packed}");
     }}
+    let (v,f)=vortex_shader::spirv_graphics::mip_fixtures_lod(1.5,false);
+    let p=s.create_native_textured_pipeline(&v,&f,[8,13],tex,
+        GraphicsState{linear_filter:true,linear_mipmap:true,..GraphicsState::default()})?;
+    s.submit(&[Command::ClearAttachments{color,depth,region:full,rgba:[0.;4],z:1.},
+        Command::DrawIndexed{pipeline:p,color,depth,region:full,vertices,offset:0,indices,first:0,count:6,base_vertex:0},
+        Command::ReadImage{src:color,region:full,dst:output,offset:0}])?;
+    for word in s.read_words(output,0,64)?{
+        if word.to_le_bytes().iter().zip([32,128,192,255]).any(|(&a,b)|i32::from(a).abs_diff(b)>2){
+            return Err("trilinear mip interpolation mismatch".into());
+        }
+    }
+    s.destroy_graphics_pipeline(p)?;
+    println!("PASS: native fractional LOD and trilinear sampling");
     // Reject bad mip and invalid attachment before any GPU writes.
     if s.submit(&[Command::UploadMip{src:upload,offset:0,dst:tex,mip:3,region:region(2)}]).is_ok(){
         return Err("out-of-range mip accepted".into());
+    }
+    if s.submit(&[Command::ClearAttachments{color:tex,depth,region:region(0),rgba:[0.;4],z:1.}]).is_ok(){
+        return Err("multi-mip attachment accepted".into());
     }
     s.submit(&[Command::GenerateMips{image:tex},
         Command::ReadMip{src:tex,mip:1,region:region(1),dst:output,offset:0},
         Command::ReadMip{src:tex,mip:2,region:region(2),dst:output,offset:16}])?;
     if s.read_words(output,0,5)?!=vec![u32::from_le_bytes(palette[0]);5]{return Err("mip generation mismatch".into());}
-    println!("PASS: GPU-generated mip chain and per-level readback");
+    // Nonconstant base verifies the blit is not just copying the first texel.
+    let quadrants=[[255u8,0,0,255],[0,255,0,255],[0,0,255,255],[255,255,255,255]];
+    let base:Vec<u32>=(0..16usize).map(|i|u32::from_le_bytes(quadrants[(i/8)*2+(i%4)/2])).collect();
+    s.write_words(upload,0,&base)?;
+    s.submit(&[Command::UploadMip{src:upload,offset:0,dst:tex,mip:0,region:region(0)},
+        Command::GenerateMips{image:tex},
+        Command::ReadMip{src:tex,mip:1,region:region(1),dst:output,offset:0},
+        Command::ReadMip{src:tex,mip:2,region:region(2),dst:output,offset:16}])?;
+    let actual=s.read_words(output,0,5)?;
+    if actual[..4]!=quadrants.map(u32::from_le_bytes)||
+        actual[4].to_le_bytes().iter().zip([128,128,128,255]).any(|(&a,b)|i32::from(a).abs_diff(b)>1){
+        return Err("nonconstant mip generation mismatch".into());
+    }
+    println!("PASS: GPU-generated constant and nonconstant mip chains and per-level readback");
     let (v,f)=vortex_shader::spirv_graphics::math_fixtures();
     let p=s.create_native_graphics_pipeline(&v,&f,[8,13])?;
     s.submit(&[Command::ClearAttachments{color,depth,region:full,rgba:[0.;4],z:1.},
