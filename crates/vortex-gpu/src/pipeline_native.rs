@@ -52,6 +52,13 @@ impl Stage{
                     // Diagnostic emitter has a synthetic ABI. Probe it for
                     // coverage only; its output must NEVER be executed here.
                     if p.stage==HwStage::Cs{
+                        // Inventory all instruction-local failures in one pass.
+                        // This does not bypass the real whole-program ABI checks.
+                        if std::env::var_os("VORTEX_BATCH_DIAGNOSTICS").is_some_and(|v|v=="1"){
+                            for (gap,count) in vortex_shader::spirv_cfg::diagnose_instructions(&ir){
+                                tracing::info!(hash=%self.hash,%gap,count,"VULKAN_SHADER_BATCH_GAP");
+                            }
+                        }
                         match vortex_shader::spirv_cfg::emit_cfg(&ir){
                             Ok(words)=>tracing::info!(hash=%self.hash,words=words.len(),"VULKAN_SHADER_LOWERING_CANDIDATE_ONLY"),
                             Err(e)=>{
