@@ -2204,7 +2204,7 @@ fn live_record(this:This)->std::sync::MutexGuard<'static,crate::vulkan_live::Rec
 }
 
 #[cfg(all(windows,feature = "vulkan"))]
-pub(crate) fn execute_live(this:This){live_record(this).execute();}
+pub(crate) fn snapshot_live(this:This)->Vec<std::sync::Arc<crate::vulkan_live::Op>>{live_record(this).snapshot()}
 
 #[cfg(all(windows,feature = "vulkan"))]
 extern "system" fn live_copy_buffer(this:This,dst:This,dst_offset:u64,src:This,src_offset:u64,len:u64){
@@ -2274,6 +2274,14 @@ extern "system" fn live_write32(this:This,address:u64,value:u32,flush:u32,flags:
 #[cfg(all(windows,feature = "vulkan"))]
 extern "system" fn live_write64(this:This,address:u64,value:u64,flush:u32,flags:u32){
     live_record(this).write_marker(address,value,8,flush,flags);
+}
+#[cfg(all(windows,feature = "vulkan"))]
+extern "system" fn live_wait32(this:This,address:u64,comparison:u32,reference:u32,mask:u32){
+    live_record(this).wait_marker(address,comparison,u64::from(reference),u64::from(mask),4);
+}
+#[cfg(all(windows,feature = "vulkan"))]
+extern "system" fn live_wait64(this:This,address:u64,comparison:u32,reference:u64,mask_or_flags:u64){
+    live_record(this).wait_marker(address,comparison,reference,mask_or_flags,8);
 }
 #[cfg(all(windows,feature = "vulkan"))]
 extern "system" fn live_set_pipeline(this:This,pipeline:This){live_record(this).set_pipeline(pipeline);}
@@ -2360,6 +2368,8 @@ const fn live_list_table(newer:bool)->[ *const ();160]{
     f[26]=live_barrier as *const ();f[51]=live_clear_dsv as *const ();f[52]=live_clear_rtv as *const ();
     f[if newer{newer_slot(69)}else{69}]=live_write32 as *const ();
     f[if newer{newer_slot(70)}else{70}]=live_write64 as *const ();
+    f[if newer{newer_slot(71)}else{71}]=live_wait32 as *const ();
+    f[if newer{newer_slot(72)}else{72}]=live_wait64 as *const ();
     f[if newer{newer_slot(129)}else{129}]=live_sync as *const ();
     f[if newer{newer_slot(130)}else{130}]=live_sync as *const ();
     f[if newer{newer_slot(137)}else{137}]=reset_x as *const ();
