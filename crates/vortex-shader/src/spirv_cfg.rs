@@ -109,7 +109,7 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
         Fields::Sopp{..} => match name {
             "s_branch"|"s_cbranch_scc0"|"s_cbranch_scc1"|"s_cbranch_execz"|"s_cbranch_execnz"|"s_endpgm" if i.writes.is_empty()=>Ok(()),
             "s_barrier" if i.writes.is_empty() => {
-                // All control in this backend is scalar and workgroup-uniform.
+                // The preflight rejects wave-dependent control in barrier programs.
                 let scope=e.c(2);let semantics=e.c(0x108);
                 e.op(224,&[scope,scope,semantics]); Ok(())
             }
