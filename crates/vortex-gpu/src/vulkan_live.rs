@@ -189,7 +189,7 @@ fn wait_read(target:&MarkerTarget,bytes:usize,comparison:u32,reference:u64,mask:
     ready
 }
 #[derive(Clone,Copy)]
-pub(crate) enum MarkerValue{Immediate(u64),GpuTimestamp}
+pub(crate) enum MarkerValue{Immediate(u64),GpuTimestamp,SystemTimestamp}
 pub(crate) enum Op{
     Sync,
     WaitMarker{target:MarkerTarget,bytes:usize,comparison:u32,reference:u64,mask:u64},
@@ -216,7 +216,7 @@ impl Recording{
     pub(crate) fn push(&mut self,op:Op){if self.closed{stop("recording into closed guest list");}self.ops.push(std::sync::Arc::new(op));}
     pub(crate) fn write_marker(&mut self,address:u64,value:u64,bytes:usize,flush:u32,flags:u32){
         if self.closed{stop("recording write into closed guest list");}
-        if !(flags==0||(flags==1&&bytes==8))||!matches!(bytes,4|8)||address==0||address%(bytes as u64)!=0{
+        if !(flags==0||((flags==1||flags==2)&&bytes==8))||!matches!(bytes,4|8)||address==0||address%(bytes as u64)!=0{
             stop(format_args!("unsupported marker flags or alignment: address={address:#x} flush={flush:#x} flags={flags:#x} bytes={bytes}"));
         }
         let location={
@@ -234,7 +234,7 @@ impl Recording{
             }
             _=>stop(format_args!("ambiguous or null marker address {address:#x}: {location:?}")),
         };
-        let marker=if flags==1{MarkerValue::GpuTimestamp}else{MarkerValue::Immediate(value)};
+        let marker=match flags{1=>MarkerValue::GpuTimestamp,2=>MarkerValue::SystemTimestamp,_=>MarkerValue::Immediate(value)};
         self.push(Op::WriteMarker{target,value:marker,bytes});
         if flags==1{static FIRST_TIMESTAMP:std::sync::Once=std::sync::Once::new();FIRST_TIMESTAMP.call_once(||tracing::info!(address,"VULKAN_GUEST_GPU_TIMESTAMP_RECORDED"));}
         static FIRST:std::sync::Once=std::sync::Once::new();
@@ -342,6 +342,14 @@ impl Op{
                     // Never publish a progress value if Vulkan submission failed.
                     let data=match value{
                         MarkerValue::Immediate(v)=>{let _=call(Task::Sync);*v}
+                        MarkerValue::SystemTimestamp=>{
+                            let _=call(Task::Sync);
+                            let mut ticks=0i64;
+                            if unsafe{windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut ticks)}==0{
+                                stop("guest system timestamp query failed");
+                            }
+                            ticks as u64
+                        }
                         MarkerValue::GpuTimestamp=>{
                             let Reply::Timestamp(ticks)=call(Task::Timestamp)else{stop("invalid Vulkan timestamp response");};
                             ticks
@@ -415,7 +423,7 @@ fn enqueue(queue:u64,work:Vec<QueueWork>){
     static SCHEDULER:OnceLock<mpsc::Sender<QueueBatch>>=OnceLock::new();
     let tx=SCHEDULER.get_or_init(||{
         let(tx,rx)=mpsc::channel::<QueueBatch>();
-        std::thread::Builder::new().name("vortex-guest-queues".into()).spawn(move||{
+        let _worker=std::thread::Builder::new().name("vortex-guest-queues".into()).spawn(move||{
             let mut pending:BTreeMap<u64,VecDeque<QueueWork>>=BTreeMap::new();
             let mut last_progress=Instant::now();
             loop{
@@ -474,6 +482,22 @@ mod marker_tests{
     use windows_sys::Win32::System::Memory::{
         VirtualAlloc,VirtualFree,MEM_COMMIT,MEM_RESERVE,MEM_RELEASE,PAGE_READWRITE,PAGE_READONLY,
     };
+    #[test]
+    fn blocked_queue_allows_other_queue_to_signal(){
+        let mut a=std::ptr::null();let mut b=std::ptr::null();
+        assert_eq!(crate::fence::create(std::ptr::null(),0,0,&crate::fence::FENCE_IIDS[0],&mut a),crate::object::S_OK);
+        assert_eq!(crate::fence::create(std::ptr::null(),0,0,&crate::fence::FENCE_IIDS[0],&mut b),crate::object::S_OK);
+        queue_wait(u64::MAX-1,a,4);
+        queue_signal(u64::MAX-1,b,9);
+        queue_signal(u64::MAX,a,4);
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);
+        while crate::fence::completed(b)!=9&&std::time::Instant::now()<deadline{
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(crate::fence::completed(a),4);
+        assert_eq!(crate::fence::completed(b),9);
+        crate::fence::release(a);crate::fence::release(b);
+    }
     #[test]
     fn retail_wait_comparisons_and_mask(){
         assert!(wait_comparison(3,0x1f,0xf,0xf));
