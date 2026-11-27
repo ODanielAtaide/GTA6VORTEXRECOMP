@@ -563,18 +563,17 @@ fn new_list(
     tracing::debug!(kind, "command list");
     #[cfg(all(windows,feature = "vulkan"))]
     let live=crate::vulkan_live::enabled();
-    #[cfg(not(all(windows,feature = "vulkan")))]
+    #[cfg(all(windows,not(feature = "vulkan")))]
     let live=false;
     #[cfg(all(windows,feature = "vulkan"))]
     if live&&!pipeline.is_null(){crate::vulkan_live::stop("initial guest pipeline is not translated");}
+    let table=if crate::device::newer(){&NEWER_LIST_FUNCTIONS}else{&LIST_FUNCTIONS};
+    #[cfg(all(windows,feature = "vulkan"))]
+    let table=if live{
+        if crate::device::newer(){&LIVE_NEWER_LIST_FUNCTIONS}else{&LIVE_LIST_FUNCTIONS}
+    }else{table};
     let list = Box::new(List {
-        object: {
-            #[cfg(all(windows,feature = "vulkan"))]
-            if live {Object::new(if crate::device::newer(){&LIVE_NEWER_LIST_FUNCTIONS}else{&LIVE_LIST_FUNCTIONS})}
-            else {Object::new(if crate::device::newer(){&NEWER_LIST_FUNCTIONS}else{&LIST_FUNCTIONS})}
-            #[cfg(not(all(windows,feature = "vulkan")))]
-            {Object::new(if crate::device::newer(){&NEWER_LIST_FUNCTIONS}else{&LIST_FUNCTIONS})}
-        },
+        object:Object::new(table),
         /* live and legacy share the guest inline layout; their tables differ. */
         kind,
         put: [0; 5],

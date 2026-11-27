@@ -66,7 +66,7 @@ fn run<'a>(context:&'a Context,s:&mut commands::Session<'_>,presenter:&mut Optio
                     s.create_buffer(CHUNK as u64,MemoryKind::DeviceLocal)?,
                     s.create_buffer(CHUNK as u64,MemoryKind::HostVisible)?]);
             }
-            let [upload,local,read]=scratch.ok_or("copy scratch missing")?;
+            let [upload,local,read]=(*scratch).ok_or("copy scratch missing")?;
             let len=bytes.len();let mut padded=bytes;padded.resize(len.next_multiple_of(4),0);
             let words:Vec<u32>=padded.chunks_exact(4).map(|p|u32::from_le_bytes([p[0],p[1],p[2],p[3]])).collect();
             s.write_words(upload,0,&words)?;
