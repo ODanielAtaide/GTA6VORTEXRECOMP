@@ -21,6 +21,18 @@ fn push(ops: &mut Vec<Op>, op: Op) -> usize {
 /// EXEC starts with an alternating mask. Immediate writes and CMPX may change it.
 /// All other live inputs are rejected.
 pub fn emit_vector(program: &ir::Program, output: Reg) -> Result<Vec<u32>, ShaderError> {
+    emit_with_inputs(program, output, false)
+}
+
+/// Explicit in-place kernel ABI: v0 = global invocation index, v1 and v2
+/// = initial buffer word for that invocation, s0/s1 = uniform push constants.
+/// EXEC initially enables all logical lanes. Only the selected result register
+/// is written back, not arbitrary guest addresses. No native memory opcodes.
+pub fn emit_buffer_kernel(program: &ir::Program, output: Reg) -> Result<Vec<u32>, ShaderError> {
+    emit_with_inputs(program, output, true)
+}
+
+fn emit_with_inputs(program: &ir::Program, output: Reg, buffer_inputs: bool) -> Result<Vec<u32>, ShaderError> {
     let unsupported = |offset, what| ShaderError::Unsupported { offset, what };
     if program.blocks.len() != 1 || !matches!(output, Reg::V(0..=2)) {
         return Err(unsupported(0, "vector diagnostic requires one block and v0-v2 output"));
@@ -35,8 +47,8 @@ pub fn emit_vector(program: &ir::Program, output: Reg) -> Result<Vec<u32>, Shade
     let one = push(&mut ops, Op::Constant(1));
     let mask = push(&mut ops, Op::Constant(31));
     let lane = push(&mut ops, Op::And(idx,mask));
-    let lo = push(&mut ops, Op::Constant(LO));
-    let hi = push(&mut ops, Op::Constant(HI));
+    let lo = push(&mut ops, Op::Constant(if buffer_inputs { u32::MAX } else { LO }));
+    let hi = push(&mut ops, Op::Constant(if buffer_inputs { u32::MAX } else { HI }));
     let lo_shifted = push(&mut ops, Op::Shr(lo,lane));
     let hi_shifted = push(&mut ops, Op::Shr(hi,lane));
     let lo_bit = push(&mut ops, Op::And(lo_shifted,one));
@@ -51,8 +63,9 @@ pub fn emit_vector(program: &ir::Program, output: Reg) -> Result<Vec<u32>, Shade
     for &(reg, value) in &program.inputs {
         let id = match reg {
             Reg::V(0) => idx,
-            Reg::V(1) => push(&mut ops, Op::Constant(OLD_V1)),
-            Reg::V(2) => push(&mut ops, Op::Constant(OLD_V2)),
+            Reg::V(1) => push(&mut ops, if buffer_inputs { Op::LoadSelf } else { Op::Constant(OLD_V1) }),
+            Reg::V(2) => push(&mut ops, if buffer_inputs { Op::LoadSelf } else { Op::Constant(OLD_V2) }),
+            Reg::S(r @ 0..=1) if buffer_inputs => push(&mut ops, Op::Push(r)),
             Reg::S(EXEC) => { exec_values.insert(reg,value); lo_bit }
             Reg::S(r) if program.wave64 && r == EXEC+1 => { exec_values.insert(reg,value); hi_bit }
             _ => return Err(unsupported(0, "unsupported vector diagnostic input")),
@@ -91,7 +104,8 @@ pub fn emit_vector(program: &ir::Program, output: Reg) -> Result<Vec<u32>, Shade
         for r in [Reg::S(EXEC), Reg::S(EXEC+1)].into_iter().take(if program.wave64 {2} else {1}) {
             if exec_values.get(&r).copied().is_none() || inst.read(r) != exec_values.get(&r).copied() { return Err(reject()); }
         }
-        if inst.reads.iter().any(|(r,_)| !matches!(r, Reg::V(0..=2)) && !exec_values.contains_key(r)) { return Err(reject()); }
+        if inst.reads.iter().any(|(r,_)| !matches!(r, Reg::V(0..=2))
+            && !exec_values.contains_key(r) && !(buffer_inputs && matches!(r, Reg::S(0..=1)))) { return Err(reject()); }
         let lo_value = *values.get(&inst.read(Reg::S(EXEC)).ok_or_else(reject)?).ok_or_else(reject)?;
         let active = if let Some(half) = half {
             let hi_value = *values.get(&inst.read(Reg::S(EXEC+1)).ok_or_else(reject)?).ok_or_else(reject)?;
@@ -102,6 +116,8 @@ pub fn emit_vector(program: &ir::Program, output: Reg) -> Result<Vec<u32>, Shade
             args.push(match *source {
                 Operand::Vector { reg: r @ 0..=2, dwords: 1 } =>
                     *values.get(&inst.read(Reg::V(r)).ok_or_else(reject)?).ok_or_else(reject)?,
+                Operand::Scalar { code: r @ 0..=1, dwords: 1 } if buffer_inputs =>
+                    *values.get(&inst.read(Reg::S(r)).ok_or_else(reject)?).ok_or_else(reject)?,
                 Operand::Literal(n) => push(&mut ops, Op::Constant(n)),
                 Operand::Const(n @ 128..=192) => push(&mut ops, Op::Constant(u32::from(n-128))),
                 Operand::Const(n @ 193..=208) => push(&mut ops, Op::Constant(0u32.wrapping_sub(u32::from(n-192)))),
@@ -220,6 +236,19 @@ pub fn cmpx_expected64(index: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_buffer_inputs_emit() {
+        // v1 = s0 + v1; v2 = s1 XOR v1.
+        let code: Vec<u8> = [0x4a02_0200u32,0x3a04_0201,0xbf81_0000]
+            .into_iter().flat_map(u32::to_le_bytes).collect();
+        for wave64 in [false,true] {
+            let p = ir::build(&code,wave64,3).unwrap();
+            assert!(p.inputs.iter().any(|(r,_)| *r == Reg::S(0)));
+            assert!(p.inputs.iter().any(|(r,_)| *r == Reg::S(1)));
+            assert!(emit_buffer_kernel(&p,Reg::V(2)).is_ok());
+            assert!(emit_vector(&p,Reg::V(2)).is_err());
+        }
+    }
     #[test]
     fn decoded_cmpx_updates_emit() {
         for wave64 in [false,true] { assert_eq!(cmpx_demo(wave64).unwrap()[0],0x07230203); }
