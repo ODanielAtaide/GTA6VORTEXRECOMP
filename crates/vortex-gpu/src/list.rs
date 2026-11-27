@@ -2381,6 +2381,23 @@ mod tests {
     use super::*;
     use crate::object::slot;
 
+    /// Compare known Xbox command slots against the live Vulkan table.
+    /// A populated slot is not proof of semantic completeness.
+    #[cfg(all(windows,feature = "vulkan"))]
+    #[test]
+    fn report_live_command_slot_gaps() {
+        let missing=object::missing_table::<LIST,160>();
+        for newer in [false,true] {
+            let known=list_table(newer);
+            let live=live_list_table(newer);
+            for slot in 0..known.len() {
+                if known[slot]!=missing[slot] && live[slot]==missing[slot] {
+                    println!("VULKAN_STATIC_SLOT_GAP interface=list newer={newer} slot={:#x}",slot*8);
+                }
+            }
+        }
+    }
+
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
         let null = std::ptr::null();
