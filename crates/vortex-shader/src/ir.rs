@@ -185,6 +185,17 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             (*to, *from) = (parked[k].1, parked[k].2);
         }
         let fallthrough = || block_at(next.ok_or(isa(machine.offset, "falls off the code"))?);
+        // From Belobug/VIctory-Belobug-AMD ir.rs (GPL-3.0-or-later),
+        // blob 410d97fb89f91effec66111b9599fbfc672cbbf0; integrated 2026-11-27.
+        // A conditional SOPP branch to fallthrough has no register effects
+        // and contributes one edge to the join. Calls also use Flow::Branch
+        // but write a return address.
+        if machine.encoding == gfx10::Encoding::Sopp
+            && matches!(flow, Flow::Branch(target) if Some(target) == next)
+        {
+            blocks[b].exit = Exit::Jump(fallthrough()?);
+            continue;
+        }
         let ends = flow != Flow::Next || next.is_none_or(|n| leaders.binary_search(&n).is_ok());
         if ends {
             blocks[b].exit = match flow {
@@ -1547,6 +1558,15 @@ mod tests {
     use super::*;
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn redundant_conditional_fallthrough_has_one_edge() {
+        let p = build_words(&[0xBF85_0000, S_ENDPGM], false);
+        assert_eq!(p.blocks.len(), 2);
+        assert_eq!(p.blocks[0].exit, Exit::Jump(1));
+        assert_eq!(p.blocks[1].preds, vec![0]);
+        assert!(p.inputs.is_empty());
+    }
 
     fn build_words(words: &[u32], wave64: bool) -> Program {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
