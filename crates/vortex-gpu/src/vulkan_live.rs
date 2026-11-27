@@ -112,6 +112,7 @@ impl Drop for Retained{
 
 pub(crate) enum Op{
     Sync,
+    Write32{resource:Retained,offset:u64,value:u32},
     Copy{dst:Retained,src:Retained,dst_offset:u64,src_offset:u64,len:u64},
     ClearColor{resource:Retained,spec:ImageSpec,rgba:[f32;4]},
     ClearDepth{resource:Retained,spec:ImageSpec,z:f32},
@@ -132,6 +133,23 @@ pub(crate) struct Recording{closed:bool,ops:Vec<Op>,
 
 impl Recording{
     pub(crate) fn push(&mut self,op:Op){if self.closed{stop("recording into closed guest list");}self.ops.push(op);}
+    pub(crate) fn write32(&mut self,address:u64,value:u32,flush:u32,flags:u32){
+        if self.closed{stop("recording write into closed guest list");}
+        if flags!=0||address%4!=0{
+            stop(format_args!("unsupported write32 flags or alignment: address={address:#x} flush={flush:#x} flags={flags:#x}"));
+        }
+        let location={
+            let resources=RESOURCES.lock().unwrap_or_else(|e|e.into_inner());
+            classify_address(&resources,address,4)
+        };
+        let AddressClass::Unique{key,offset,..}=location else{
+            stop(format_args!("write32 address {address:#x} is not a unique registered buffer: {location:?} flush={flush:#x} flags={flags:#x}"));
+        };
+        let resource=Retained::new(key as This);
+        self.push(Op::Write32{resource,offset,value});
+        static FIRST:std::sync::Once=std::sync::Once::new();
+        FIRST.call_once(||tracing::info!(address,value,flush,flags,"VULKAN_GUEST_WRITE32_RECORDED"));
+    }
     pub(crate) fn close(&mut self){if self.closed{stop("guest list already closed");}self.closed=true;}
     pub(crate) fn reset(&mut self){self.ops.clear();self.closed=false;self.pipeline=None;self.roots=Default::default();self.heaps.clear();}
     pub(crate) fn set_pipeline(&mut self,pipeline:This){
@@ -201,6 +219,20 @@ impl Recording{
                     let _=call(Task::Sync);
                     static FIRST:std::sync::Once=std::sync::Once::new();
                     FIRST.call_once(||println!("VULKAN_GUEST_SYNC_OK: native synchronization2 barrier submitted and completed"));
+                }
+                Op::Write32{resource,offset,value}=>{
+                    // Current live backend completes each submitted operation
+                    // synchronously; widen the guest flush to a full GPU sync.
+                    let _=call(Task::Sync);
+                    let address=range(resource.get(),*offset,4);
+                    let bytes=value.to_le_bytes();
+                    let mut actual=0usize;
+                    use windows_sys::Win32::System::{Diagnostics::Debug::WriteProcessMemory,Threading::GetCurrentProcess};
+                    if unsafe{WriteProcessMemory(GetCurrentProcess(),address as *mut _,bytes.as_ptr().cast(),bytes.len(),&mut actual)}==0||actual!=bytes.len(){
+                        stop("guest write32 destination is not writable");
+                    }
+                    static FIRST:std::sync::Once=std::sync::Once::new();
+                    FIRST.call_once(||println!("VULKAN_GUEST_WRITE32_OK: ordered write to registered guest buffer"));
                 }
                 Op::Copy{dst,src,dst_offset,src_offset,len}=>copy(dst.get(),src.get(),*dst_offset,*src_offset,*len),
                 Op::ClearColor{resource,spec,rgba}=>{
