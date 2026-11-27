@@ -7,8 +7,8 @@
 //! descriptor 0:0 with stride four. EXEC starts full; immediate writes and
 //! unsigned CMPX update per-lane state. EXECZ/EXECNZ are real subgroup votes.
 //! Native memory effects only; no implicit output. One-dimensional workgroups of
-//! 64. Dynamic dword indices are bounds checked. Ordinary stores may only use v0
-//! and zero offset. Atomic accesses may share addresses. The caller must ensure
+//! 64. Dynamic dword indices are bounds checked. Ordinary stores may only use
+//! the proven original global index and zero offset. Atomic accesses may share addresses. The caller must ensure
 //! ordinary reads and LDS accesses are race free. LDS/barriers are rejected in
 //! programs with EXEC mutations or wave-dependent branches. No indirect jumps,
 //! arbitrary descriptors, VCC branches or general mask dataflow yet.
@@ -374,7 +374,8 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
             if !writes(i,&expected){return Err(err());}
             if !atomic&&cache.glc{return Err(err());}
             // Nonatomic stores are private. Shared-address writes use atomics.
-            if name=="buffer_store_dword" && (address!=0||*offset!=0){return Err(err());}
+            // The module preflight proves the index is invocation-private.
+            if name=="buffer_store_dword" && *offset!=0{return Err(err());}
             let raw=e.reg(Reg::V(address))?;let off=e.c(u32::from(*offset)/4);
             let index=e.u(128,raw,off);let no_wrap=e.test(174,index,raw);
             let in_bounds=e.test(176,index,length);
@@ -389,10 +390,15 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
             match name {
                 "buffer_load_dword"=>{let val=e.load(ptr);e.put(r,val)?;},
                 "buffer_store_dword"=>{let val=e.reg(r)?;e.op(62,&[ptr,val]);},
-                "buffer_atomic_add"|"buffer_atomic_umin"|"buffer_atomic_umax"|"buffer_atomic_swap"|"buffer_atomic_cmpswap"=>{
+                "buffer_atomic_add"|"buffer_atomic_sub"|"buffer_atomic_and"|"buffer_atomic_or"|"buffer_atomic_xor"|
+                "buffer_atomic_umin"|"buffer_atomic_umax"|"buffer_atomic_swap"|"buffer_atomic_cmpswap"=>{
                     let scope=e.c(1);let sem=e.c(0);let val=old.ok_or_else(err)?;
-                    let opcode=match name {"buffer_atomic_add"=>234,"buffer_atomic_umin"=>237,
-                        "buffer_atomic_umax"=>239,"buffer_atomic_swap"=>229,_=>230};
+                    let opcode=match name {
+                        "buffer_atomic_add"=>234,"buffer_atomic_sub"=>235,
+                        "buffer_atomic_and"=>240,"buffer_atomic_or"=>241,"buffer_atomic_xor"=>242,
+                        "buffer_atomic_umin"=>237,"buffer_atomic_umax"=>239,
+                        "buffer_atomic_swap"=>229,"buffer_atomic_cmpswap"=>230,_=>return Err(err()),
+                    };
                     let result=if cmp{e.value(opcode,UINT,&[ptr,scope,sem,sem,val,compare.ok_or_else(err)?])}
                         else{e.value(opcode,UINT,&[ptr,scope,sem,val])};
                     if cache.glc{e.put(r,result)?;}
@@ -465,6 +471,43 @@ pub fn emit_cfg(p:&ir::Program)->Result<Vec<u32>,ShaderError> { emit_cfg_inner(p
 /// Explicit two-resource ABI: s[4:7] -> binding 0, s[8:11] -> binding 1.
 pub fn emit_cfg_two_resources(p:&ir::Program)->Result<Vec<u32>,ShaderError> { emit_cfg_inner(p,true) }
 
+// Prove identity to the original global index in SSA, rather than requiring
+// a particular physical register. Start with the conservative full-EXEC,
+// straight-line case. Partial EXEC preserves old lane values, so it must not
+// propagate a copy unless both masked alternatives are known (not modeled yet).
+fn check_private_stores(p: &ir::Program) -> Result<(), ShaderError> {
+    let mut private = std::collections::BTreeSet::new();
+    if let Some((_, v)) = p.inputs.iter().find(|(r, _)| *r == Reg::V(0)) {
+        private.insert(*v);
+    }
+    let copies = p.blocks.len() == 1 && !has_wave_flow(p);
+    for i in p.blocks.iter().flat_map(|b| &b.insts) {
+        if i.name() == "buffer_store_dword" {
+            let address = match &i.fields {
+                Fields::Buffer { addr, offset: 0, .. } => vector(*addr),
+                _ => None,
+            };
+            if !address.and_then(|reg| i.read(Reg::V(reg))).is_some_and(|v| private.contains(&v)) {
+                return Err(unsupported(i.machine.offset, "CFG store requires unchanged global index"));
+            }
+        }
+        if copies && i.name() == "v_mov_b32" && i.machine.encoding == Encoding::Vop1 {
+            if let Fields::Valu(v) = &i.fields {
+                if v.dpp.is_none() && v.sdwa.is_none() {
+                    if let [source] = v.src.as_slice() {
+                        if let (Some(src), Some(dst)) = (vector(*source), v.dst.and_then(vector)) {
+                            if i.read(Reg::V(src)).is_some_and(|id| private.contains(&id)) {
+                                if let Some(id) = i.write(Reg::V(dst)) { private.insert(id); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn emit_cfg_inner(p:&ir::Program,multi:bool)->Result<Vec<u32>,ShaderError> {
     if p.blocks.is_empty()||p.blocks.len()>1024 {
         return Err(unsupported(0,"CFG block count"));
@@ -476,18 +519,7 @@ fn emit_cfg_inner(p:&ir::Program,multi:bool)->Result<Vec<u32>,ShaderError> {
     if p.inputs.iter().any(|(r,_)|!matches!(r,Reg::S(0..=1)|Reg::V(_))&&!descriptor(*r)&&!(multi&&second_descriptor(*r))&&!exec(*r)){
         return Err(unsupported(0,"undeclared CFG input"));
     }
-    // MBCNT can overwrite v0. The fixture storage ABI may only use the
-    // original global index for non-atomic writes; never turn a lane-local
-    // index into a shared address across workgroups.
-    let original=p.inputs.iter().find(|(r,_)|*r==Reg::V(0)).map(|(_,v)|*v);
-    for i in p.blocks.iter().flat_map(|b|&b.insts){
-        if i.name()=="buffer_store_dword"{
-            let address=match &i.fields{Fields::Buffer{addr,..}=>vector(*addr),_=>None};
-            if address!=Some(0)||original.is_none()||i.read(Reg::V(0))!=original{
-                return Err(unsupported(i.machine.offset,"CFG store requires unchanged global index"));
-            }
-        }
-    }
+    check_private_stores(p)?;
     if has_wave_flow(p)&&p.blocks.iter().flat_map(|b|&b.insts).any(|i|
         i.name()=="s_barrier"||matches!(i.fields,Fields::Ds{..})) {
         return Err(unsupported(0,"LDS or barrier in wave-dependent CFG"));
@@ -654,6 +686,21 @@ mod tests {
         assert_eq!(words[0], 0x07230203);
         assert!(!has_opcode(&words, 246)); // OpLoopMerge
         assert!(!has_opcode(&words, 251)); // OpSwitch
+    }
+    #[test]
+    fn private_store_accepts_proven_copy_not_arbitrary_index() {
+        // v_mov_b32 v2, v0; buffer_store_dword v3, v2, s[4:7], 0 idxen.
+        let build = |mov| {
+            let code: Vec<u8> = [mov, 0xe070_2000u32, 0x8001_0302, 0xbf81_0000]
+                .into_iter().flat_map(u32::to_le_bytes).collect();
+            ir::build(&code, false, 4).unwrap()
+        };
+        let copied = build(0x7e04_0300);
+        assert!(check_private_stores(&copied).is_ok());
+        assert!(emit_cfg(&copied).is_ok());
+        let constant = build(0x7e04_0280);
+        assert!(check_private_stores(&constant).is_err());
+        assert!(emit_cfg(&constant).is_err());
     }
     #[test]
     fn native_loop_and_branch_emit() {
