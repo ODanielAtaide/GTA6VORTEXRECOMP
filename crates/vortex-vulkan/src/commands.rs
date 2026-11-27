@@ -46,20 +46,30 @@ pub enum MemoryKind { DeviceLocal, HostVisible }
 
 /// Initial attachment formats; all supported texels occupy four bytes.
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
-pub enum ImageKind { Rgba8, Depth32 }
+pub enum ImageKind { Rgba8, Depth32, Bc1, Bc2, Bc3, Bc4, Bc5, Bc6h, Bc7 }
 
 impl ImageKind {
     fn format(self) -> vk::Format {
-        match self { Self::Rgba8 => vk::Format::R8G8B8A8_UNORM, Self::Depth32 => vk::Format::D32_SFLOAT }
+        match self { Self::Rgba8 => vk::Format::R8G8B8A8_UNORM, Self::Depth32 => vk::Format::D32_SFLOAT,
+            Self::Bc1=>vk::Format::BC1_RGBA_UNORM_BLOCK,Self::Bc2=>vk::Format::BC2_UNORM_BLOCK,
+            Self::Bc3=>vk::Format::BC3_UNORM_BLOCK,Self::Bc4=>vk::Format::BC4_UNORM_BLOCK,
+            Self::Bc5=>vk::Format::BC5_UNORM_BLOCK,Self::Bc6h=>vk::Format::BC6H_UFLOAT_BLOCK,
+            Self::Bc7=>vk::Format::BC7_UNORM_BLOCK }
+    }
+    fn block_bytes(self)->Option<u64>{
+        match self{Self::Bc1|Self::Bc4=>Some(8),Self::Bc2|Self::Bc3|Self::Bc5|Self::Bc6h|Self::Bc7=>Some(16),_=>None}
+    }
+    fn sampled(self)->bool{self!=Self::Depth32
     }
     fn aspect(self) -> vk::ImageAspectFlags {
-        match self { Self::Rgba8 => vk::ImageAspectFlags::COLOR, Self::Depth32 => vk::ImageAspectFlags::DEPTH }
+        match self { Self::Depth32 => vk::ImageAspectFlags::DEPTH, _=>vk::ImageAspectFlags::COLOR }
     }
     fn usage(self) -> vk::ImageUsageFlags {
         let transfer = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
         transfer | match self {
             Self::Rgba8 => vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             Self::Depth32 => vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            _=>vk::ImageUsageFlags::SAMPLED,
         }
     }
 }
@@ -235,10 +245,23 @@ impl<'a> Image<'a> {
         Ok(((self.width>>mip).max(1),(self.height>>mip).max(1)))
     }
     fn check_mip(&self,mip:u32,region:ImageRegion)->Result<u64>{
-        let (w,h)=self.mip_dimensions(mip)?;region_bytes(w,h,region)
+        let (w,h)=self.mip_dimensions(mip)?;self.region_size(w,h,region)
     }
     fn check(&self,region:ImageRegion) -> Result<u64> {
-        region_bytes(self.width,self.height,region)
+        self.region_size(self.width,self.height,region)
+    }
+    fn region_size(&self,width:u32,height:u32,region:ImageRegion)->Result<u64>{
+        let bytes=region_bytes(width,height,region)?;
+        if let Some(block)=self.kind.block_bytes(){
+            if region.x%4!=0||region.y%4!=0||(region.width%4!=0&&region.x+region.width!=width)
+                ||(region.height%4!=0&&region.y+region.height!=height){return Err("compressed region must align to blocks or mip edge".into());}
+            return u64::from(region.width.div_ceil(4)).checked_mul(u64::from(region.height.div_ceil(4)))
+                .and_then(|n|n.checked_mul(block)).ok_or_else(||"compressed byte count overflow".into());
+        }
+        Ok(bytes)
+    }
+    fn check_transfer_offset(&self,offset:u64)->Result<()>{
+        if self.kind.block_bytes().is_some_and(|b|offset%b!=0){return Err("compressed transfer offset misaligned".into());}Ok(())
     }
 }
 
@@ -627,6 +650,7 @@ impl<'a> Session<'a> {
         self.create_image_levels(width,height,ImageKind::Rgba8,mips)
     }
     fn create_image_levels(&mut self,width:u32,height:u32,kind:ImageKind,mips:u32)->Result<ImageId>{
+        if kind.block_bytes().is_some(){return Err("compressed textures require explicit initial block data".into());}
         self.ready()?;
         if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
             return Err("invalid image dimensions".into());
@@ -648,10 +672,49 @@ impl<'a> Session<'a> {
         let clear = match kind {
             ImageKind::Rgba8 => Command::ClearImage { dst:id,rgba:[0.;4] },
             ImageKind::Depth32 => Command::ClearDepth { dst:id,depth:1. },
+            _=>unreachable!("compressed images initialized by upload"),
         };
         self.submit(&[clear])?;
         self.images.get_mut(&id).expect("created image").initialized = true;
         Ok(id)
+    }
+
+    /// Allocate a BCn sampled image and initialize every mip from original
+    /// tightly packed compressed blocks. No CPU decompression or swizzling.
+    pub fn create_bc_texture(&mut self,width:u32,height:u32,kind:ImageKind,levels:&[&[u32]])->Result<ImageId>{
+        self.ready()?;
+        let block=kind.block_bytes().ok_or("expected BCn format")?;
+        if width==0||height==0||width>i32::MAX as u32||height>i32::MAX as u32
+            ||levels.is_empty()||levels.len()> (32-width.max(height).leading_zeros()) as usize{
+            return Err("invalid BCn dimensions or mip count".into());
+        }
+        let features=unsafe{self.instance.get_physical_device_features(self.physical)};
+        if features.texture_compression_bc==0{return Err("BC texture compression unsupported".into());}
+        let props=unsafe{self.instance.get_physical_device_image_format_properties(self.physical,kind.format(),
+            vk::ImageType::TYPE_2D,vk::ImageTiling::OPTIMAL,kind.usage(),vk::ImageCreateFlags::empty())?};
+        if width>props.max_extent.width||height>props.max_extent.height||levels.len()>props.max_mip_levels as usize{
+            return Err("BCn image exceeds limits".into());
+        }
+        let mut bytes=0u64;
+        let mut copies=Vec::new();
+        for (mip,level) in levels.iter().enumerate(){
+            let w=(width>>mip).max(1);let h=(height>>mip).max(1);
+            let n=u64::from(w.div_ceil(4)).checked_mul(u64::from(h.div_ceil(4)))
+                .and_then(|n|n.checked_mul(block)).ok_or("BCn size overflow")?;
+            if (level.len() as u64).checked_mul(4)!=Some(n){return Err("incorrect BCn level byte count".into());}
+            copies.push((bytes,ImageRegion{x:0,y:0,width:w,height:h}));bytes=bytes.checked_add(n).ok_or("BCn size overflow")?;
+        }
+        let staging=self.create_buffer(bytes,MemoryKind::HostVisible)?;
+        for ((offset,_),level) in copies.iter().zip(levels){self.write_words(staging,*offset,level)?;}
+        let id=ImageId(self.next_id);self.next_id=self.next_id.checked_add(1).ok_or("image ID exhausted")?;
+        let image=Image::new(self.d,&self.memory,width,height,kind,levels.len() as u32)?;
+        self.images.insert(id,image);
+        // First upload transitions the whole chain; subsequent uploads use GENERAL.
+        for (mip,(offset,region)) in copies.into_iter().enumerate(){
+            self.submit(&[Command::UploadMip{src:staging,offset,dst:id,mip:mip as u32,region}])?;
+            self.images.get_mut(&id).expect("created compressed image").initialized=true;
+        }
+        self.destroy_buffer(staging)?;Ok(id)
     }
 
     fn pipeline(&self,id:PipelineId) -> Result<&GraphicsPipeline<'a>> {
@@ -698,7 +761,7 @@ impl<'a> Session<'a> {
         }
         let f=spirv_graphics::emit_graphics(&fragment,Stage::Fragment)?;
         let image=self.image(texture)?;
-        if image.kind!=ImageKind::Rgba8{return Err("texture must be RGBA8".into());}
+        if !image.kind.sampled(){return Err("texture must be a sampled color format".into());}
         let props=unsafe{self.instance.get_physical_device_format_properties(self.physical,image.kind.format())};
         if state.linear_filter&&!props.optimal_tiling_features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR){
             return Err("linear texture filtering unsupported".into());
@@ -728,7 +791,7 @@ impl<'a> Session<'a> {
         if sampled!=texture.is_some(){return Err("native MRT texture binding mismatch".into());}
         let view=if let Some(id)=texture{
             let image=self.image(id)?;
-            if image.kind!=ImageKind::Rgba8{return Err("MRT texture must be RGBA8".into());}
+            if !image.kind.sampled(){return Err("MRT texture must be a sampled color format".into());}
             let props=unsafe{self.instance.get_physical_device_format_properties(self.physical,image.kind.format())};
             if state.linear_filter&&!props.optimal_tiling_features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR){
                 return Err("linear texture filtering unsupported".into());
@@ -748,7 +811,7 @@ impl<'a> Session<'a> {
         let p=self.pipeline(id)?;
         if p.texture.is_none(){return Err("pipeline has no texture descriptor".into());}
         let image=self.image(texture)?;
-        if image.kind!=ImageKind::Rgba8{return Err("texture must be RGBA8".into());}
+        if !image.kind.sampled(){return Err("texture must be a sampled color format".into());}
         let props=unsafe{self.instance.get_physical_device_format_properties(self.physical,image.kind.format())};
         if p.linear_filter&&!props.optimal_tiling_features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR){
             return Err("linear texture filtering unsupported".into());
@@ -1101,11 +1164,13 @@ impl<'a> Session<'a> {
                 }
                 Command::UploadMip{src,offset,dst,mip,region}=>{
                     let image=self.image(dst)?;
-                    if image.kind!=ImageKind::Rgba8{return Err("mip upload requires RGBA8".into());}
+                    if !image.kind.sampled(){return Err("mip upload requires color texture".into());}
+                    image.check_transfer_offset(offset)?;
                     check_range(self.buffer(src)?.bytes,offset,image.check_mip(mip,region)?)?;
                 }
                 Command::ReadMip{src,mip,region,dst,offset}=>{
-                    check_range(self.buffer(dst)?.bytes,offset,self.image(src)?.check_mip(mip,region)?)?;
+                    let image=self.image(src)?;image.check_transfer_offset(offset)?;
+                    check_range(self.buffer(dst)?.bytes,offset,image.check_mip(mip,region)?)?;
                 }
                 Command::GenerateMips{image}=>{
                     let image=self.image(image)?;
@@ -1117,19 +1182,21 @@ impl<'a> Session<'a> {
                 }
                 Command::UploadImage { src,offset,dst,region } => {
                     let image = self.image(dst)?;
-                    if image.kind != ImageKind::Rgba8 { return Err("depth upload not implemented".into()); }
+                    if !image.kind.sampled() { return Err("depth upload not implemented".into()); }
+                    image.check_transfer_offset(offset)?;
                     let bytes = image.check(region)?;
                     check_range(self.buffer(src)?.bytes,offset,bytes)?;
                 }
                 Command::ReadImage { src,region,dst,offset } => {
-                    let bytes = self.image(src)?.check(region)?;
+                    let image=self.image(src)?;image.check_transfer_offset(offset)?;
+                    let bytes = image.check(region)?;
                     check_range(self.buffer(dst)?.bytes,offset,bytes)?;
                 }
                 Command::CopyImage { src,region,dst,x,y } => {
                     if src == dst { return Err("same-image copy is not implemented".into()); }
                     let from = self.image(src)?;
                     let to = self.image(dst)?;
-                    if from.kind != to.kind { return Err("image copy format mismatch".into()); }
+                    if from.kind != to.kind||from.kind.block_bytes().is_some(){return Err("image copy format mismatch or compressed image copy unsupported".into());}
                     from.check(region)?;
                     to.check(ImageRegion { x,y,..region })?;
                 }
@@ -1292,6 +1359,7 @@ impl<'a> Session<'a> {
                     }
                     Command::UploadMip{src,offset,dst,mip,region}=>{
                         let image=self.image(dst)?;
+                        initialize_layout(d,cmd,image);
                         let copy=buffer_image_copy(offset,region,image.kind).image_subresource(image_layers(image.kind).mip_level(mip));
                         d.cmd_copy_buffer_to_image(cmd,self.buffer(src)?.handle,image.handle,vk::ImageLayout::GENERAL,&[copy]);
                     }
@@ -2378,6 +2446,47 @@ pub(crate) fn verify_native_mrt(context:&mut Context)->Result<()>{
         }
         for id in colors.into_iter().flatten(){s.destroy_image(id)?;}
     }
+    Ok(())
+}
+
+/// Validate real hardware BC decoding using original constant-color blocks.
+pub(crate) fn verify_native_bc(context:&mut Context)->Result<()>{
+    let mut s=Session::new(context)?;
+    if unsafe{s.instance.get_physical_device_features(s.physical)}.texture_compression_bc==0{
+        println!("SKIP: BC texture compression unsupported");return Ok(());
+    }
+    let color=s.create_image(8,8)?;let depth=s.create_depth_image(8,8)?;
+    let full=ImageRegion{x:0,y:0,width:8,height:8};
+    let vertices=s.create_buffer(4*VERTEX_BYTES,MemoryKind::HostVisible)?;
+    let mut data=Vec::new();
+    for(x,y)in[(-1f32,-1f32),(1.,-1.),(1.,1.),(-1.,1.)]{
+        data.extend([x,y,0.5,(x+1.)*0.5,(y+1.)*0.5,0.,1.].map(f32::to_bits));
+    }
+    s.write_words(vertices,0,&data)?;
+    let indices=s.create_index_buffer(&[0,1,2,0,2,3])?;
+    let output=s.create_buffer(256,MemoryKind::HostVisible)?;
+    // BC1 red endpoint 0xf800, black endpoint 0, all indices zero.
+    // BC2/3 alpha blocks select fully opaque. BC4/5 select endpoint 255.
+    let cases=[
+        (ImageKind::Bc1,vec![0xf800,0], [255u8,0,0,255]),
+        (ImageKind::Bc2,vec![u32::MAX,u32::MAX,0xf800,0],[255,0,0,255]),
+        (ImageKind::Bc3,vec![255,0,0xf800,0],[255,0,0,255]),
+        (ImageKind::Bc4,vec![255,0],[255,0,0,255]),
+        (ImageKind::Bc5,vec![255,0,255,0],[255,255,0,255]),
+    ];
+    let(v,f)=vortex_shader::spirv_graphics::texture_fixtures(false,false);
+    for(kind,block,expected)in cases{
+        if s.create_bc_texture(4,4,kind,&[&block[..block.len()-1]]).is_ok(){return Err("accepted truncated BC block".into());}
+        let tex=s.create_bc_texture(4,4,kind,&[&block,&block,&block])?;
+        let p=s.create_native_textured_pipeline(&v,&f,[8,13],tex,GraphicsState::default())?;
+        s.submit(&[Command::ClearAttachments{color,depth,region:full,rgba:[0.;4],z:1.},
+            Command::DrawIndexed{pipeline:p,color,depth,region:full,vertices,offset:0,indices,first:0,count:6,base_vertex:0},
+            Command::ReadImage{src:color,region:full,dst:output,offset:0}])?;
+        if s.read_words(output,0,64)?!=vec![u32::from_le_bytes(expected);64]{return Err(format!("{kind:?} sample mismatch").into());}
+        s.destroy_graphics_pipeline(p)?;s.destroy_image(tex)?;
+        println!("PASS: native {kind:?} compressed mip texture sampled without CPU decompression");
+    }
+    println!("PASS: BC1/2/3/4/5 native texture tests");
     Ok(())
 }
 
