@@ -243,10 +243,29 @@ fn initialize_layout(d:&ash::Device,cmd:vk::CommandBuffer,image:&Image<'_>) {
     unsafe { d.cmd_pipeline_barrier2(cmd,&vk::DependencyInfo::default().image_memory_barriers(&barriers)); }
 }
 
+/// Initial explicit graphics state. Textures are bound for the lifetime
+/// of a pipeline; later descriptor reuse can separate the two objects.
+#[derive(Debug,Clone,Copy)]
+pub struct GraphicsState {
+    pub depth_test: bool,
+    pub depth_write: bool,
+    pub alpha_blend: bool,
+    pub linear_filter: bool,
+    pub repeat: bool,
+}
+impl Default for GraphicsState {
+    fn default()->Self{Self{depth_test:true,depth_write:true,alpha_blend:false,linear_filter:false,repeat:false}}
+}
+
 struct GraphicsPipeline<'a> {
     d: &'a ash::Device,
     vert: vk::ShaderModule,
     frag: vk::ShaderModule,
+    texture: Option<ImageId>,
+    sampler: vk::Sampler,
+    descriptor_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set: vk::DescriptorSet,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
 }
@@ -257,17 +276,43 @@ impl Drop for GraphicsPipeline<'_> {
             self.d.destroy_pipeline_layout(self.layout,None);
             self.d.destroy_shader_module(self.vert,None);
             self.d.destroy_shader_module(self.frag,None);
+            self.d.destroy_descriptor_pool(self.descriptor_pool,None);
+            self.d.destroy_descriptor_set_layout(self.descriptor_layout,None);
+            self.d.destroy_sampler(self.sampler,None);
         }
     }
 }
 impl<'a> GraphicsPipeline<'a> {
-    fn new(d:&'a ash::Device,vert:&[u32],frag:&[u32]) -> Result<Self> {
+    fn new(d:&'a ash::Device,vert:&[u32],frag:&[u32],texture:Option<(ImageId,vk::ImageView)>,state:GraphicsState) -> Result<Self> {
         let mut p = Self { d,vert:vk::ShaderModule::null(),frag:vk::ShaderModule::null(),
-            layout:vk::PipelineLayout::null(),pipeline:vk::Pipeline::null() };
+            texture:texture.map(|(id,_)|id),sampler:vk::Sampler::null(),
+            descriptor_layout:vk::DescriptorSetLayout::null(),descriptor_pool:vk::DescriptorPool::null(),
+            descriptor_set:vk::DescriptorSet::null(),layout:vk::PipelineLayout::null(),pipeline:vk::Pipeline::null() };
         unsafe {
             p.vert = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(vert),None)?;
             p.frag = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(frag),None)?;
-            p.layout = d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(),None)?;
+            if let Some((_,view))=texture {
+                let filter=if state.linear_filter{vk::Filter::LINEAR}else{vk::Filter::NEAREST};
+                let address=if state.repeat{vk::SamplerAddressMode::REPEAT}else{vk::SamplerAddressMode::CLAMP_TO_EDGE};
+                p.sampler=d.create_sampler(&vk::SamplerCreateInfo::default().mag_filter(filter).min_filter(filter)
+                    .mipmap_mode(vk::SamplerMipmapMode::NEAREST).address_mode_u(address)
+                    .address_mode_v(address).address_mode_w(address).min_lod(0.).max_lod(0.),None)?;
+                let bindings=[vk::DescriptorSetLayoutBinding::default().binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+                p.descriptor_layout=d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),None)?;
+                let sizes=[vk::DescriptorPoolSize{ty:vk::DescriptorType::COMBINED_IMAGE_SAMPLER,descriptor_count:1}];
+                p.descriptor_pool=d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes),None)?;
+                let layouts=[p.descriptor_layout];
+                p.descriptor_set=d.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(p.descriptor_pool).set_layouts(&layouts))?[0];
+                let images=[vk::DescriptorImageInfo::default().sampler(p.sampler).image_view(view).image_layout(vk::ImageLayout::GENERAL)];
+                d.update_descriptor_sets(&[vk::WriteDescriptorSet::default().dst_set(p.descriptor_set).dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&images)],&[]);
+                p.layout=d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts),None)?;
+            }else{
+                p.layout=d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(),None)?;
+            }
             let entry = c"main";
             let stages = [
                 vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::VERTEX)
@@ -294,9 +339,12 @@ impl<'a> GraphicsPipeline<'a> {
             let samples = vk::PipelineMultisampleStateCreateInfo::default()
                 .rasterization_samples(vk::SampleCountFlags::TYPE_1);
             let depth = vk::PipelineDepthStencilStateCreateInfo::default()
-                .depth_test_enable(true).depth_write_enable(true).depth_compare_op(vk::CompareOp::LESS);
+                .depth_test_enable(state.depth_test).depth_write_enable(state.depth_write).depth_compare_op(vk::CompareOp::LESS);
             let blends = [vk::PipelineColorBlendAttachmentState::default()
-                .color_write_mask(vk::ColorComponentFlags::RGBA)];
+                .color_write_mask(vk::ColorComponentFlags::RGBA).blend_enable(state.alpha_blend)
+                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA).dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .color_blend_op(vk::BlendOp::ADD).src_alpha_blend_factor(vk::BlendFactor::ONE)
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA).alpha_blend_op(vk::BlendOp::ADD)];
             let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blends);
             let dynamic_states = [vk::DynamicState::VIEWPORT,vk::DynamicState::SCISSOR];
             let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
@@ -457,8 +505,8 @@ pub struct Session<'a> {
     compute_bindings: BTreeMap<ComputeBindingId,ComputeBinding<'a>>,
     compute_pipelines: BTreeMap<ComputeId,ComputePipeline<'a>>,
     buffers: BTreeMap<BufferId,Buffer<'a>>,
-    images: BTreeMap<ImageId,Image<'a>>,
     pipelines: BTreeMap<PipelineId,GraphicsPipeline<'a>>,
+    images: BTreeMap<ImageId,Image<'a>>,
     indices: BTreeMap<IndexId,IndexBuffer<'a>>,
 }
 
@@ -574,7 +622,7 @@ impl<'a> Session<'a> {
         self.ready()?;
         let id = PipelineId(self.next_id);
         self.next_id = self.next_id.checked_add(1).ok_or("pipeline ID exhausted")?;
-        let p = GraphicsPipeline::new(self.d,vert,frag)?;
+        let p = GraphicsPipeline::new(self.d,vert,frag,None,GraphicsState::default())?;
         self.pipelines.insert(id,p);
         Ok(id)
     }
@@ -587,6 +635,24 @@ impl<'a> Session<'a> {
         let v=spirv_graphics::emit_graphics(&ir::build(vertex,false,vgprs[0])?,Stage::Vertex)?;
         let f=spirv_graphics::emit_graphics(&ir::build(fragment,false,vgprs[1])?,Stage::Fragment)?;
         self.create_graphics_pipeline(&v,&f)
+    }
+
+    /// Compile a native textured graphics pair and bind a retained RGBA8 image.
+    pub fn create_native_textured_pipeline(&mut self,vertex:&[u8],fragment:&[u8],vgprs:[u16;2],
+                                           texture:ImageId,state:GraphicsState)->Result<PipelineId>{
+        use vortex_shader::{ir,spirv_graphics::{self,Stage}};
+        self.ready()?;
+        let v=spirv_graphics::emit_graphics(&ir::build(vertex,false,vgprs[0])?,Stage::Vertex)?;
+        let f=spirv_graphics::emit_graphics(&ir::build(fragment,false,vgprs[1])?,Stage::Fragment)?;
+        let image=self.image(texture)?;
+        if image.kind!=ImageKind::Rgba8{return Err("texture must be RGBA8".into());}
+        let props=unsafe{self.instance.get_physical_device_format_properties(self.physical,image.kind.format())};
+        if state.linear_filter&&!props.optimal_tiling_features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR){
+            return Err("linear texture filtering unsupported".into());
+        }
+        let p=GraphicsPipeline::new(self.d,&v,&f,Some((texture,image.view)),state)?;
+        let id=PipelineId(self.next_id);self.next_id=self.next_id.checked_add(1).ok_or("pipeline ID exhausted")?;
+        self.pipelines.insert(id,p);Ok(id)
     }
 
     pub fn destroy_graphics_pipeline(&mut self,id:PipelineId) -> Result<()> {
@@ -796,6 +862,7 @@ impl<'a> Session<'a> {
 
     pub fn destroy_image(&mut self,id:ImageId) -> Result<()> {
         self.ready()?;
+        if self.pipelines.values().any(|p|p.texture==Some(id)){return Err("texture retained by graphics pipeline".into());}
         self.images.remove(&id).ok_or("unknown or retired image ID")?;
         Ok(())
     }
@@ -862,7 +929,9 @@ impl<'a> Session<'a> {
                     d.check(region)?;
                 }
                 Command::Draw { pipeline,color,depth,region,vertices,offset,count } => {
-                    self.pipeline(pipeline)?;
+                    let p=self.pipeline(pipeline)?;
+                    if p.texture==Some(color)||p.texture==Some(depth){return Err("sampled attachment feedback unsupported".into());}
+                    if let Some(id)=p.texture{self.image(id)?;}
                     let c = self.image(color)?;
                     let d = self.image(depth)?;
                     if c.kind != ImageKind::Rgba8 || d.kind != ImageKind::Depth32
@@ -875,7 +944,9 @@ impl<'a> Session<'a> {
                     check_range(self.buffer(vertices)?.bytes,offset,u64::from(count)*VERTEX_BYTES)?;
                 }
                 Command::DrawIndexed { pipeline,color,depth,region,vertices,offset,indices,first,count,base_vertex } => {
-                    self.pipeline(pipeline)?;
+                    let p=self.pipeline(pipeline)?;
+                    if p.texture==Some(color)||p.texture==Some(depth){return Err("sampled attachment feedback unsupported".into());}
+                    if let Some(id)=p.texture{self.image(id)?;}
                     let c = self.image(color)?;
                     let d = self.image(depth)?;
                     if c.kind != ImageKind::Rgba8 || d.kind != ImageKind::Depth32
@@ -1004,6 +1075,7 @@ impl<'a> Session<'a> {
                         d.cmd_begin_rendering(cmd,&vk::RenderingInfo::default().render_area(area)
                             .layer_count(1).color_attachments(&colors).depth_attachment(&depth_attachment));
                         d.cmd_bind_pipeline(cmd,vk::PipelineBindPoint::GRAPHICS,p.pipeline);
+                        if p.texture.is_some(){d.cmd_bind_descriptor_sets(cmd,vk::PipelineBindPoint::GRAPHICS,p.layout,0,&[p.descriptor_set],&[]);}
                         d.cmd_set_viewport(cmd,0,&viewport);
                         d.cmd_set_scissor(cmd,0,&[area]);
                         d.cmd_bind_vertex_buffers(cmd,0,&[self.buffer(vertices)?.handle],&[offset]);
@@ -1752,7 +1824,13 @@ pub(crate) fn verify_advanced(context:&mut Context) -> Result<()> {
 pub(crate) fn emit_native_graphics(dir:&std::path::Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let (v,f)=vortex_shader::spirv_graphics::fixture_modules()?;
-    for (name,words) in [("native.vert.spv",v),("native.frag.spv",f)] {
+    let mut modules=vec![("native.vert.spv".to_owned(),v),("native.frag.spv".to_owned(),f)];
+    for explicit in [false,true]{for depth in [false,true]{
+        let (v,f)=vortex_shader::spirv_graphics::texture_modules(explicit,depth)?;
+        let prefix=format!("texture_{}_{}",if explicit{"lod"}else{"implicit"},if depth{"depth"}else{"color"});
+        modules.push((format!("{prefix}.vert.spv"),v));modules.push((format!("{prefix}.frag.spv"),f));
+    }}
+    for (name,words) in modules {
         let path=dir.join(name);
         std::fs::write(&path,words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>())?;
         println!("PASS: emitted {}",path.display());
@@ -1834,6 +1912,68 @@ pub(crate) fn verify_native_graphics(context:&mut Context) -> Result<()> {
         return Err("accepted incompatible native stages".into());
     }
     println!("PASS: incompatible native stage rejected");
+    Ok(())
+}
+
+/// Native interpolation, sampled-image descriptors, texture upload, depth
+/// exports, nearest/linear filters, repeat/clamp, and alpha blending.
+pub(crate) fn verify_native_textures(context:&mut Context)->Result<()> {
+    let mut s=Session::new(context)?;
+    let texture=s.create_image(2,2)?;
+    let color=s.create_image(8,8)?;let depth=s.create_depth_image(8,8)?;
+    let full=ImageRegion{x:0,y:0,width:8,height:8};
+    let tex_region=ImageRegion{x:0,y:0,width:2,height:2};
+    let texels=[[255u8,0,0,128],[0,255,0,128],[0,0,255,128],[255,255,255,128]];
+    let upload=s.create_buffer(16,MemoryKind::HostVisible)?;
+    s.write_words(upload,0,&texels.map(u32::from_le_bytes))?;
+    s.submit(&[Command::UploadImage{src:upload,offset:0,dst:texture,region:tex_region}])?;
+    let staging=s.create_buffer(4*VERTEX_BYTES,MemoryKind::HostVisible)?;
+    let vertices=s.create_buffer(4*VERTEX_BYTES,MemoryKind::DeviceLocal)?;
+    let output=s.create_buffer(512,MemoryKind::HostVisible)?;
+    let indices=s.create_index_buffer(&[0,1,2,0,2,3])?;
+    for (explicit,depth_export,linear,repeat,blend) in [
+        (false,false,false,false,false),(true,true,false,false,false),
+        (false,false,true,false,false),(true,true,false,true,true),
+    ]{
+        let (v,f)=vortex_shader::spirv_graphics::texture_fixtures(explicit,depth_export);
+        let state=GraphicsState{linear_filter:linear,repeat,alpha_blend:blend,depth_write:!blend,..GraphicsState::default()};
+        let p=s.create_native_textured_pipeline(&v,&f,[8,13],texture,state)?;
+        let mut data=Vec::new();
+        for (x,y) in [(-1f32,-1f32),(1.,-1.),(1.,1.),(-1.,1.)]{
+            let u=(x+1.)*0.5+if repeat{1.}else{0.};let v=(y+1.)*0.5;
+            data.extend([x,y,0.5,u,v,0.,1.].map(f32::to_bits));
+        }
+        s.write_words(staging,0,&data)?;
+        let draw=Command::DrawIndexed{pipeline:p,color,depth,region:full,vertices,offset:0,indices,first:0,count:6,base_vertex:0};
+        let epoch=s.submit(&[
+            Command::Copy{src:staging,src_offset:0,dst:vertices,dst_offset:0,bytes:4*VERTEX_BYTES},
+            Command::ClearAttachments{color,depth,region:full,rgba:[0.,0.,0.,1.],z:1.},
+            draw,Command::ReadImage{src:color,region:full,dst:output,offset:0},
+            Command::ReadImage{src:depth,region:full,dst:output,offset:256},
+        ])?;
+        let actual=s.read_words(output,0,128)?;
+        for y in 0..8usize{for x in 0..8usize{
+            let i=y*8+x;let u=(x as f32+0.5)/8.;let v=(y as f32+0.5)/8.;
+            let mut expected=[0f32;4];
+            if linear{
+                let a=(u*2.-0.5).clamp(0.,1.);let b=(v*2.-0.5).clamp(0.,1.);
+                for ch in 0..4{expected[ch]=(1.-b)*((1.-a)*f32::from(texels[0][ch])+a*f32::from(texels[1][ch]))
+                    +b*((1.-a)*f32::from(texels[2][ch])+a*f32::from(texels[3][ch]));}
+            }else{expected=texels[(y/4)*2+x/4].map(f32::from);}
+            if blend{for ch in 0..3{expected[ch]*=128./255.;}expected[3]=255.;}
+            let a=actual[i].to_le_bytes();
+            if a.iter().zip(expected).any(|(&a,b)|(f32::from(a)-b).abs()>2.){
+                return Err(format!("native texture mismatch {x},{y}, explicit={explicit}, linear={linear}: {a:?} vs {expected:?}").into());
+            }
+            let z=if blend{1f32}else if depth_export{0.25}else{0.5};
+            if actual[64+i]!=z.to_bits(){return Err(format!("native sampled depth mismatch {x},{y}").into());}
+        }}
+        if s.destroy_image(texture).is_ok(){return Err("retired retained texture".into());}
+        s.destroy_graphics_pipeline(p)?;
+        println!("PASS: native texture explicit_lod={explicit}, depth_export={depth_export}, linear={linear}, repeat={repeat}, blend={blend}; timeline {epoch}");
+    }
+    s.destroy_image(texture)?;
+    println!("PASS: native VINTRP, MIMG sampling, fragment depth, samplers and alpha blending verified");
     Ok(())
 }
 
