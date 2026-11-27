@@ -18,6 +18,7 @@ pub mod resource;
 pub mod spill;
 pub mod spirv;
 pub mod spirv_scalar;
+pub mod spirv_vector;
 pub mod structure;
 
 pub use dxbc::{Container, FourCC, Part};
