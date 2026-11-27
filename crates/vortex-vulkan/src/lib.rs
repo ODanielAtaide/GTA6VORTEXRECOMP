@@ -101,7 +101,8 @@ impl Context {
         commands::verify_native_textures(self)?;
         commands::verify_native_mips(self)?;
         commands::verify_native_mrt(self)?;
-        commands::verify_native_bc(self)
+        commands::verify_native_bc(self)?;
+        commands::verify_native_dual_texture(self)
     }
 
     /// Verify sparse non-uniform runtime descriptor arrays on supported hardware.
