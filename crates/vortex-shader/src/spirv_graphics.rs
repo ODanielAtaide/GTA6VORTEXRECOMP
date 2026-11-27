@@ -6,7 +6,9 @@
 //! Full EXEC, straight line, POS0/PARAM0 or MRT0 and optional depth export.
 //! A restricted native P1/P2 interpolation pair maps attr0 to location 0;
 //! normalized 2D MIMG sampling maps s[4:11]/s[12:15] to combined binding 0.
-//! Explicit LOD currently targets a single-mip image. Reject unsupported effects.
+//! Supports normalized RGBA sampling and partial dmask, including explicit LOD.
+//! FP32 ALU assumes finite ordinary values; exact guest FP mode/NaN rules are
+//! not yet modeled. Reject unsupported effects.
 use crate::{ShaderError,gfx10::{Encoding,Fields,Operand},ir::{self,Reg,Value,EXEC}};
 use std::collections::{BTreeMap,BTreeSet};
 
@@ -35,6 +37,7 @@ const TEX_PTR:u32=19;
 const TEX:u32=20;
 const DEPTH_PTR:u32=21;
 const DEPTH:u32=22;
+const GLSL:u32=23;
 
 fn op(out:&mut Vec<u32>,code:u16,a:&[u32]) {
     out.push(((a.len() as u32+1)<<16)|u32::from(code));out.extend_from_slice(a);
@@ -74,6 +77,12 @@ impl Emit {
         }
     }
     fn float(&mut self,a:u32)->u32 {self.value(124,FLOAT,&[a])}
+    fn ext_fp(&mut self,opcode:u32,args:&[u32])->u32 {
+        let mut operands=vec![GLSL,opcode];
+        for &arg in args {operands.push(self.float(arg));}
+        let result=self.value(12,FLOAT,&operands);
+        self.value(124,UINT,&[result])
+    }
     fn fp(&mut self,opcode:u16,a:u32,b:u32)->u32 {
         let a=self.float(a);let b=self.float(b);let f=self.value(opcode,FLOAT,&[a,b]);
         self.value(124,UINT,&[f])
@@ -90,7 +99,7 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
     let interp=b.insts.iter().any(|i|matches!(i.fields,Fields::Vintrp{..}));
     let depth=b.insts.iter().any(|i|matches!(i.fields,Fields::Exp{target:8,..}));
     if stage!=Stage::Fragment&&(sampled||interp||depth){return Err(err(0,"fragment-only graphics effect"));}
-    let mut e=Emit{next:23,constants:BTreeMap::new(),declarations:vec![],body:vec![],
+    let mut e=Emit{next:24,constants:BTreeMap::new(),declarations:vec![],body:vec![],
         values:BTreeMap::new(),defined:BTreeSet::new()};
     op(&mut e.body,54,&[VOID,MAIN,0,FN]);op(&mut e.body,248,&[ENTRY]);
     let first=e.value(61,if stage==Stage::Vertex{VEC3}else{VEC4},&[INPUT0]);
@@ -146,6 +155,22 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
                     ("v_sub_f32",&[a,b])=>e.fp(131,a,b),
                     ("v_subrev_f32",&[a,b])=>e.fp(131,b,a),
                     ("v_mul_f32",&[a,b])=>e.fp(133,a,b),
+                    ("v_floor_f32",&[a])=>e.ext_fp(8,&[a]),
+                    ("v_ceil_f32",&[a])=>e.ext_fp(9,&[a]),
+                    ("v_fract_f32",&[a])=>e.ext_fp(10,&[a]),
+                    ("v_trunc_f32",&[a])=>e.ext_fp(3,&[a]),
+                    ("v_exp_f32",&[a])=>e.ext_fp(29,&[a]),
+                    ("v_log_f32",&[a])=>e.ext_fp(30,&[a]),
+                    ("v_sqrt_f32",&[a])=>e.ext_fp(31,&[a]),
+                    ("v_rsq_f32",&[a])=>e.ext_fp(32,&[a]),
+                    ("v_rcp_f32",&[a])=>{
+                        let one=e.constant(1f32.to_bits());e.fp(136,one,a)
+                    }
+                    ("v_min_f32",&[a,b])=>e.ext_fp(37,&[a,b]),
+                    ("v_max_f32",&[a,b])=>e.ext_fp(40,&[a,b]),
+                    ("v_cvt_f32_u32",&[a])=>{
+                        let f=e.value(112,FLOAT,&[a]);e.value(124,UINT,&[f])
+                    }
                     ("v_add_nc_u32",&[a,b])=>e.value(128,UINT,&[a,b]),
                     ("v_sub_nc_u32",&[a,b])=>e.value(130,UINT,&[a,b]),
                     ("v_and_b32",&[a,b])=>e.value(199,UINT,&[a,b]),
@@ -183,15 +208,16 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
             }
             Fields::Image{data,addr,rsrc,sampler,dmask,dim,unorm,r128,a16,d16,tfe,lwe,cache}=>{
                 let explicit=i.name()=="image_sample_l";
-                if !(explicit||i.name()=="image_sample")||*dim!=1||*dmask!=15||*unorm||*r128
+                if !(explicit||i.name()=="image_sample")||*dim!=1||*dmask==0||*dmask>15||*unorm||*r128
                     ||*a16||*d16||*tfe||*lwe||cache.glc||cache.slc||cache.dlc
                     ||*rsrc!=(Operand::Scalar{code:4,dwords:8})
                     ||*sampler!=Some(Operand::Scalar{code:12,dwords:4}){return Err(reject());}
                 if (4..=15).any(|r|entry_value(Reg::S(r)).is_none()||i.read(Reg::S(r))!=entry_value(Reg::S(r))){return Err(reject());}
                 let [Operand::Vector{reg:base,dwords:n}]=addr.as_slice() else{return Err(reject());};
                 if *n!=(if explicit{3}else{2})||*base>61{return Err(reject());}
-                let Operand::Vector{reg:dest,dwords:4}=*data else{return Err(reject());};
-                if dest>60||i.writes.len()!=4{return Err(reject());}
+                let Operand::Vector{reg:dest,dwords}=*data else{return Err(reject());};
+                let count=dmask.count_ones() as u8;
+                if dwords!=count||u16::from(dest)+u16::from(count)>64||i.writes.len()!=usize::from(count){return Err(reject());}
                 let u=e.word(i,Operand::Vector{reg:*base,dwords:1})?;
                 let v=e.word(i,Operand::Vector{reg:*base+1,dwords:1})?;
                 let u=e.float(u);let v=e.float(v);let uv=e.value(80,VEC2,&[u,v]);
@@ -200,10 +226,12 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
                     let lod=e.word(i,Operand::Vector{reg:*base+2,dwords:1})?;
                     let lod=e.float(lod);e.value(88,VEC4,&[tex,uv,2,lod])
                 }else{e.value(87,VEC4,&[tex,uv])};
+                let mut packed=0;
                 for ch in 0..4u8{
-                    let r=Reg::V(dest+ch);let result=i.write(r).ok_or_else(reject)?;
+                    if *dmask&(1<<ch)==0{continue;}
+                    let r=Reg::V(dest+packed);let result=i.write(r).ok_or_else(reject)?;
                     let f=e.value(81,FLOAT,&[rgba,u32::from(ch)]);let w=e.value(124,UINT,&[f]);
-                    e.values.insert(result,w);e.defined.insert(r);
+                    e.values.insert(result,w);e.defined.insert(r);packed+=1;
                 }
             }
             Fields::Exp{target,src,compr,done:finish,vm:_}=>{
@@ -234,7 +262,9 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
     if !done||exports!=required||!halves.is_empty(){return Err(err(0,"missing required graphics exports"));}
     op(&mut e.body,253,&[]);op(&mut e.body,56,&[]);
     let mut out=vec![0x07230203,0x00010300,0,e.next,0];
-    op(&mut out,17,&[1]);op(&mut out,14,&[0,1]);
+    op(&mut out,17,&[1]);
+    op(&mut out,11,&[GLSL,0x4c534c47,0x6474732e,0x3035342e,0]); // GLSL.std.450
+    op(&mut out,14,&[0,1]);
     let mut entry=vec![if stage==Stage::Vertex{0}else{4},MAIN,0x6e69616d,0,INPUT0,OUTPUT0];
     if stage==Stage::Vertex{entry.extend([INPUT1,POSITION]);}
     if depth{entry.push(DEPTH);}
@@ -304,6 +334,36 @@ pub fn texture_modules(explicit:bool,depth:bool)->Result<(Vec<u32>,Vec<u32>),Sha
     Ok((emit_graphics(&ir::build(&v,false,8)?,Stage::Vertex)?,
         emit_graphics(&ir::build(&f,false,13)?,Stage::Fragment)?))
 }
+/// Original fixture with selectable integer mip LOD and optional packed RB
+/// sample (dmask 0101). The missing channels are supplied by native VALU.
+pub fn mip_fixtures(lod:u8,packed:bool)->(Vec<u8>,Vec<u8>){
+    let (vertex,_)=texture_fixtures(true,false);
+    let mut pixel=vec![0xc810_0000u32,0xc811_0001,0xc814_0100,0xc815_0101,
+        0x7e0c_02ff,(lod as f32).to_bits(),
+        if packed{0xf090_0508}else{0xf090_0f08},0x0061_0804,0xbf8c_0000];
+    if packed{
+        // v8 = R, v9 = B; output R, 0, B, 1.
+        pixel.extend([0x7e14_0280,0x7e16_02f2,0xf800_080f,0x0b09_0a08]);
+    }else{pixel.extend([0xf800_080f,0x0b0a_0908]);}
+    pixel.push(0xbf81_0000);
+    (vertex,pixel.into_iter().flat_map(u32::to_le_bytes).collect())
+}
+
+/// Test finite native FP32 unary/binary operations through actual pixel output.
+/// v4=fract(1.25), v5=sqrt(0.25), v6=rcp(4), v7=min(1,ceil(0.25)).
+pub fn math_fixtures()->(Vec<u8>,Vec<u8>){
+    let (vertex,_)=texture_fixtures(false,false);
+    let words=[0x7e08_02ffu32,1.25f32.to_bits(),0x7e08_4104,
+        0x7e0a_02ff,0.25f32.to_bits(),0x7e0a_6705,
+        0x7e0c_02f6,0x7e0c_5506,
+        0x7e0e_02ff,0.25f32.to_bits(),0x7e0e_4507,0x1e0e_0ef2,
+        0xf800_080f,0x0706_0504,0xbf81_0000];
+    (vertex,words.into_iter().flat_map(u32::to_le_bytes).collect())
+}
+pub fn extra_modules(v:&[u8],f:&[u8])->Result<(Vec<u32>,Vec<u32>),ShaderError>{
+    Ok((emit_graphics(&ir::build(v,false,8)?,Stage::Vertex)?,
+        emit_graphics(&ir::build(f,false,13)?,Stage::Fragment)?))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +375,13 @@ mod tests {
     #[test]
     fn texture_and_depth_emit(){
         for explicit in [false,true]{for depth in [false,true]{assert!(texture_modules(explicit,depth).is_ok());}}
+    }
+    #[test]
+    fn additional_graphics_modules_emit(){
+        for lod in 0..3{for packed in [false,true]{
+            let (v,f)=mip_fixtures(lod,packed);assert!(extra_modules(&v,&f).is_ok());
+        }}
+        let (v,f)=math_fixtures();assert!(extra_modules(&v,&f).is_ok());
     }
     #[test]
     fn wrong_stage_rejected(){
