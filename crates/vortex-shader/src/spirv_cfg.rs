@@ -145,7 +145,7 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
     let err=||unsupported(i.machine.offset,"native CFG instruction or operand");
     let name=i.name();
     if i.reads.iter().any(|(r,_)|!ordinary(*r)&&!descriptor(*r)&&!exec(*r))
-        || i.writes.iter().any(|(r,_)|(!ordinary(*r)&&!exec(*r))||*r==Reg::V(0)||(e.multi&&second_descriptor(*r))) { return Err(err()); }
+        || i.writes.iter().any(|(r,_)|(!ordinary(*r)&&!exec(*r))||(*r==Reg::V(0)&&!matches!(name,"v_mbcnt_lo_u32_b32"|"v_mbcnt_hi_u32_b32"))||(e.multi&&second_descriptor(*r))) { return Err(err()); }
     match &i.fields {
         Fields::Sopp{..} => match name {
             "s_branch"|"s_cbranch_scc0"|"s_cbranch_scc1"|"s_cbranch_execz"|"s_cbranch_execnz"|"s_cbranch_vccz"|"s_cbranch_vccnz"|"s_endpgm" if i.writes.is_empty()=>Ok(()),
@@ -245,7 +245,8 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
             e.put(dest,v)?;if let Some(c)=flag{e.put(Reg::Scc,c)?;} Ok(())
         }
         Fields::Valu(v)=>{
-            if !matches!(i.machine.encoding,Encoding::Vop1|Encoding::Vop2|Encoding::Vopc)
+            let mbcnt=matches!(name,"v_mbcnt_lo_u32_b32"|"v_mbcnt_hi_u32_b32");
+            if !(matches!(i.machine.encoding,Encoding::Vop1|Encoding::Vop2|Encoding::Vopc)||mbcnt)
                 || v.carry.is_some() || v.neg!=0 || v.abs!=0 || v.neg_hi!=0 || v.opsel!=0
                 || v.opsel_hi!=0 || v.clamp || v.omod!=0 || v.sdwa.is_some() || v.dpp.is_some() {
                 return Err(err());
@@ -267,7 +268,27 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
             }
             let dst=vector(v.dst.ok_or_else(err)?).ok_or_else(err)?;
             let r=Reg::V(dst);
-            if dst==0||!writes(i,&[r]){return Err(err());}
+            if (dst==0&&!mbcnt)||!writes(i,&[r]){return Err(err());}
+            if mbcnt{
+                let &[mask,base]=v.src.as_slice()else{return Err(err());};
+                let a=match mask{
+                    Operand::Scalar{code,dwords:1} if code==EXEC||code==EXEC+1=>{
+                        let halves=e.exec_words();if code==EXEC{halves[0]}else if e.wave64{halves[1]}else{e.c(0)}
+                    }
+                    _=>e.operand(mask)?,
+                };
+                let b=e.operand(base)?;
+                let lane=e.load(SUBGROUP_LANE);
+                let one=e.c(1);let zero=e.c(0);let thirtytwo=e.c(32);let thirtyone=e.c(31);let ones=e.c(u32::MAX);
+                let below=if name=="v_mbcnt_hi_u32_b32"{
+                    let lower=e.test(176,lane,thirtytwo);let n=e.u(130,lane,thirtytwo);e.select(lower,zero,n)
+                }else{lane};
+                let shift=e.u(199,below,thirtyone);
+                let bit=e.u(196,one,shift);let prefix=e.u(130,bit,one);
+                let full=e.test(174,below,thirtytwo);let prefix=e.select(full,ones,prefix);
+                let masked=e.u(199,a,prefix);let count=e.value(205,UINT,&[masked]);let result=e.u(128,b,count);
+                return e.put_vector(r,result);
+            }
             let args:Vec<u32>=v.src.iter().map(|o|e.operand(*o)).collect::<Result<_,_>>()?;
             let val=match (name,args.as_slice()) {
                 ("v_mov_b32",&[a])=>a,
@@ -377,6 +398,18 @@ fn emit_cfg_inner(p:&ir::Program,multi:bool)->Result<Vec<u32>,ShaderError> {
     }
     if p.inputs.iter().any(|(r,_)|!matches!(r,Reg::S(0..=1)|Reg::V(0..=31))&&!descriptor(*r)&&!(multi&&second_descriptor(*r))&&!exec(*r)){
         return Err(unsupported(0,"undeclared CFG input"));
+    }
+    // MBCNT can overwrite v0. The fixture storage ABI may only use the
+    // original global index for non-atomic writes; never turn a lane-local
+    // index into a shared address across workgroups.
+    let original=p.inputs.iter().find(|(r,_)|*r==Reg::V(0)).map(|(_,v)|*v);
+    for i in p.blocks.iter().flat_map(|b|&b.insts){
+        if i.name()=="buffer_store_dword"&&i.read(Reg::V(0))!=original{
+            return Err(unsupported(i.machine.offset,"CFG store requires unchanged global index"));
+        }
+        if i.name()=="ds_read_b32"&&i.write(Reg::V(0)).is_some(){
+            return Err(unsupported(i.machine.offset,"CFG LDS destination v0"));
+        }
     }
     if has_wave_flow(p)&&p.blocks.iter().flat_map(|b|&b.insts).any(|i|
         i.name()=="s_barrier"||matches!(i.fields,Fields::Ds{..})) {

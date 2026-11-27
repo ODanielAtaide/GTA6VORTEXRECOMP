@@ -70,15 +70,32 @@ struct RootState{
 #[derive(Default)]
 pub(crate) struct Recording{closed:bool,ops:Vec<Op>,
     pipeline:Option<std::sync::Arc<crate::pipeline::native_live::Description>>,
-    roots:[RootState;2]}
+    roots:[RootState;2],
+    heaps:Vec<crate::descriptor::LiveHeap>}
 
 impl Recording{
     pub(crate) fn push(&mut self,op:Op){if self.closed{stop("recording into closed guest list");}self.ops.push(op);}
     pub(crate) fn close(&mut self){if self.closed{stop("guest list already closed");}self.closed=true;}
-    pub(crate) fn reset(&mut self){self.ops.clear();self.closed=false;self.pipeline=None;self.roots=Default::default();}
+    pub(crate) fn reset(&mut self){self.ops.clear();self.closed=false;self.pipeline=None;self.roots=Default::default();self.heaps.clear();}
     pub(crate) fn set_pipeline(&mut self,pipeline:This){
         if self.closed{stop("binding into closed guest list");}
         self.pipeline=if pipeline.is_null(){None}else{Some(crate::pipeline::native_live::get(pipeline).unwrap_or_else(||stop("invalid native pipeline object")))};
+    }
+    pub(crate) fn set_heaps(&mut self,heaps:&[This]){
+        if self.closed||heaps.len()>2{stop("invalid descriptor heap binding");}
+        let mut retained=Vec::new();
+        for &heap in heaps{
+            let h=crate::descriptor::LiveHeap::retain(heap).unwrap_or_else(||stop("unknown or non-shader-visible descriptor heap"));
+            if retained.iter().any(|old:&crate::descriptor::LiveHeap|old.kind==h.kind){stop("duplicate descriptor heap type");}
+            retained.push(h);
+        }
+        retained.sort_by_key(|h|h.kind);
+        if self.heaps!=retained{
+            self.heaps=retained;
+            for root in &mut self.roots{root.tables.clear();}
+        }
+        static FIRST:std::sync::Once=std::sync::Once::new();
+        FIRST.call_once(||tracing::info!(heaps=?self.heaps,"VULKAN_GUEST_DESCRIPTOR_HEAPS_BOUND"));
     }
     fn root_state(&mut self,compute:bool)->&mut RootState{
         if self.closed{stop("setting root state in closed list");}
@@ -113,7 +130,7 @@ impl Recording{
     }
     pub(crate) fn require_pipeline(&self,kind:&str)->!{
         let root=&self.roots[usize::from(kind=="dispatch")];
-        tracing::info!(kind,root_bytes=root.signature.as_ref().map_or(0,|v|v.len()),
+        tracing::info!(kind,heaps=?self.heaps,table_handles_valid=root.tables.values().all(|&h|self.heaps.iter().any(|heap|heap.contains(h))),root_bytes=root.signature.as_ref().map_or(0,|v|v.len()),
             table_slots=?root.tables.keys().collect::<Vec<_>>(),
             view_slots=?root.views.iter().map(|(k,v)|(*k,v.0)).collect::<Vec<_>>(),
             constant_dwords=root.constants.len(),"VULKAN_GUEST_ROOT_BINDINGS");

@@ -1,5 +1,5 @@
 param(
-    [string]$Exe = "C:\Users\SERVIDORBECODATORTA\Downloads\G\game_scarlett_master.exe",
+    [Parameter(Mandatory=$true)][string]$Exe,
     [string]$BackupDirectory = "C:\GTA6VORTEXRECOMP_BACKUPS"
 )
 $ErrorActionPreference = "Stop"
@@ -34,5 +34,5 @@ $log = Join-Path (Get-Location).Path "vulkan-live-$stamp.log"
 $result = $LASTEXITCODE
 Write-Host "Runtime exit: $result"
 Write-Host "Log: $log"
-Select-String -Path $log -Pattern 'VULKAN_SHADER_OPCODE_GAP|VULKAN_COMPUTE_HARDWARE_INPUTS|VULKAN_OPTIONAL_PSO_UNSUPPORTED|VULKAN_RUNTIME_BLOCKER|FIRST_VULKAN_GUEST_PRESENT_OK'
+Select-String -Path $log -Pattern 'VULKAN_GUEST_DESCRIPTOR_HEAPS_BOUND|VULKAN_SHADER_OPCODE_GAP|VULKAN_COMPUTE_HARDWARE_INPUTS|VULKAN_OPTIONAL_PSO_UNSUPPORTED|VULKAN_RUNTIME_BLOCKER|FIRST_VULKAN_GUEST_PRESENT_OK'
 exit $result

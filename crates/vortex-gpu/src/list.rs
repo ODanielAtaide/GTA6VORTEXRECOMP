@@ -2295,6 +2295,17 @@ extern "system" fn live_draw_indexed(this:This,indices:u32,instances:u32,first:u
 #[cfg(all(windows,feature = "vulkan"))]
 mod live_root_state{
     use super::*;
+    pub(super) extern "system" fn heaps(this:This,count:u32,heaps:*const This){
+        if count==0{live_record(this).set_heaps(&[]);return;}
+        if count>2||heaps.is_null(){crate::vulkan_live::stop("invalid guest heap array");}
+        let mut copied=[std::ptr::null();2];
+        let mut actual=0usize;let bytes=count as usize*std::mem::size_of::<This>();
+        use windows_sys::Win32::System::{Diagnostics::Debug::ReadProcessMemory,Threading::GetCurrentProcess};
+        if unsafe{ReadProcessMemory(GetCurrentProcess(),heaps.cast(),copied.as_mut_ptr().cast(),bytes,&mut actual)}==0||actual!=bytes{
+            crate::vulkan_live::stop("unreadable guest heap array");
+        }
+        live_record(this).set_heaps(&copied[..count as usize]);
+    }
     pub(super) extern "system" fn compute_root(this:This,root:This){live_record(this).set_root(true,root);}
     pub(super) extern "system" fn graphics_root(this:This,root:This){live_record(this).set_root(false,root);}
     pub(super) extern "system" fn compute_table(this:This,slot:u32,handle:u64){live_record(this).set_table(true,slot,handle);}
@@ -2328,6 +2339,7 @@ const fn live_list_table(newer:bool)->[ *const ();160]{
     f[9]=close as *const ();f[10]=reset as *const ();
     f[12]=live_draw as *const ();f[13]=live_draw_indexed as *const ();f[14]=live_dispatch as *const ();
     f[25]=live_set_pipeline as *const ();
+    f[32]=live_root_state::heaps as *const ();
     f[33]=live_root_state::compute_root as *const ();f[34]=live_root_state::graphics_root as *const ();
     f[35]=live_root_state::compute_table as *const ();f[36]=live_root_state::graphics_table as *const ();
     f[37]=live_root_state::compute_constant as *const ();f[38]=live_root_state::graphics_constant as *const ();

@@ -124,6 +124,35 @@ const SHADER_VISIBLE: u32 = 1;
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
 
+#[cfg(all(windows,feature = "vulkan"))]
+#[derive(Debug,PartialEq,Eq)]
+pub(crate) struct LiveHeap{
+    key:usize,
+    pub(crate) kind:u32,
+    pub(crate) start:u64,
+    pub(crate) count:u32,
+}
+#[cfg(all(windows,feature = "vulkan"))]
+impl LiveHeap{
+    /// Guest owns a live reference for the duration of SetDescriptorHeaps.
+    pub(crate) fn retain(this:This)->Option<Self>{
+        let heaps=SHADER_HEAPS.lock().unwrap_or_else(|e|e.into_inner());
+        let &(_,_,key)=heaps.iter().find(|&&(_,_,k)|k==this as usize)?;
+        let h=heap(this);
+        if h.desc.count==0||!matches!(h.desc.kind,VIEWS_KIND|SAMPLERS){return None;}
+        object::add_ref(this);
+        Some(Self{key,kind:h.desc.kind,start:h.start,count:h.desc.count})
+    }
+    pub(crate) fn contains(&self,handle:u64)->bool{
+        let Some(step)=increment(self.kind).map(u64::from)else{return false;};
+        handle.checked_sub(self.start).is_some_and(|offset|offset%step==0&&offset/step<u64::from(self.count))
+    }
+}
+#[cfg(all(windows,feature = "vulkan"))]
+impl Drop for LiveHeap{
+    fn drop(&mut self){release(self.key as This);}
+}
+
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
 fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
