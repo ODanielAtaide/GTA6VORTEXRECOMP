@@ -53,6 +53,8 @@ mod shadow;
 pub mod signature;
 /// Experimental Vulkan transfer planning; independent of the legacy backend.
 pub mod vulkan_upload;
+/// Experimental sparse descriptor publication journal.
+pub mod vulkan_descriptors;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
