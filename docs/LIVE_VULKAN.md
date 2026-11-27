@@ -1,5 +1,8 @@
 # Initial live Vulkan runtime
 
+## Follow-up survey: instruction-local and module-level coverage
+The compute emitter permits ordinary VGPR0 destinations (including bounded LDS loads), while ordinary global stores still require the original input SSA value and zero-offset v0 address. A separate symbolic instruction probe collects every locally failing compute instruction, including those hidden behind earlier CFG failures; it generates no executable shader and does not imply full-program support. The offline scanner now reports these counts and writes modules.txt, distinguishing source modules and stage coverage. Guest pointers and real pipeline ABI are still unresolved. Build and validation of this revision are pending.
+
 ## Offline coverage-driven compiler increment
 The initial offline scan decoded every discovered native program into IR but no candidate SPIR-V was emitted. The experimental compute emitter now supports the full u8 VGPR numbering range, with separate bounded block/instruction/register limit diagnostics, and a restricted unmodified integer VOP3 arithmetic subset (shift-add/or, add-shift, and-or, three-input add/or/xor, low multiply, unsigned min/max and population count). The unchanged global-index write restriction and guest-dispatch prohibition remain. Increased compile-time limits do not alter the runtime loop watchdog. This change does not implement raw guest pointers, real resource bindings, float-mode semantics or graphics input mapping. Use `--code-only` (PowerShell `-CodeOnly`) to explicitly restrict a follow-up offline survey to EXE/DLL/SGD5 inputs; all other files are excluded and counted, not silently reported as scanned. Compilation, validation and live execution of this increment remain pending.
 

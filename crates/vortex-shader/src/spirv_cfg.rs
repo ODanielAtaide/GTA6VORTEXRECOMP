@@ -2,7 +2,7 @@
 //! Experimental native compute CFG backend. Unlike the straight-line diagnostic,
 //! this lowers actual decoded block edges, scalar branches and loops. Register
 //! state persists across edges, so phi joins are represented by mutable slots.
-//! ABI: v0 = global index (immutable), v1 = local index, v2 = physical subgroup
+//! ABI: v0 initially holds the global index, v1 = local index, v2 = physical subgroup
 //! size; other VGPRs initially zero; s0/s1 = push constants; s[4:7] = storage
 //! descriptor 0:0 with stride four. EXEC starts full; immediate writes and
 //! unsigned CMPX update per-lane state. EXECZ/EXECNZ are real subgroup votes.
@@ -145,7 +145,7 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
     let err=||unsupported(i.machine.offset,"native CFG instruction or operand");
     let name=i.name();
     if i.reads.iter().any(|(r,_)|!ordinary(*r)&&!descriptor(*r)&&!exec(*r))
-        || i.writes.iter().any(|(r,_)|(!ordinary(*r)&&!exec(*r))||(*r==Reg::V(0)&&!matches!(name,"v_mbcnt_lo_u32_b32"|"v_mbcnt_hi_u32_b32"))||(e.multi&&second_descriptor(*r))) { return Err(err()); }
+        || i.writes.iter().any(|(r,_)|(!ordinary(*r)&&!exec(*r))||(e.multi&&second_descriptor(*r))) { return Err(err()); }
     match &i.fields {
         Fields::Sopp{..} => match name {
             "s_branch"|"s_cbranch_scc0"|"s_cbranch_scc1"|"s_cbranch_execz"|"s_cbranch_execnz"|"s_cbranch_vccz"|"s_cbranch_vccnz"|"s_endpgm" if i.writes.is_empty()=>Ok(()),
@@ -269,7 +269,7 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
             }
             let dst=vector(v.dst.ok_or_else(err)?).ok_or_else(err)?;
             let r=Reg::V(dst);
-            if (dst==0&&!mbcnt)||!writes(i,&[r]){return Err(err());}
+            if !writes(i,&[r]){return Err(err());}
             if mbcnt{
                 let &[mask,base]=v.src.as_slice()else{return Err(err());};
                 let a=match mask{
@@ -338,7 +338,7 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
             let Some(Operand::Vector{reg,dwords})=*data else{return Err(err());};
             let atomic=name.starts_with("buffer_atomic_");
             let cmp=name=="buffer_atomic_cmpswap";
-            if reg==0 || dwords!=(if cmp{2}else{1}) || (cmp&&reg==u8::MAX) {return Err(err());}
+            if dwords!=(if cmp{2}else{1}) || (cmp&&reg==u8::MAX) {return Err(err());}
             let r=Reg::V(reg);
             let expected=if name=="buffer_load_dword" || (atomic&&cache.glc){vec![r]}else{vec![]};
             if !writes(i,&expected){return Err(err());}
@@ -399,6 +399,29 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
     }
 }
 
+/// Instruction-local lowering diagnostics only. Every instruction is probed
+/// independently with symbolic register slots; no module is built or executed.
+/// These counts deliberately do NOT certify resource mappings, CFG, phi,
+/// subgroup convergence, or cross-invocation memory safety.
+pub fn diagnose_instructions(p:&ir::Program)->BTreeMap<String,u64>{
+    let mut gaps=BTreeMap::new();
+    let mut regs=BTreeMap::new();
+    let mut next=64u32;
+    for r in (0..=u8::MAX).map(Reg::V).chain((0..=127u8).map(Reg::S)).chain([Reg::Scc]){
+        if ordinary(r){regs.insert(r,next);next+=1;}
+    }
+    let mut e=Emit{next,globals:vec![],body:vec![],constants:BTreeMap::new(),regs,
+        pc:31,budget:32,active:33,global_index:34,length:35,length_second:36,wave64:p.wave64,multi:false};
+    for i in p.blocks.iter().flat_map(|b|&b.insts){
+        e.body.clear();e.globals.clear();e.constants.clear();e.next=next;
+        if let Err(error)=lower(&mut e,i){
+            let reason=match error{ShaderError::Unsupported{what,..}=>what,ShaderError::Isa{reason,..}=>reason,_=>"other"};
+            *gaps.entry(format!("{}: {}",i.name(),reason)).or_default()+=1;
+        }
+    }
+    gaps
+}
+
 /// Compiles trusted native code with the explicit ABI above. Scalar flow is
 /// uniform within a physical subgroup; wave branches vote across all its lanes.
 fn has_wave_flow(p:&ir::Program)->bool {
@@ -428,11 +451,11 @@ fn emit_cfg_inner(p:&ir::Program,multi:bool)->Result<Vec<u32>,ShaderError> {
     // index into a shared address across workgroups.
     let original=p.inputs.iter().find(|(r,_)|*r==Reg::V(0)).map(|(_,v)|*v);
     for i in p.blocks.iter().flat_map(|b|&b.insts){
-        if i.name()=="buffer_store_dword"&&i.read(Reg::V(0))!=original{
-            return Err(unsupported(i.machine.offset,"CFG store requires unchanged global index"));
-        }
-        if i.name()=="ds_read_b32"&&i.write(Reg::V(0)).is_some(){
-            return Err(unsupported(i.machine.offset,"CFG LDS destination v0"));
+        if i.name()=="buffer_store_dword"{
+            let address=match &i.fields{Fields::Buffer{addr,..}=>vector(*addr),_=>None};
+            if address!=Some(0)||original.is_none()||i.read(Reg::V(0))!=original{
+                return Err(unsupported(i.machine.offset,"CFG store requires unchanged global index"));
+            }
         }
     }
     if has_wave_flow(p)&&p.blocks.iter().flat_map(|b|&b.insts).any(|i|
@@ -558,5 +581,6 @@ mod tests {
         let p=ir::build(&code,false,4).unwrap();
         assert!(p.blocks.len()>1);
         assert_eq!(emit_cfg(&p).unwrap()[0],0x07230203);
+        assert!(diagnose_instructions(&p).is_empty());
     }
 }

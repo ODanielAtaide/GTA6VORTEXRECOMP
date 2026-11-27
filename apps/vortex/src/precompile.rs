@@ -11,7 +11,7 @@ use vortex_shader::{Container,FourCC,HwStage,ShaderError,ir,gfx10,resource,struc
 const BLOCK:usize=8*1024*1024;
 const MAX_CONTAINER:usize=32*1024*1024;
 const MAX_PACKED_FILE:u64=128*1024*1024;
-const SCHEMA:&str="offline-v1";
+const SCHEMA:&str="offline-v2";
 type Counts=BTreeMap<String,u64>;
 
 #[derive(Default,Serialize,Deserialize)]
@@ -19,6 +19,8 @@ struct Analysis {
     programs:u64,decoded:u64,ir_ok:u64,resources_ok:u64,io_ok:u64,structured:u64,
     candidate:u64,validated:u64,
     stages:Counts,opcodes:Counts,gaps:Counts,
+    #[serde(default)]
+    instruction_gaps:Counts,
 }
 impl Analysis {
     fn gap(&mut self,key:impl Into<String>){*self.gaps.entry(key.into()).or_default()+=1;}
@@ -26,7 +28,7 @@ impl Analysis {
         self.programs+=b.programs;self.decoded+=b.decoded;self.ir_ok+=b.ir_ok;
         self.resources_ok+=b.resources_ok;self.io_ok+=b.io_ok;self.structured+=b.structured;
         self.candidate+=b.candidate;self.validated+=b.validated;
-        for (a,b) in [(&mut self.stages,&b.stages),(&mut self.opcodes,&b.opcodes),(&mut self.gaps,&b.gaps)]{
+        for (a,b) in [(&mut self.stages,&b.stages),(&mut self.opcodes,&b.opcodes),(&mut self.gaps,&b.gaps),(&mut self.instruction_gaps,&b.instruction_gaps)]{
             for (k,n) in b{*a.entry(k.clone()).or_default()+=n;}
         }
     }
@@ -110,6 +112,11 @@ impl Shared {
                         Ok(v)=>{a.ir_ok+=1;v}
                         Err(e)=>{a.gap(format!("IR: {}",reason(&e)));continue;}
                     };
+                    if p.stage==HwStage::Cs{
+                        for (key,n) in vortex_shader::spirv_cfg::diagnose_instructions(&program){
+                            *a.instruction_gaps.entry(key).or_default()+=n;
+                        }
+                    }
                     let structured=structure::structure(&program);
                     match &structured{
                         Ok(_)=>a.structured+=1,
@@ -303,7 +310,14 @@ pub fn run(root:&Path,workers:usize,validate:bool,refresh:bool,code_only:bool)->
     inventory.flush()?;
     let mut index=BufWriter::new(File::create(report.join("containers.tsv"))?);
     writeln!(index,"blake3\tfirst_location\tmetadata_cached")?;
+    let mut modules:BTreeMap<String,Analysis>=BTreeMap::new();
     for (hash,origin) in shared.seen.into_inner().unwrap_or_else(|e|e.into_inner()){
+        let name=origin.rsplit_once('@').map_or(origin.as_str(),|(path,_)|path);
+        if let Ok(raw)=fs::read_to_string(shared.cache.join(format!("{hash}.toml"))){
+            if let Ok(a)=toml::from_str::<Analysis>(&raw){
+                modules.entry(name.to_owned()).or_default().merge(&a);
+            }
+        }
         writeln!(index,"{hash}\t{}\t{}",clean(&origin),shared.cache.join(format!("{hash}.toml")).is_file())?;
     }
     index.flush()?;
@@ -316,6 +330,16 @@ pub fn run(root:&Path,workers:usize,validate:bool,refresh:bool,code_only:bool)->
     section(&mut w,"Hardware stages",&totals.stages)?;
     section(&mut w,"Incompatibilities (counts by failing analysis step, not unique shaders)",&totals.gaps)?;
     section(&mut w,"Instruction frequency",&totals.opcodes)?;
+    section(&mut w,"Compute instruction-local lowering gaps (not full-program compatibility)",&totals.instruction_gaps)?;
+    let mut module_report=BufWriter::new(File::create(report.join("modules.txt"))?);
+    for (path,a) in modules{
+        writeln!(module_report,"\nMODULE {}\nprograms={} IR={} resource_tracking={} candidates={} validated={}",
+            clean(&path),a.programs,a.ir_ok,a.resources_ok,a.candidate,a.validated)?;
+        section(&mut module_report,"Stages",&a.stages)?;
+        section(&mut module_report,"Full-program first failures",&a.gaps)?;
+        section(&mut module_report,"Compute instruction-local gaps",&a.instruction_gaps)?;
+    }
+    module_report.flush()?;
     w.flush()?;
     atomic_write(&report.join("analysis.toml"),toml::to_string(&totals)?.as_bytes())?;
     println!("VULKAN_PRECOMPILE_DONE files={} bytes_read={read_bytes} unique={unique} IR={} candidates={} validated={} guest_pipelines_ready=0 errors={errors} report={}",files.len(),totals.ir_ok,totals.candidate,totals.validated,report.display());
