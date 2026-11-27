@@ -192,6 +192,7 @@ fn wait_read(target:&MarkerTarget,bytes:usize,comparison:u32,reference:u64,mask:
 pub(crate) enum MarkerValue{Immediate(u64),GpuTimestamp,SystemTimestamp}
 pub(crate) enum Op{
     Sync,
+    TextureSync{resources:Vec<Retained>},
     WaitMarker{target:MarkerTarget,bytes:usize,comparison:u32,reference:u64,mask:u64},
     WriteMarker{target:MarkerTarget,value:MarkerValue,bytes:usize},
     Copy{dst:Retained,src:Retained,dst_offset:u64,src_offset:u64,len:u64},
@@ -261,6 +262,9 @@ impl Recording{
         // Retail 0x248/0x250 call shape documented by OpenScarlett's
         // d3d12_xs_shim.cpp (48a98fcd); 0/1 in the mask slot are flags.
         let width_mask=if bytes==4{u64::from(u32::MAX)}else{u64::MAX};
+        // The newer retail method accepts a 32-bit flags field in this
+        // argument position. Windows x64 does not define its high dword.
+        // The older ABI uses explicit masks, preserved by its caller.
         let mask=if mask_or_flags<=1{width_mask}else{mask_or_flags&width_mask};
         let target=MarkerTarget::resolve(address,bytes);
         self.push(Op::WaitMarker{target,bytes,comparison,reference:reference&width_mask,mask});
@@ -342,7 +346,19 @@ impl Op{
     }
     fn execute(&self){
             match self{
-                Op::WaitMarker{..}=>{},
+                Op::WaitMarker{..}=>{
+                    static FIRST:std::sync::Once=std::sync::Once::new();
+                    FIRST.call_once(||tracing::info!("VULKAN_GUEST_WAIT_SATISFIED"));
+                },
+                Op::TextureSync{resources}=>{
+                    // Every materialized live image stays in GENERAL, so
+                    // there is no Vulkan layout change to perform. A full
+                    // device memory dependency covers prior and next uses.
+                    // Unmaterialized resources remain unmaterialized.
+                    let _=call(Task::Sync);
+                    static FIRST:std::sync::Once=std::sync::Once::new();
+                    FIRST.call_once(||tracing::info!(textures=resources.len(),"VULKAN_GUEST_TEXTURE_BARRIER_OK"));
+                },
 
                 Op::Sync=>{
                     let _=call(Task::Sync);
