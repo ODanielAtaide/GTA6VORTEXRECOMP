@@ -299,7 +299,7 @@ struct GraphicsPipeline<'a> {
     d: &'a ash::Device,
     vert: vk::ShaderModule,
     frag: vk::ShaderModule,
-    texture: Option<ImageId>,
+    textures: Vec<ImageId>,
     batchable: bool,
     color_count:u32,
     linear_filter: bool,
@@ -324,32 +324,33 @@ impl Drop for GraphicsPipeline<'_> {
     }
 }
 impl<'a> GraphicsPipeline<'a> {
-    fn new(d:&'a ash::Device,vert:&[u32],frag:&[u32],texture:Option<(ImageId,vk::ImageView)>,state:GraphicsState,cache:vk::PipelineCache,color_count:u32) -> Result<Self> {
+    fn new(d:&'a ash::Device,vert:&[u32],frag:&[u32],textures:&[(ImageId,vk::ImageView)],state:GraphicsState,cache:vk::PipelineCache,color_count:u32) -> Result<Self> {
         let mut p = Self { d,vert:vk::ShaderModule::null(),frag:vk::ShaderModule::null(),
-            texture:texture.map(|(id,_)|id),batchable:false,color_count,linear_filter:state.linear_filter,sampler:vk::Sampler::null(),
+            textures:textures.iter().map(|(id,_)|*id).collect(),batchable:false,color_count,linear_filter:state.linear_filter,sampler:vk::Sampler::null(),
             descriptor_layout:vk::DescriptorSetLayout::null(),descriptor_pool:vk::DescriptorPool::null(),
             descriptor_set:vk::DescriptorSet::null(),layout:vk::PipelineLayout::null(),pipeline:vk::Pipeline::null() };
         unsafe {
             p.vert = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(vert),None)?;
             p.frag = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(frag),None)?;
-            if let Some((_,view))=texture {
+            if !textures.is_empty() {
                 let filter=if state.linear_filter{vk::Filter::LINEAR}else{vk::Filter::NEAREST};
                 let address=if state.repeat{vk::SamplerAddressMode::REPEAT}else{vk::SamplerAddressMode::CLAMP_TO_EDGE};
                 p.sampler=d.create_sampler(&vk::SamplerCreateInfo::default().mag_filter(filter).min_filter(filter)
                     .mipmap_mode(if state.linear_mipmap{vk::SamplerMipmapMode::LINEAR}else{vk::SamplerMipmapMode::NEAREST}).address_mode_u(address)
                     .address_mode_v(address).address_mode_w(address).min_lod(0.).max_lod(1000.),None)?;
-                let bindings=[vk::DescriptorSetLayoutBinding::default().binding(0)
+                let bindings:Vec<_>=(0..textures.len() as u32).map(|binding|vk::DescriptorSetLayoutBinding::default().binding(binding)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT)).collect();
                 p.descriptor_layout=d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),None)?;
-                let sizes=[vk::DescriptorPoolSize{ty:vk::DescriptorType::COMBINED_IMAGE_SAMPLER,descriptor_count:1}];
+                let sizes=[vk::DescriptorPoolSize{ty:vk::DescriptorType::COMBINED_IMAGE_SAMPLER,descriptor_count:textures.len() as u32}];
                 p.descriptor_pool=d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes),None)?;
                 let layouts=[p.descriptor_layout];
                 p.descriptor_set=d.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(p.descriptor_pool).set_layouts(&layouts))?[0];
-                let images=[vk::DescriptorImageInfo::default().sampler(p.sampler).image_view(view).image_layout(vk::ImageLayout::GENERAL)];
-                d.update_descriptor_sets(&[vk::WriteDescriptorSet::default().dst_set(p.descriptor_set).dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&images)],&[]);
+                let images:Vec<_>=textures.iter().map(|(_,view)|vk::DescriptorImageInfo::default().sampler(p.sampler).image_view(*view).image_layout(vk::ImageLayout::GENERAL)).collect();
+                let writes:Vec<_>=images.iter().enumerate().map(|(slot,info)|vk::WriteDescriptorSet::default().dst_set(p.descriptor_set).dst_binding(slot as u32)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(std::slice::from_ref(info))).collect();
+                d.update_descriptor_sets(&writes,&[]);
                 p.layout=d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts),None)?;
             }else{
                 p.layout=d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(),None)?;
@@ -727,7 +728,7 @@ impl<'a> Session<'a> {
         self.ready()?;
         let id = PipelineId(self.next_id);
         self.next_id = self.next_id.checked_add(1).ok_or("pipeline ID exhausted")?;
-        let p = GraphicsPipeline::new(self.d,vert,frag,None,GraphicsState::default(),self.cache.handle(),1)?;
+        let p = GraphicsPipeline::new(self.d,vert,frag,&[],GraphicsState::default(),self.cache.handle(),1)?;
         self.pipelines.insert(id,p);
         Ok(id)
     }
@@ -767,7 +768,8 @@ impl<'a> Session<'a> {
             return Err("linear texture filtering unsupported".into());
         }
         if spirv_graphics::color_export_count(&fragment)!=1{return Err("use native MRT pipeline for multiple outputs".into());}
-        let mut p=GraphicsPipeline::new(self.d,&v,&f,Some((texture,image.view)),state,self.cache.handle(),1)?;
+        if spirv_graphics::texture_count(&fragment)!=1{return Err("wrong native texture count".into());}
+        let mut p=GraphicsPipeline::new(self.d,&v,&f,&[(texture,image.view)],state,self.cache.handle(),1)?;
         p.batchable=true;
         let id=PipelineId(self.next_id);self.next_id=self.next_id.checked_add(1).ok_or("pipeline ID exhausted")?;
         self.pipelines.insert(id,p);Ok(id)
@@ -788,7 +790,7 @@ impl<'a> Session<'a> {
             return Err("native MRT count exceeds supported limits".into());
         }
         let sampled=program.blocks.iter().flat_map(|b|&b.insts).any(|i|matches!(i.fields,vortex_shader::gfx10::Fields::Image{..}));
-        if sampled!=texture.is_some(){return Err("native MRT texture binding mismatch".into());}
+        if sampled!=texture.is_some()||spirv_graphics::texture_count(&program)>1{return Err("native MRT texture binding mismatch".into());}
         let view=if let Some(id)=texture{
             let image=self.image(id)?;
             if !image.kind.sampled(){return Err("MRT texture must be a sampled color format".into());}
@@ -798,7 +800,35 @@ impl<'a> Session<'a> {
             }
             Some((id,image.view))
         }else{None};
-        let p=GraphicsPipeline::new(self.d,&v,&f,view,state,self.cache.handle(),count)?;
+        let p=GraphicsPipeline::new(self.d,&v,&f,view.as_slice(),state,self.cache.handle(),count)?;
+        let id=PipelineId(self.next_id);self.next_id=self.next_id.checked_add(1).ok_or("pipeline ID exhausted")?;
+        self.pipelines.insert(id,p);Ok(id)
+    }
+
+    /// Explicit two-texture native graphics pipeline (two independently retained
+    /// image descriptors, shared sampler configuration).
+    pub fn create_native_dual_texture_pipeline(&mut self,vertex:&[u8],fragment:&[u8],vgprs:[u16;2],
+        textures:[ImageId;2],state:GraphicsState)->Result<PipelineId>{
+        use vortex_shader::{ir,spirv_graphics::{self,Stage}};
+        self.ready()?;
+        let v=spirv_graphics::emit_graphics(&ir::build(vertex,false,vgprs[0])?,Stage::Vertex)?;
+        let program=ir::build(fragment,false,vgprs[1])?;
+        let f=spirv_graphics::emit_graphics(&program,Stage::Fragment)?;
+        if spirv_graphics::texture_count(&program)!=2||spirv_graphics::color_export_count(&program)!=1{
+            return Err("dual texture layout mismatch".into());
+        }
+        let mut views=Vec::new();
+        for id in textures{
+            let image=self.image(id)?;
+            if !image.kind.sampled(){return Err("invalid sampled texture".into());}
+            let props=unsafe{self.instance.get_physical_device_format_properties(self.physical,image.kind.format())};
+            if state.linear_filter&&!props.optimal_tiling_features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR){
+                return Err("linear texture filtering unsupported".into());
+            }
+            views.push((id,image.view));
+        }
+        let mut p=GraphicsPipeline::new(self.d,&v,&f,&views,state,self.cache.handle(),1)?;
+        p.batchable=true;
         let id=PipelineId(self.next_id);self.next_id=self.next_id.checked_add(1).ok_or("pipeline ID exhausted")?;
         self.pipelines.insert(id,p);Ok(id)
     }
@@ -809,18 +839,18 @@ impl<'a> Session<'a> {
     pub fn rebind_graphics_texture(&mut self,id:PipelineId,texture:ImageId)->Result<()> {
         self.ready()?;
         let p=self.pipeline(id)?;
-        if p.texture.is_none(){return Err("pipeline has no texture descriptor".into());}
+        if p.textures.is_empty(){return Err("pipeline has no texture descriptor".into());}
         let image=self.image(texture)?;
         if !image.kind.sampled(){return Err("texture must be a sampled color format".into());}
         let props=unsafe{self.instance.get_physical_device_format_properties(self.physical,image.kind.format())};
         if p.linear_filter&&!props.optimal_tiling_features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR){
             return Err("linear texture filtering unsupported".into());
         }
-        if p.texture==Some(texture){return Ok(());}
+        if p.textures[0]==texture{return Ok(());}
         let images=[vk::DescriptorImageInfo::default().sampler(p.sampler).image_view(image.view).image_layout(vk::ImageLayout::GENERAL)];
         unsafe{self.d.update_descriptor_sets(&[vk::WriteDescriptorSet::default().dst_set(p.descriptor_set).dst_binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&images)],&[]);}
-        self.pipelines.get_mut(&id).ok_or("missing graphics pipeline")?.texture=Some(texture);
+        self.pipelines.get_mut(&id).ok_or("missing graphics pipeline")?.textures[0]=texture;
         Ok(())
     }
 
@@ -1031,7 +1061,7 @@ impl<'a> Session<'a> {
 
     pub fn destroy_image(&mut self,id:ImageId) -> Result<()> {
         self.ready()?;
-        if self.pipelines.values().any(|p|p.texture==Some(id)){return Err("texture retained by graphics pipeline".into());}
+        if self.pipelines.values().any(|p|p.textures.contains(&id)){return Err("texture retained by graphics pipeline".into());}
         self.images.remove(&id).ok_or("unknown or retired image ID")?;
         Ok(())
     }
@@ -1100,8 +1130,8 @@ impl<'a> Session<'a> {
                 Command::Draw { pipeline,color,depth,region,vertices,offset,count } => {
                     let p=self.pipeline(pipeline)?;
                     if p.color_count!=1{return Err("MRT pipeline requires target array".into());}
-                    if p.texture==Some(color)||p.texture==Some(depth){return Err("sampled attachment feedback unsupported".into());}
-                    if let Some(id)=p.texture{self.image(id)?;}
+                    if p.textures.contains(&color)||p.textures.contains(&depth){return Err("sampled attachment feedback unsupported".into());}
+                    for &id in &p.textures{self.image(id)?;}
                     let c = self.image(color)?;
                     let d = self.image(depth)?;
                     if c.mips!=1||d.mips!=1||c.kind != ImageKind::Rgba8 || d.kind != ImageKind::Depth32
@@ -1116,8 +1146,8 @@ impl<'a> Session<'a> {
                 Command::DrawIndexed { pipeline,color,depth,region,vertices,offset,indices,first,count,base_vertex } => {
                     let p=self.pipeline(pipeline)?;
                     if p.color_count!=1{return Err("MRT pipeline requires target array".into());}
-                    if p.texture==Some(color)||p.texture==Some(depth){return Err("sampled attachment feedback unsupported".into());}
-                    if let Some(id)=p.texture{self.image(id)?;}
+                    if p.textures.contains(&color)||p.textures.contains(&depth){return Err("sampled attachment feedback unsupported".into());}
+                    for &id in &p.textures{self.image(id)?;}
                     let c = self.image(color)?;
                     let d = self.image(depth)?;
                     if c.mips!=1||d.mips!=1||c.kind != ImageKind::Rgba8 || d.kind != ImageKind::Depth32
@@ -1140,14 +1170,14 @@ impl<'a> Session<'a> {
                     z.check(region)?;
                     let mut seen=std::collections::BTreeSet::new();
                     for &id in colors.iter().flatten(){
-                        if !seen.insert(id)||p.texture==Some(id)||id==depth{return Err("MRT feedback or duplicate attachment".into());}
+                        if !seen.insert(id)||p.textures.contains(&id)||id==depth{return Err("MRT feedback or duplicate attachment".into());}
                         let c=self.image(id)?;
                         if c.kind!=ImageKind::Rgba8||c.mips!=1||(c.width,c.height)!=(z.width,z.height){
                             return Err("MRT dimensions or format mismatch".into());
                         }
                         c.check(region)?;
                     }
-                    if let Some(id)=p.texture{self.image(id)?;}
+                    for &id in &p.textures{self.image(id)?;}
                     let bytes=indexed_vertex_bytes(&self.index(indices)?.words,first,count,base_vertex)?;
                     check_range(self.buffer(vertices)?.bytes,offset,bytes)?;
                 }
@@ -1310,7 +1340,7 @@ impl<'a> Session<'a> {
                             d.cmd_begin_rendering(cmd,&vk::RenderingInfo::default().render_area(area)
                                 .layer_count(1).color_attachments(&colors).depth_attachment(&depth_attachment));
                             d.cmd_bind_pipeline(cmd,vk::PipelineBindPoint::GRAPHICS,p.pipeline);
-                            if p.texture.is_some(){d.cmd_bind_descriptor_sets(cmd,vk::PipelineBindPoint::GRAPHICS,p.layout,0,&[p.descriptor_set],&[]);}
+                            if !p.textures.is_empty(){d.cmd_bind_descriptor_sets(cmd,vk::PipelineBindPoint::GRAPHICS,p.layout,0,&[p.descriptor_set],&[]);}
                             d.cmd_set_viewport(cmd,0,&viewport);
                             d.cmd_set_scissor(cmd,0,&[area]);
                         }
@@ -1340,7 +1370,7 @@ impl<'a> Session<'a> {
                         d.cmd_begin_rendering(cmd,&vk::RenderingInfo::default().render_area(area).layer_count(1)
                             .color_attachments(&attachments).depth_attachment(&z));
                         d.cmd_bind_pipeline(cmd,vk::PipelineBindPoint::GRAPHICS,p.pipeline);
-                        if p.texture.is_some(){d.cmd_bind_descriptor_sets(cmd,vk::PipelineBindPoint::GRAPHICS,p.layout,0,&[p.descriptor_set],&[]);}
+                        if !p.textures.is_empty(){d.cmd_bind_descriptor_sets(cmd,vk::PipelineBindPoint::GRAPHICS,p.layout,0,&[p.descriptor_set],&[]);}
                         d.cmd_set_viewport(cmd,0,&viewport);d.cmd_set_scissor(cmd,0,&[area]);
                         d.cmd_bind_vertex_buffers(cmd,0,&[self.buffer(vertices)?.handle],&[offset]);
                         d.cmd_bind_index_buffer(cmd,self.index(indices)?.buffer.handle,0,vk::IndexType::UINT32);
@@ -2136,6 +2166,10 @@ pub(crate) fn emit_native_graphics(dir:&std::path::Path) -> Result<()> {
         let prefix=format!("mrt_{count}_{depth}");
         modules.push((format!("{prefix}.vert.spv"),v));modules.push((format!("{prefix}.frag.spv"),f));
     }}
+    let(v,f)=vortex_shader::spirv_graphics::dual_texture_fixtures();
+    let v=vortex_shader::spirv_graphics::emit_graphics(&vortex_shader::ir::build(&v,false,8)?,vortex_shader::spirv_graphics::Stage::Vertex)?;
+    let f=vortex_shader::spirv_graphics::emit_graphics(&vortex_shader::ir::build(&f,false,16)?,vortex_shader::spirv_graphics::Stage::Fragment)?;
+    modules.push(("dual_texture.vert.spv".to_owned(),v));modules.push(("dual_texture.frag.spv".to_owned(),f));
     for (name,words) in modules {
         let path=dir.join(name);
         std::fs::write(&path,words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>())?;
@@ -2490,6 +2524,32 @@ pub(crate) fn verify_native_bc(context:&mut Context)->Result<()>{
     Ok(())
 }
 
+pub(crate) fn verify_native_dual_texture(context:&mut Context)->Result<()>{
+    let mut s=Session::new(context)?;
+    let a=s.create_image(2,2)?;let b=s.create_image(2,2)?;
+    let color=s.create_image(8,8)?;let depth=s.create_depth_image(8,8)?;
+    let full=ImageRegion{x:0,y:0,width:8,height:8};
+    let vertices=s.create_buffer(4*VERTEX_BYTES,MemoryKind::HostVisible)?;
+    let mut data=Vec::new();
+    for(x,y)in[(-1f32,-1f32),(1.,-1.),(1.,1.),(-1.,1.)]{
+        data.extend([x,y,0.5,(x+1.)*0.5,(y+1.)*0.5,0.,1.].map(f32::to_bits));
+    }
+    s.write_words(vertices,0,&data)?;
+    let indices=s.create_index_buffer(&[0,1,2,0,2,3])?;
+    let output=s.create_buffer(256,MemoryKind::HostVisible)?;
+    let(v,f)=vortex_shader::spirv_graphics::dual_texture_fixtures();
+    if s.create_native_textured_pipeline(&v,&f,[8,16],a,GraphicsState::default()).is_ok(){return Err("accepted missing second texture".into());}
+    let p=s.create_native_dual_texture_pipeline(&v,&f,[8,16],[a,b],GraphicsState::default())?;
+    if s.destroy_image(b).is_ok(){return Err("released retained second texture".into());}
+    s.submit(&[Command::ClearImage{dst:a,rgba:[1.,0.,0.,1.]},Command::ClearImage{dst:b,rgba:[0.,1.,0.,1.]},
+        Command::ClearAttachments{color,depth,region:full,rgba:[0.;4],z:1.},
+        Command::DrawIndexed{pipeline:p,color,depth,region:full,vertices,offset:0,indices,first:0,count:6,base_vertex:0},
+        Command::ReadImage{src:color,region:full,dst:output,offset:0}])?;
+    if s.read_words(output,0,64)?!=vec![u32::from_le_bytes([255,255,0,255]);64]{return Err("two-texture sample mismatch".into());}
+    s.destroy_graphics_pipeline(p)?;s.destroy_image(a)?;s.destroy_image(b)?;
+    println!("PASS: two independent native MIMG textures and descriptor lifetime");
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
