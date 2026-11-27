@@ -2293,6 +2293,34 @@ extern "system" fn live_draw_indexed(this:This,indices:u32,instances:u32,first:u
     live_record(this).require_pipeline("draw indexed");
 }
 #[cfg(all(windows,feature = "vulkan"))]
+mod live_root_state{
+    use super::*;
+    pub(super) extern "system" fn compute_root(this:This,root:This){live_record(this).set_root(true,root);}
+    pub(super) extern "system" fn graphics_root(this:This,root:This){live_record(this).set_root(false,root);}
+    pub(super) extern "system" fn compute_table(this:This,slot:u32,handle:u64){live_record(this).set_table(true,slot,handle);}
+    pub(super) extern "system" fn graphics_table(this:This,slot:u32,handle:u64){live_record(this).set_table(false,slot,handle);}
+    pub(super) extern "system" fn compute_constant(this:This,slot:u32,value:u32,offset:u32){live_record(this).set_constants(true,slot,offset,&[value]);}
+    pub(super) extern "system" fn graphics_constant(this:This,slot:u32,value:u32,offset:u32){live_record(this).set_constants(false,slot,offset,&[value]);}
+    fn constants(this:This,compute:bool,slot:u32,count:u32,values:*const u32,offset:u32){
+        if count==0{return;}
+        if count>64||values.is_null(){crate::vulkan_live::stop("invalid guest root constants");}
+        let mut copied=[0u32;64];let mut actual=0usize;let bytes=count as usize*4;
+        use windows_sys::Win32::System::{Diagnostics::Debug::ReadProcessMemory,Threading::GetCurrentProcess};
+        if unsafe{ReadProcessMemory(GetCurrentProcess(),values.cast(),copied.as_mut_ptr().cast(),bytes,&mut actual)}==0||actual!=bytes{
+            crate::vulkan_live::stop("unreadable root constants");
+        }
+        live_record(this).set_constants(compute,slot,offset,&copied[..count as usize]);
+    }
+    pub(super) extern "system" fn compute_constants(this:This,slot:u32,count:u32,values:*const u32,offset:u32){constants(this,true,slot,count,values,offset);}
+    pub(super) extern "system" fn graphics_constants(this:This,slot:u32,count:u32,values:*const u32,offset:u32){constants(this,false,slot,count,values,offset);}
+    pub(super) extern "system" fn compute_cbv(this:This,slot:u32,address:u64){live_record(this).set_view(true,slot,2,address);}
+    pub(super) extern "system" fn graphics_cbv(this:This,slot:u32,address:u64){live_record(this).set_view(false,slot,2,address);}
+    pub(super) extern "system" fn compute_srv(this:This,slot:u32,address:u64){live_record(this).set_view(true,slot,3,address);}
+    pub(super) extern "system" fn graphics_srv(this:This,slot:u32,address:u64){live_record(this).set_view(false,slot,3,address);}
+    pub(super) extern "system" fn compute_uav(this:This,slot:u32,address:u64){live_record(this).set_view(true,slot,4,address);}
+    pub(super) extern "system" fn graphics_uav(this:This,slot:u32,address:u64){live_record(this).set_view(false,slot,4,address);}
+}
+#[cfg(all(windows,feature = "vulkan"))]
 const fn live_list_table(newer:bool)->[ *const ();160]{
     let mut f=object::d3d12_object(object::missing_table::<LIST,160>());
     f[0]=list_query as *const ();f[2]=list_release as *const ();
@@ -2300,6 +2328,13 @@ const fn live_list_table(newer:bool)->[ *const ();160]{
     f[9]=close as *const ();f[10]=reset as *const ();
     f[12]=live_draw as *const ();f[13]=live_draw_indexed as *const ();f[14]=live_dispatch as *const ();
     f[25]=live_set_pipeline as *const ();
+    f[33]=live_root_state::compute_root as *const ();f[34]=live_root_state::graphics_root as *const ();
+    f[35]=live_root_state::compute_table as *const ();f[36]=live_root_state::graphics_table as *const ();
+    f[37]=live_root_state::compute_constant as *const ();f[38]=live_root_state::graphics_constant as *const ();
+    f[39]=live_root_state::compute_constants as *const ();f[40]=live_root_state::graphics_constants as *const ();
+    f[41]=live_root_state::compute_cbv as *const ();f[42]=live_root_state::graphics_cbv as *const ();
+    f[43]=live_root_state::compute_srv as *const ();f[44]=live_root_state::graphics_srv as *const ();
+    f[45]=live_root_state::compute_uav as *const ();f[46]=live_root_state::graphics_uav as *const ();
     f[if newer{newer_slot(78)}else{78}]=live_dispatch_x as *const ();
     f[15]=live_copy_buffer as *const ();f[17]=live_copy_resource as *const ();
     f[26]=live_barrier as *const ();f[51]=live_clear_dsv as *const ();f[52]=live_clear_rtv as *const ();

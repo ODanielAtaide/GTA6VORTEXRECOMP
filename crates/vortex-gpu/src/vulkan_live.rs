@@ -61,16 +61,62 @@ pub(crate) enum Op{
     CopyImage{src:Retained,dst:Retained,from:ImageSpec,to:ImageSpec},
 }
 #[derive(Default)]
-pub(crate) struct Recording{closed:bool,ops:Vec<Op>,pipeline:Option<std::sync::Arc<crate::pipeline::native_live::Description>>}
+struct RootState{
+    signature:Option<std::sync::Arc<[u8]>>,
+    tables:std::collections::BTreeMap<u32,u64>,
+    views:std::collections::BTreeMap<u32,(u32,u64)>,
+    constants:std::collections::BTreeMap<(u32,u32),u32>,
+}
+#[derive(Default)]
+pub(crate) struct Recording{closed:bool,ops:Vec<Op>,
+    pipeline:Option<std::sync::Arc<crate::pipeline::native_live::Description>>,
+    roots:[RootState;2]}
+
 impl Recording{
     pub(crate) fn push(&mut self,op:Op){if self.closed{stop("recording into closed guest list");}self.ops.push(op);}
     pub(crate) fn close(&mut self){if self.closed{stop("guest list already closed");}self.closed=true;}
-    pub(crate) fn reset(&mut self){self.ops.clear();self.closed=false;self.pipeline=None;}
+    pub(crate) fn reset(&mut self){self.ops.clear();self.closed=false;self.pipeline=None;self.roots=Default::default();}
     pub(crate) fn set_pipeline(&mut self,pipeline:This){
         if self.closed{stop("binding into closed guest list");}
         self.pipeline=if pipeline.is_null(){None}else{Some(crate::pipeline::native_live::get(pipeline).unwrap_or_else(||stop("invalid native pipeline object")))};
     }
+    fn root_state(&mut self,compute:bool)->&mut RootState{
+        if self.closed{stop("setting root state in closed list");}
+        &mut self.roots[usize::from(compute)]
+    }
+    pub(crate) fn set_root(&mut self,compute:bool,root:This){
+        let signature=if root.is_null(){None}else{Some(crate::root::live_snapshot(root).unwrap_or_else(||stop("unknown bound root signature")))};
+        let state=self.root_state(compute);
+        // A different signature invalidates previous root bindings.
+        let unchanged=match (&state.signature,&signature){
+            (Some(a),Some(b))=>std::sync::Arc::ptr_eq(a,b),(None,None)=>true,_=>false
+        };
+        if !unchanged{*state=RootState{signature,..Default::default()};}
+    }
+    pub(crate) fn set_table(&mut self,compute:bool,slot:u32,handle:u64){
+        if slot>=1024{stop("invalid root table slot");}
+        let state=self.root_state(compute);
+        state.views.remove(&slot);state.tables.insert(slot,handle);
+        state.constants.retain(|&(s,_),_|s!=slot);
+    }
+    pub(crate) fn set_view(&mut self,compute:bool,slot:u32,kind:u32,address:u64){
+        if slot>=1024{stop("invalid root view slot");}
+        let state=self.root_state(compute);
+        state.tables.remove(&slot);state.views.insert(slot,(kind,address));
+        state.constants.retain(|&(s,_),_|s!=slot);
+    }
+    pub(crate) fn set_constants(&mut self,compute:bool,slot:u32,offset:u32,values:&[u32]){
+        if slot>=1024||offset.checked_add(values.len() as u32).is_none_or(|n|n>64){stop("invalid root constants range");}
+        let state=self.root_state(compute);
+        state.tables.remove(&slot);state.views.remove(&slot);
+        for (i,&value) in values.iter().enumerate(){state.constants.insert((slot,offset+i as u32),value);}
+    }
     pub(crate) fn require_pipeline(&self,kind:&str)->!{
+        let root=&self.roots[usize::from(kind=="dispatch")];
+        tracing::info!(kind,root_bytes=root.signature.as_ref().map_or(0,|v|v.len()),
+            table_slots=?root.tables.keys().collect::<Vec<_>>(),
+            view_slots=?root.views.iter().map(|(k,v)|(*k,v.0)).collect::<Vec<_>>(),
+            constant_dwords=root.constants.len(),"VULKAN_GUEST_ROOT_BINDINGS");
         self.pipeline.as_ref().unwrap_or_else(||stop(format_args!("{kind}: no bound native pipeline"))).require_execution(kind)
     }
     pub(crate) fn execute(&self){

@@ -7,7 +7,7 @@ use super::{Bytecode,ComputeHead,GraphicsHead,StreamDesc,GRAPHICS_STAGES,PIPELIN
 use crate::object::{self,This,Object,Table,Iid,HRESULT,PIPELINE,E_INVALIDARG};
 use std::sync::{Arc,Mutex,OnceLock};
 use std::collections::BTreeMap;
-use vortex_shader::{Container,FourCC,HwStage,NativeProgram,native::StageIo};
+use vortex_shader::{Container,FourCC,HwStage,NativeProgram};
 use windows_sys::Win32::System::{Diagnostics::Debug::ReadProcessMemory,Threading::GetCurrentProcess};
 
 const LIMIT:usize=32*1024*1024;
@@ -147,7 +147,7 @@ pub(crate) extern "system" fn create_graphics(_:This,desc:*const GraphicsHead,ii
 pub(crate) extern "system" fn create_stream(_:This,desc:*const StreamDesc,iid:*const Iid,out:*mut This)->HRESULT{
     let Some(d)=(unsafe{desc.as_ref()})else{return E_INVALIDARG;};
     let stream=match read(d.stream as usize,d.size){Ok(v)=>v,Err(e)=>return failed(e)};
-    let mut at=0;let mut stages=vec![];let mut signature=None;
+    let mut at=0usize;let mut stages=vec![];let mut signature=None;
     while at<stream.len(){
         let Some(header)=stream.get(at..at.saturating_add(8))else{return E_INVALIDARG;};
         let kind=u32::from_le_bytes(header[..4].try_into().expect("four bytes"));
