@@ -16,6 +16,9 @@ pub struct ImageId(u64);
 #[derive(Debug,Clone,Copy,PartialEq,Eq,PartialOrd,Ord)]
 pub struct PipelineId(u64);
 
+#[derive(Debug,Clone,Copy,PartialEq,Eq,PartialOrd,Ord)]
+pub struct IndexId(u64);
+
 /// Fixed initial graphics ABI: position xyz and color rgba, seven f32s.
 const VERTEX_BYTES: u64 = 28;
 
@@ -61,6 +64,8 @@ pub enum Command {
     ClearAttachments { color: ImageId, depth: ImageId, region: ImageRegion, rgba: [f32;4], z: f32 },
     Draw { pipeline: PipelineId, color: ImageId, depth: ImageId, region: ImageRegion,
         vertices: BufferId, offset: u64, count: u32 },
+    DrawIndexed { pipeline: PipelineId, color: ImageId, depth: ImageId, region: ImageRegion,
+        vertices: BufferId, offset: u64, indices: IndexId, first: u32, count: u32, base_vertex: i32 },
     UploadImage { src: BufferId, offset: u64, dst: ImageId, region: ImageRegion },
     ReadImage { src: ImageId, region: ImageRegion, dst: BufferId, offset: u64 },
     CopyImage { src: ImageId, region: ImageRegion, dst: ImageId, x: u32, y: u32 },
@@ -100,7 +105,7 @@ impl<'a> Buffer<'a> {
         unsafe {
             b.handle = d.create_buffer(&vk::BufferCreateInfo::default().size(bytes)
                 .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST
-                    | vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::VERTEX_BUFFER)
+                    | vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE),None)?;
             let req = d.get_buffer_memory_requirements(b.handle);
             use vk::MemoryPropertyFlags as F;
@@ -304,6 +309,23 @@ impl<'a> GraphicsPipeline<'a> {
     }
 }
 
+/// Immutable UINT32 index buffer. The CPU reference is retained for validation;
+/// neither ordinary buffer writes nor GPU commands can change its contents.
+struct IndexBuffer<'a> {
+    buffer: Buffer<'a>,
+    words: Vec<u32>,
+}
+
+fn indexed_vertex_bytes(words:&[u32],first:u32,count:u32,base_vertex:i32) -> Result<u64> {
+    if count == 0 || count % 3 != 0 { return Err("invalid indexed triangle count".into()); }
+    let end = first.checked_add(count).ok_or("index range overflow")?;
+    let selected = words.get(first as usize..end as usize).ok_or("index range out of bounds")?;
+    let min = i64::from(*selected.iter().min().ok_or("empty index range")?) + i64::from(base_vertex);
+    let max = i64::from(*selected.iter().max().ok_or("empty index range")?) + i64::from(base_vertex);
+    if min < 0 || max > i64::from(u32::MAX) { return Err("base vertex out of bounds".into()); }
+    (max as u64 + 1).checked_mul(VERTEX_BYTES).ok_or_else(|| "vertex size overflow".into())
+}
+
 /// Owns resources and a command queue while exclusively borrowing Context.
 /// IDs are valid only in the session that created them. Failed submissions
 /// poison the session; no resource is reused before completion is known.
@@ -322,6 +344,7 @@ pub struct Session<'a> {
     buffers: BTreeMap<BufferId,Buffer<'a>>,
     images: BTreeMap<ImageId,Image<'a>>,
     pipelines: BTreeMap<PipelineId,GraphicsPipeline<'a>>,
+    indices: BTreeMap<IndexId,IndexBuffer<'a>>,
 }
 
 impl Drop for Session<'_> {
@@ -343,7 +366,7 @@ impl<'a> Session<'a> {
             memory:unsafe { context.instance.get_physical_device_memory_properties(context.physical) },
             queue:unsafe { d.get_device_queue(context.family,0) },
             pool:vk::CommandPool::null(),command:vk::CommandBuffer::null(),
-            timeline:vk::Semaphore::null(),completed:0,next_id:1,poisoned:false,buffers:BTreeMap::new(),images:BTreeMap::new(),pipelines:BTreeMap::new(),
+            timeline:vk::Semaphore::null(),completed:0,next_id:1,poisoned:false,buffers:BTreeMap::new(),images:BTreeMap::new(),pipelines:BTreeMap::new(),indices:BTreeMap::new(),
         };
         unsafe {
             session.pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default()
@@ -444,6 +467,52 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
+    fn index(&self,id:IndexId) -> Result<&IndexBuffer<'a>> {
+        self.indices.get(&id).ok_or_else(|| "unknown or retired index buffer".into())
+    }
+
+    /// Upload immutable UINT32 indices through the existing command executor.
+    /// Ownership moves into a separate registry only after the copy completes.
+    pub fn create_index_buffer(&mut self,words:&[u32]) -> Result<IndexId> {
+        self.ready()?;
+        if words.is_empty() || words.len() > u32::MAX as usize {
+            return Err("invalid index buffer length".into());
+        }
+        let limits = unsafe { self.instance.get_physical_device_properties(self.physical) }.limits;
+        if words.iter().any(|&i| i > limits.max_draw_indexed_index_value) {
+            return Err("index exceeds physical device limit".into());
+        }
+        let id = IndexId(self.next_id);
+        self.next_id = self.next_id.checked_add(1).ok_or("index ID exhausted")?;
+        let bytes = words.len() as u64 * 4;
+        let staging = self.create_buffer(bytes,MemoryKind::HostVisible)?;
+        let local = match self.create_buffer(bytes,MemoryKind::DeviceLocal) {
+            Ok(id) => id,
+            Err(e) => {
+                if !self.poisoned { self.buffers.remove(&staging); }
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.write_words(staging,0,words) {
+            self.buffers.remove(&staging);
+            self.buffers.remove(&local);
+            return Err(e);
+        }
+        // On GPU submission failure, retain both buffers until session drop
+        // has waited for idle. Never free potentially in-flight resources.
+        self.submit(&[Command::Copy { src:staging,src_offset:0,dst:local,dst_offset:0,bytes }])?;
+        self.destroy_buffer(staging)?;
+        let buffer = self.buffers.remove(&local).ok_or("missing index backing buffer")?;
+        self.indices.insert(id,IndexBuffer { buffer,words:words.to_vec() });
+        Ok(id)
+    }
+
+    pub fn destroy_index_buffer(&mut self,id:IndexId) -> Result<()> {
+        self.ready()?;
+        self.indices.remove(&id).ok_or("unknown or retired index buffer")?;
+        Ok(())
+    }
+
     pub fn destroy_image(&mut self,id:ImageId) -> Result<()> {
         self.ready()?;
         self.images.remove(&id).ok_or("unknown or retired image ID")?;
@@ -523,6 +592,19 @@ impl<'a> Session<'a> {
                     c.check(region)?;
                     d.check(region)?;
                     check_range(self.buffer(vertices)?.bytes,offset,u64::from(count)*VERTEX_BYTES)?;
+                }
+                Command::DrawIndexed { pipeline,color,depth,region,vertices,offset,indices,first,count,base_vertex } => {
+                    self.pipeline(pipeline)?;
+                    let c = self.image(color)?;
+                    let d = self.image(depth)?;
+                    if c.kind != ImageKind::Rgba8 || d.kind != ImageKind::Depth32
+                        || (c.width,c.height) != (d.width,d.height) {
+                        return Err("invalid indexed draw attachments".into());
+                    }
+                    c.check(region)?;
+                    d.check(region)?;
+                    let bytes = indexed_vertex_bytes(&self.index(indices)?.words,first,count,base_vertex)?;
+                    check_range(self.buffer(vertices)?.bytes,offset,bytes)?;
                 }
                 Command::UploadImage { src,offset,dst,region } => {
                     let image = self.image(dst)?;
@@ -610,7 +692,8 @@ impl<'a> Session<'a> {
                             .layer_count(1).color_attachments(&colors).depth_attachment(&depth_attachment));
                         d.cmd_end_rendering(cmd);
                     }
-                    Command::Draw { pipeline,color,depth,region,vertices,offset,count } => {
+                    Command::Draw { pipeline,color,depth,region,vertices,offset,count }
+                    | Command::DrawIndexed { pipeline,color,depth,region,vertices,offset,count,.. } => {
                         let p = self.pipeline(pipeline)?;
                         let c = self.image(color)?;
                         let z = self.image(depth)?;
@@ -632,7 +715,13 @@ impl<'a> Session<'a> {
                         d.cmd_set_viewport(cmd,0,&viewport);
                         d.cmd_set_scissor(cmd,0,&[area]);
                         d.cmd_bind_vertex_buffers(cmd,0,&[self.buffer(vertices)?.handle],&[offset]);
-                        d.cmd_draw(cmd,count,1,0,0);
+                        match command {
+                            Command::DrawIndexed { indices,first,base_vertex,.. } => {
+                                d.cmd_bind_index_buffer(cmd,self.index(indices)?.buffer.handle,0,vk::IndexType::UINT32);
+                                d.cmd_draw_indexed(cmd,count,1,first,base_vertex,0);
+                            }
+                            _ => d.cmd_draw(cmd,count,1,0,0),
+                        }
                         d.cmd_end_rendering(cmd);
                     }
                     Command::UploadImage { src,offset,dst,region } => {
@@ -858,9 +947,67 @@ pub(crate) fn verify_draws(context:&mut Context,vert:&std::path::Path,frag:&std:
     Ok(())
 }
 
+pub(crate) fn verify_indexed(context:&mut Context,vert:&std::path::Path,frag:&std::path::Path) -> Result<()> {
+    let load = |path:&std::path::Path| -> Result<Vec<u32>> {
+        Ok(ash::util::read_spv(&mut std::io::Cursor::new(std::fs::read(path)?))?)
+    };
+    let mut s = Session::new(context)?;
+    let p = s.create_graphics_pipeline(&load(vert)?,&load(frag)?)?;
+    let color = s.create_image(8,8)?;
+    let depth = s.create_depth_image(8,8)?;
+    let full = ImageRegion { x:0,y:0,width:8,height:8 };
+    // Four vertices form two triangles. Indices deliberately refer to
+    // vertices 1..4 through a negative base vertex, and skip three entries.
+    let mut data = Vec::new();
+    for (x,y) in [(-1f32,-1f32),(1.,-1.),(1.,1.),(-1.,1.)] {
+        data.extend([x,y,0.375,0.,1.,0.,1.].map(f32::to_bits));
+    }
+    let upload = s.create_buffer(data.len() as u64*4,MemoryKind::HostVisible)?;
+    let vertices = s.create_buffer(data.len() as u64*4,MemoryKind::DeviceLocal)?;
+    let output = s.create_buffer(512,MemoryKind::HostVisible)?;
+    s.write_words(upload,0,&data)?;
+    let indices = s.create_index_buffer(&[0,0,0,1,2,3,1,3,4])?;
+    let draw = |first,count,base_vertex| Command::DrawIndexed {
+        pipeline:p,color,depth,region:full,vertices,offset:0,indices,first,count,base_vertex
+    };
+    let epoch = s.submit(&[
+        Command::Copy { src:upload,src_offset:0,dst:vertices,dst_offset:0,bytes:data.len() as u64*4 },
+        Command::ClearAttachments { color,depth,region:full,rgba:[0.;4],z:1. },
+        draw(3,6,-1),
+        Command::ReadImage { src:color,region:full,dst:output,offset:0 },
+        Command::ReadImage { src:depth,region:full,dst:output,offset:256 },
+    ])?;
+    let mut expected = vec![u32::from_le_bytes([0,255,0,255]);64];
+    expected.extend([0.375f32.to_bits();64]);
+    if s.read_words(output,0,128)? != expected { return Err("indexed quad color/depth mismatch".into()); }
+    println!("PASS: indexed quad, 4 vertices, 6 indices, first index 3 and base vertex -1 at timeline {epoch}");
+    for invalid in [draw(6,6,-1),draw(3,6,0),draw(3,6,-2),draw(3,5,-1)] {
+        if s.submit(&[Command::ClearImage { dst:color,rgba:[0.;4] },invalid]).is_ok() {
+            return Err("accepted invalid indexed draw".into());
+        }
+    }
+    s.submit(&[Command::ReadImage { src:color,region:full,dst:output,offset:0 }])?;
+    if s.read_words(output,0,64)? != expected[..64] { return Err("invalid indexed list modified color".into()); }
+    s.destroy_index_buffer(indices)?;
+    if s.submit(&[draw(3,6,-1)]).is_ok() { return Err("accepted retired index buffer".into()); }
+    println!("PASS: invalid index ranges, base vertices and retired index buffer rejected");
+    println!("PASS: reusable Vulkan indexed draw executor verified");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn indexed_vertex_validation() {
+        let indices = [0,0,0,1,2,3,1,3,4];
+        assert_eq!(indexed_vertex_bytes(&indices,3,6,-1).unwrap(),4*VERTEX_BYTES);
+        assert!(indexed_vertex_bytes(&indices,3,6,-2).is_err());
+        assert!(indexed_vertex_bytes(&indices,6,6,-1).is_err());
+        assert!(indexed_vertex_bytes(&indices,u32::MAX,3,0).is_err());
+        assert!(indexed_vertex_bytes(&indices,0,0,0).is_err());
+    }
+
     #[test]
     fn image_region_validation() {
         let r = ImageRegion { x:2,y:1,width:3,height:2 };
