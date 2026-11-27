@@ -98,6 +98,9 @@ enum Command {
     /// Verify the reusable Vulkan buffer command executor.
     #[cfg(feature = "vulkan")]
     VulkanCommands,
+    /// Verify reusable depth-tested drawing with the original shader fixture.
+    #[cfg(feature = "vulkan")]
+    VulkanDraw { vertex: PathBuf, fragment: PathBuf },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -198,6 +201,12 @@ fn main() -> Result<()> {
             }
             println!("PASS: shared Vulkan host library verified from vortex CLI (not title execution)");
             Ok(())
+        }
+        #[cfg(feature = "vulkan")]
+        Command::VulkanDraw { vertex, fragment } => {
+            let mut host = vortex_vulkan::Context::new()
+                .map_err(|e| anyhow::anyhow!("Vulkan initialization: {e}"))?;
+            host.verify_draws(&vertex,&fragment).map_err(|e| anyhow::anyhow!("Vulkan draw executor: {e}"))
         }
         #[cfg(feature = "vulkan")]
         Command::VulkanCommands => {
