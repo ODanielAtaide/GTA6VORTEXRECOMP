@@ -99,7 +99,9 @@ impl Context {
     pub fn verify_native_graphics(&mut self) -> Result<()> {
         commands::verify_native_graphics(self)?;
         commands::verify_native_textures(self)?;
-        commands::verify_native_mips(self)
+        commands::verify_native_mips(self)?;
+        commands::verify_native_mrt(self)?;
+        commands::verify_native_bc(self)
     }
 
     /// Verify sparse non-uniform runtime descriptor arrays on supported hardware.
@@ -302,7 +304,11 @@ fn select_device(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, ash::D
     let mut enabled13 = vk::PhysicalDeviceVulkan13Features::default().synchronization2(true).dynamic_rendering(true)
         .subgroup_size_control(f13.subgroup_size_control != 0)
         .compute_full_subgroups(f13.compute_full_subgroups != 0);
+    let core=unsafe{instance.get_physical_device_features(physical)};
+    let enabled_core=vk::PhysicalDeviceFeatures::default().texture_compression_bc(core.texture_compression_bc!=0);
+    println!("BC texture compression: {}",core.texture_compression_bc!=0);
     let device_info = vk::DeviceCreateInfo::default()
+        .enabled_features(&enabled_core)
         .queue_create_infos(&queues).push_next(&mut enabled12).push_next(&mut enabled13);
     let device = unsafe { instance.create_device(physical, &device_info, None)? };
     println!("PASS: AMD Vulkan logical device initialized");
