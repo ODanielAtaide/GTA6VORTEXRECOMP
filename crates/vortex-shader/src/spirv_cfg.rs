@@ -57,7 +57,7 @@ fn unsupported(offset:usize,what:&'static str)->ShaderError {
 }
 struct Emit {
     next:u32, globals:Vec<u32>, body:Vec<u32>, constants:BTreeMap<u32,u32>,
-    regs:BTreeMap<Reg,u32>, pc:u32,budget:u32, active:u32, global_index:u32, length:u32, length_second:u32, wave64:bool, multi:bool,
+    regs:BTreeMap<Reg,u32>, pc:u32,budget:u32, active:u32, global_index:u32, length:u32, length_second:u32, wave64:bool, multi:bool, full_exec:bool,
 }
 impl Emit {
     fn id(&mut self)->u32 { let n=self.next; self.next+=1; n }
@@ -142,6 +142,8 @@ impl Emit {
         Ok(())
     }
     fn put_vector(&mut self,r:Reg,v:u32)->Result<(),ShaderError> {
+        // Full EXEC is proven once per program, not guessed from an instruction.
+        if self.full_exec { return self.put(r,v); }
         let old=self.reg(r)?;let cond=self.active_condition();let result=self.select(cond,v,old);
         self.put(r,result)
     }
@@ -270,7 +272,7 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
         Fields::Valu(v)=>{
             let mbcnt=matches!(name,"v_mbcnt_lo_u32_b32"|"v_mbcnt_hi_u32_b32");
             let integer_vop3=matches!(name,"v_lshl_add_u32"|"v_lshl_or_b32"|"v_add_lshl_u32"|"v_and_or_b32"|"v_or3_b32"|"v_add3_u32"|"v_xor3_b32"|"v_mul_lo_u32"|"v_min_u32"|"v_max_u32"|"v_bcnt_u32_b32"|"v_subrev_nc_u32");
-            if !(matches!(i.machine.encoding,Encoding::Vop1|Encoding::Vop2|Encoding::Vopc)||mbcnt||integer_vop3)
+            if !(matches!(i.machine.encoding,Encoding::Vop1|Encoding::Vop2|Encoding::Vopc)||mbcnt||integer_vop3||(i.machine.encoding==Encoding::Vop3&&name=="v_cndmask_b32"))
                 || v.carry.is_some() || v.neg!=0 || v.abs!=0 || v.neg_hi!=0 || v.opsel!=0
                 || v.opsel_hi!=0 || v.clamp || v.omod!=0 || v.sdwa.is_some() || v.dpp.is_some() {
                 return Err(err());
@@ -293,6 +295,22 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
             let dst=vector(v.dst.ok_or_else(err)?).ok_or_else(err)?;
             let r=Reg::V(dst);
             if !writes(i,&[r]){return Err(err());}
+            if name=="v_cndmask_b32" {
+                let &[a,b,mask]=v.src.as_slice() else { return Err(err()); };
+                let a=e.operand(a)?; let b=e.operand(b)?;
+                let words=e.mask_operand(mask,if e.wave64{2}else{1})?;
+                let lane=e.load(SUBGROUP_LANE);
+                let low_bits=e.c(31); let bit=e.u(199,lane,low_bits);
+                let word=if e.wave64 {
+                    let split=e.c(32); let upper=e.test(174,lane,split);
+                    e.select(upper,words[1],words[0])
+                }else{words[0]};
+                let shifted=e.u(194,word,bit); let one=e.c(1);
+                let selected=e.u(199,shifted,one);
+                let zero=e.c(0); let cond=e.test(171,selected,zero);
+                let result=e.select(cond,b,a);
+                return e.put_vector(r,result);
+            }
             if mbcnt{
                 let &[mask,base]=v.src.as_slice()else{return Err(err());};
                 let a=match mask{
@@ -447,7 +465,7 @@ pub fn diagnose_instructions(p:&ir::Program)->BTreeMap<String,u64>{
         if ordinary(r){regs.insert(r,next);next+=1;}
     }
     let mut e=Emit{next,globals:vec![],body:vec![],constants:BTreeMap::new(),regs,
-        pc:31,budget:32,active:33,global_index:34,length:35,length_second:36,wave64:p.wave64,multi:false};
+        pc:31,budget:32,active:33,global_index:34,length:35,length_second:36,wave64:p.wave64,multi:false,full_exec:false};
     for i in p.blocks.iter().flat_map(|b|&b.insts){
         e.body.clear();e.globals.clear();e.constants.clear();e.next=next;
         if let Err(error)=lower(&mut e,i){
@@ -525,7 +543,7 @@ fn emit_cfg_inner(p:&ir::Program,multi:bool)->Result<Vec<u32>,ShaderError> {
         return Err(unsupported(0,"LDS or barrier in wave-dependent CFG"));
     }
     let mut e=Emit {next:32,globals:vec![],body:vec![],constants:BTreeMap::new(),
-        regs:BTreeMap::new(),pc:0,budget:0,active:0,global_index:0,length:0,length_second:0,wave64:p.wave64,multi};
+        regs:BTreeMap::new(),pc:0,budget:0,active:0,global_index:0,length:0,length_second:0,wave64:p.wave64,multi,full_exec:!has_wave_flow(p)};
     let mut used=std::collections::BTreeSet::new();
     for &(r,_) in &p.inputs {if ordinary(r)&&!(multi&&second_descriptor(r)){used.insert(r);}}
     for b in &p.blocks {
@@ -686,6 +704,19 @@ mod tests {
         assert_eq!(words[0], 0x07230203);
         assert!(!has_opcode(&words, 246)); // OpLoopMerge
         assert!(!has_opcode(&words, 251)); // OpSwitch
+        assert!(!has_opcode(&words, 169)); // No EXEC selects for full-EXEC arithmetic
+    }
+    #[test]
+    fn cndmask_uses_native_wave_mask() {
+        // v_cmp_eq_u32 vcc, 0, v0; v_cndmask_b32 v1, 0, v0, vcc.
+        let code: Vec<u8> = [0x7d84_0080u32,0x0202_0080,0xbf81_0000]
+            .into_iter().flat_map(u32::to_le_bytes).collect();
+        for wave64 in [false,true] {
+            let p = ir::build(&code, wave64, 4).unwrap();
+            let words = emit_cfg(&p).unwrap();
+            assert!(has_opcode(&words, 339)); // OpGroupNonUniformBallot
+            assert!(has_opcode(&words, 169)); // OpSelect
+        }
     }
     #[test]
     fn private_store_accepts_proven_copy_not_arbitrary_index() {
