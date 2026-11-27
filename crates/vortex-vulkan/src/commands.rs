@@ -576,7 +576,7 @@ impl Drop for Session<'_> {
 }
 
 impl<'a> Session<'a> {
-    pub(crate) fn new(context: &'a mut Context) -> Result<Self> {
+    pub(crate) fn new(context: &'a Context) -> Result<Self> {
         let d = &context.device;
         let mut session = Self {
             d, instance:&context.instance, physical:context.physical,
@@ -631,6 +631,14 @@ impl<'a> Session<'a> {
 
     fn image(&self,id:ImageId) -> Result<&Image<'a>> {
         self.images.get(&id).ok_or_else(|| "unknown or retired image ID".into())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn present_source(&self,id:ImageId)->Result<(vk::Image,u32,u32)>{
+        self.ready()?;
+        let image=self.image(id)?;
+        if image.kind!=ImageKind::Rgba8||image.mips!=1||!image.initialized{return Err("invalid native present source".into());}
+        Ok((image.handle,image.width,image.height))
     }
 
     /// Allocate an RGBA8 color image, compatible with rendering and transfers.
