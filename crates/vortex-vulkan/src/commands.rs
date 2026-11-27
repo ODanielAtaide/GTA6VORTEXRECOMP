@@ -551,6 +551,11 @@ pub struct Session<'a> {
     pool: vk::CommandPool,
     command: vk::CommandBuffer,
     timeline: vk::Semaphore,
+    timestamp_pool: vk::QueryPool,
+    timestamp_bits: u32,
+    timestamp_period: f64,
+    timestamp_last: Option<u64>,
+    timestamp_elapsed: u128,
     completed: u64,
     next_id: u64,
     poisoned: bool,
@@ -571,6 +576,7 @@ impl Drop for Session<'_> {
             let _ = self.d.device_wait_idle();
             self.d.destroy_command_pool(self.pool,None);
             self.d.destroy_semaphore(self.timeline,None);
+            if self.timestamp_pool != vk::QueryPool::null() { self.d.destroy_query_pool(self.timestamp_pool,None); }
         }
         if !self.poisoned {self.cache.save();}
         // Buffers drop after the device is idle; Context outlives the session.
@@ -588,7 +594,10 @@ impl<'a> Session<'a> {
             memory:unsafe { context.instance.get_physical_device_memory_properties(context.physical) },
             queue:unsafe { d.get_device_queue(context.family,0) },
             pool:vk::CommandPool::null(),command:vk::CommandBuffer::null(),
-            timeline:vk::Semaphore::null(),completed:0,next_id:1,poisoned:false,buffers:BTreeMap::new(),images:BTreeMap::new(),pipelines:BTreeMap::new(),indices:BTreeMap::new(),compute_bindings:BTreeMap::new(),compute_pipelines:BTreeMap::new(),
+            timeline:vk::Semaphore::null(),timestamp_pool:vk::QueryPool::null(),
+            timestamp_bits:unsafe{context.instance.get_physical_device_queue_family_properties(context.physical)}[context.family as usize].timestamp_valid_bits,
+            timestamp_period:f64::from(unsafe{context.instance.get_physical_device_properties(context.physical)}.limits.timestamp_period),
+            timestamp_last:None,timestamp_elapsed:0,completed:0,next_id:1,poisoned:false,buffers:BTreeMap::new(),images:BTreeMap::new(),pipelines:BTreeMap::new(),indices:BTreeMap::new(),compute_bindings:BTreeMap::new(),compute_pipelines:BTreeMap::new(),
         };
         unsafe {
             session.pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default()
@@ -1260,7 +1269,37 @@ impl<'a> Session<'a> {
         self.pipelines.get(&pipeline).filter(|p|p.batchable).map(|_|(pipeline,color,depth,region))
     }
 
+    /// GPU bottom-of-pipe timestamp in the guest's advertised 100 MHz units.
+    /// The query pool is reused only after the timeline semaphore completes.
+    pub fn guest_timestamp(&mut self) -> Result<u64> {
+        self.ready()?;
+        if !(1..=64).contains(&self.timestamp_bits) || !self.timestamp_period.is_finite() || self.timestamp_period <= 0.0 {
+            return Err("Vulkan queue has no usable timestamp clock".into());
+        }
+        if self.timestamp_pool == vk::QueryPool::null() {
+            self.timestamp_pool=unsafe{self.d.create_query_pool(&vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP).query_count(1),None)?};
+        }
+        self.submit_inner(&[Command::Sync],true)?;
+        let mut ticks=[0u64;1];
+        unsafe{self.d.get_query_pool_results(self.timestamp_pool,0,&mut ticks,
+            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT)?;}
+        let mask=u64::MAX >> (64-self.timestamp_bits);
+        let raw=ticks[0]&mask;
+        if let Some(last)=self.timestamp_last {
+            self.timestamp_elapsed=self.timestamp_elapsed.checked_add(u128::from(raw.wrapping_sub(last)&mask))
+                .ok_or("GPU timestamp counter overflow")?;
+        }
+        self.timestamp_last=Some(raw);
+        // timestampPeriod is nanoseconds per hardware tick; 100 MHz is 10 ns.
+        let guest=self.timestamp_elapsed as f64*self.timestamp_period/10.0;
+        if !guest.is_finite() || guest>=u64::MAX as f64{return Err("guest timestamp overflow".into());}
+        Ok(guest as u64)
+    }
     pub fn submit(&mut self,commands:&[Command]) -> Result<u64> {
+        self.submit_inner(commands,false)
+    }
+    fn submit_inner(&mut self,commands:&[Command],timestamp:bool) -> Result<u64> {
         self.ready()?;
         self.validate(commands)?;
         if commands.is_empty() { self.last_recording=RecordingStats::default();return Ok(self.completed); }
@@ -1274,6 +1313,7 @@ impl<'a> Session<'a> {
             d.reset_command_pool(self.pool,vk::CommandPoolResetFlags::empty())?;
             d.begin_command_buffer(cmd,&vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            if timestamp { d.cmd_reset_query_pool(cmd,self.timestamp_pool,0,1); }
             for (index,&command) in commands.iter().enumerate() {
                 let key=self.draw_key(&command);
                 let continues=key.is_some()&&index>0&&key==self.draw_key(&commands[index-1]);
@@ -1459,6 +1499,7 @@ impl<'a> Session<'a> {
                 .dst_stage_mask(vk::PipelineStageFlags2::HOST)
                 .dst_access_mask(vk::AccessFlags2::HOST_READ | vk::AccessFlags2::HOST_WRITE)];
             d.cmd_pipeline_barrier2(cmd,&vk::DependencyInfo::default().memory_barriers(&host));
+            if timestamp { d.cmd_write_timestamp2(cmd,vk::PipelineStageFlags2::ALL_COMMANDS,self.timestamp_pool,0); }
             d.end_command_buffer(cmd)?;
             let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
             let wait = [vk::SemaphoreSubmitInfo::default().semaphore(self.timeline).value(self.completed)
