@@ -96,3 +96,11 @@ The maintainer reported "TODOS OS TESTES APROVADOS" for the combined 38-module c
 `tools/update-vulkan.ps1` creates verified full Git bundles of local committed refs before contacting the remote and after fetching/updating, then validates shader and Vulkan unit tests and executes both graphics batching modes. Default backup directory is outside the checkout. Bundles do not contain uncommitted changes, ignored files or external LFS objects; keep separate backups if needed. No automatic background backup is implied. Restore with git clone -b experimental/amd-vulkan-spirv <bundle> <destination>.
 
 New code and script are pending local compilation and execution. Existing shader ABI and runtime integration limitations remain.
+
+### Native mip chains, channel masks and FP32 expansion
+
+Maintainer confirmed the previous complete suite, including persistent pipeline cache load/save (131056 bytes), three native indexed draws in two rendering scopes and two pipeline binds, sampled graphics and texture rebinding. This is a command-count improvement, not a measured title FPS gain.
+
+The next original revision adds multi-mip RGBA8 sampled images, per-mip upload/readback, bounds checks, GPU linear-blit mip generation with transfer dependencies, fractional explicit LOD and trilinear sampling. Multi-mip views cannot be used as render attachments. Native MIMG dmask supports nonempty packed component subsets. Added 12 FP32 ALU operations: floor, ceil, fract, trunc, exp2, log2, sqrt, inverse sqrt, reciprocal, min/max and unsigned-to-float conversion; guest denormal/NaN/rounding modes are not modeled exactly. The math GPU fixture checks five of those operations; the others need dedicated numerical tests. New fixtures verify all three discrete mip levels, packed red/blue sampling, fractional LOD, constant and nonconstant generated mip chains, and invalid mip/attachment rejection. The CLI emits 26 graphics modules plus the prior 28 compute modules. All new code awaits build, spirv-val and GPU validation.
+
+Continue with tools/update-vulkan.ps1, which saves verified Git bundles before and after fetching the update. Only versioned refs are included. Still limited to explicit diagnostic ABIs and RGBA8 images, no compressed formats, MRT, general shader CFG/resource discovery or title execution.
