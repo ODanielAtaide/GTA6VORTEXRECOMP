@@ -44,12 +44,26 @@ impl Stage{
                     let ops:usize=ir.blocks.iter().map(|b|b.insts.len()).sum();
                     let inputs:Vec<_>=ir.inputs.iter().map(|(reg,_)|*reg).collect();
                     tracing::info!(hash=%self.hash,blocks=ir.blocks.len(),ops,?inputs,"VULKAN_GUEST_SHADER_IR");
+                    if let vortex_shader::native::StageIo::Cs(io)=&p.io{
+                        let (group_ids,group_info)=io.system_sgprs();
+                        tracing::info!(hash=%self.hash,threads=?io.threads,user_sgprs=io.user_sgprs(),
+                            ?group_ids,?group_info,"VULKAN_COMPUTE_HARDWARE_INPUTS");
+                    }
                     // Diagnostic emitter has a synthetic ABI. Probe it for
                     // coverage only; its output must NEVER be executed here.
                     if p.stage==HwStage::Cs{
                         match vortex_shader::spirv_cfg::emit_cfg(&ir){
                             Ok(words)=>tracing::info!(hash=%self.hash,words=words.len(),"VULKAN_SHADER_LOWERING_CANDIDATE_ONLY"),
-                            Err(e)=>tracing::info!(hash=%self.hash,error=%e,"VULKAN_SHADER_LOWERING_GAP"),
+                            Err(e)=>{
+                                tracing::info!(hash=%self.hash,error=%e,"VULKAN_SHADER_LOWERING_GAP");
+                                if let vortex_shader::ShaderError::Unsupported{offset,..}|vortex_shader::ShaderError::Isa{offset,..}=e{
+                                    if let Some(i)=ir.blocks.iter().flat_map(|b|&b.insts).find(|i|i.machine.offset==offset){
+                                        let reads:Vec<_>=i.reads.iter().map(|(r,_)|*r).collect();
+                                        let writes:Vec<_>=i.writes.iter().map(|(r,_)|*r).collect();
+                                        tracing::info!(hash=%self.hash,offset=format_args!("{offset:#x}"),opcode=i.name(),?reads,?writes,"VULKAN_SHADER_OPCODE_GAP");
+                                    }
+                                }
+                            },
                         }
                     }
                 }

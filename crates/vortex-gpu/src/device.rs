@@ -404,6 +404,10 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled()&&(calls<=4||calls.is_power_of_two()){
+        tracing::warn!(slot=format_args!("{SLOT:#x}"),calls,"VULKAN_OPTIONAL_PSO_UNSUPPORTED: E_NOTIMPL, no pipeline created");
+    }
     E_NOTIMPL
 }
 
@@ -478,6 +482,11 @@ static LIVE_FUNCTIONS:Table<160>={
     f[11]=pipeline::native_live::create_compute as *const ();
     f[62]=pipeline::native_live::create_compute_x as *const ();
     f[86]=pipeline::native_live::create_stream as *const ();
+    // Existing guest ABI explicitly supports failed optional PSO creation.
+    // Return the original E_NOTIMPL/null object contract, not S_OK, and
+    // report the unsupported description. No host renderer is involved.
+    f[57]=unknown_pipeline::<0x1c8> as *const ();
+    f[67]=unknown_pipeline::<0x218> as *const ();
     f[12]=list::create_list as *const ();f[13]=check_feature_support as *const ();
     f[14]=descriptor::create_heap as *const ();f[15]=descriptor::increment_size as *const ();
     f[16]=root::create as *const ();f[17]=descriptor::create_cbv as *const ();
