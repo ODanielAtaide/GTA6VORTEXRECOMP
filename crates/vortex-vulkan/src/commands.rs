@@ -76,6 +76,9 @@ pub enum Command {
         vertices: BufferId, offset: u64, count: u32 },
     DrawIndexed { pipeline: PipelineId, color: ImageId, depth: ImageId, region: ImageRegion,
         vertices: BufferId, offset: u64, indices: IndexId, first: u32, count: u32, base_vertex: i32 },
+    /// Contiguous color targets, indexed triangles, repeated instances.
+    DrawIndexedTargets { pipeline:PipelineId, colors:[Option<ImageId>;8], depth:ImageId, region:ImageRegion,
+        vertices:BufferId,offset:u64,indices:IndexId,first:u32,count:u32,base_vertex:i32,instances:u32 },
     Dispatch { binding: ComputeBindingId, groups: u32, constants: [u32;2] },
     UploadImage { src: BufferId, offset: u64, dst: ImageId, region: ImageRegion },
     UploadMip { src: BufferId, offset: u64, dst: ImageId, mip:u32, region: ImageRegion },
@@ -275,6 +278,7 @@ struct GraphicsPipeline<'a> {
     frag: vk::ShaderModule,
     texture: Option<ImageId>,
     batchable: bool,
+    color_count:u32,
     linear_filter: bool,
     sampler: vk::Sampler,
     descriptor_layout: vk::DescriptorSetLayout,
@@ -297,9 +301,9 @@ impl Drop for GraphicsPipeline<'_> {
     }
 }
 impl<'a> GraphicsPipeline<'a> {
-    fn new(d:&'a ash::Device,vert:&[u32],frag:&[u32],texture:Option<(ImageId,vk::ImageView)>,state:GraphicsState,cache:vk::PipelineCache) -> Result<Self> {
+    fn new(d:&'a ash::Device,vert:&[u32],frag:&[u32],texture:Option<(ImageId,vk::ImageView)>,state:GraphicsState,cache:vk::PipelineCache,color_count:u32) -> Result<Self> {
         let mut p = Self { d,vert:vk::ShaderModule::null(),frag:vk::ShaderModule::null(),
-            texture:texture.map(|(id,_)|id),batchable:false,linear_filter:state.linear_filter,sampler:vk::Sampler::null(),
+            texture:texture.map(|(id,_)|id),batchable:false,color_count,linear_filter:state.linear_filter,sampler:vk::Sampler::null(),
             descriptor_layout:vk::DescriptorSetLayout::null(),descriptor_pool:vk::DescriptorPool::null(),
             descriptor_set:vk::DescriptorSet::null(),layout:vk::PipelineLayout::null(),pipeline:vk::Pipeline::null() };
         unsafe {
@@ -354,15 +358,15 @@ impl<'a> GraphicsPipeline<'a> {
                 .rasterization_samples(vk::SampleCountFlags::TYPE_1);
             let depth = vk::PipelineDepthStencilStateCreateInfo::default()
                 .depth_test_enable(state.depth_test).depth_write_enable(state.depth_write).depth_compare_op(vk::CompareOp::LESS);
-            let blends = [vk::PipelineColorBlendAttachmentState::default()
+            let blends = vec![vk::PipelineColorBlendAttachmentState::default()
                 .color_write_mask(vk::ColorComponentFlags::RGBA).blend_enable(state.alpha_blend)
                 .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA).dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
                 .color_blend_op(vk::BlendOp::ADD).src_alpha_blend_factor(vk::BlendFactor::ONE)
-                .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA).alpha_blend_op(vk::BlendOp::ADD)];
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA).alpha_blend_op(vk::BlendOp::ADD);color_count as usize];
             let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blends);
             let dynamic_states = [vk::DynamicState::VIEWPORT,vk::DynamicState::SCISSOR];
             let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-            let formats = [ImageKind::Rgba8.format()];
+            let formats = vec![ImageKind::Rgba8.format();color_count as usize];
             let mut rendering = vk::PipelineRenderingCreateInfo::default()
                 .color_attachment_formats(&formats).depth_attachment_format(ImageKind::Depth32.format());
             let info = vk::GraphicsPipelineCreateInfo::default().stages(&stages)
@@ -660,7 +664,7 @@ impl<'a> Session<'a> {
         self.ready()?;
         let id = PipelineId(self.next_id);
         self.next_id = self.next_id.checked_add(1).ok_or("pipeline ID exhausted")?;
-        let p = GraphicsPipeline::new(self.d,vert,frag,None,GraphicsState::default(),self.cache.handle())?;
+        let p = GraphicsPipeline::new(self.d,vert,frag,None,GraphicsState::default(),self.cache.handle(),1)?;
         self.pipelines.insert(id,p);
         Ok(id)
     }
@@ -676,6 +680,7 @@ impl<'a> Session<'a> {
             return Err("native sampled fragment requires texture descriptor".into());
         }
         let f=spirv_graphics::emit_graphics(&fragment,Stage::Fragment)?;
+        if spirv_graphics::color_export_count(&fragment)!=1{return Err("use native MRT pipeline for multiple outputs".into());}
         let id=self.create_graphics_pipeline(&v,&f)?;
         self.pipelines.get_mut(&id).ok_or("missing graphics pipeline")?.batchable=true;
         Ok(id)
@@ -698,8 +703,39 @@ impl<'a> Session<'a> {
         if state.linear_filter&&!props.optimal_tiling_features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR){
             return Err("linear texture filtering unsupported".into());
         }
-        let mut p=GraphicsPipeline::new(self.d,&v,&f,Some((texture,image.view)),state,self.cache.handle())?;
+        if spirv_graphics::color_export_count(&fragment)!=1{return Err("use native MRT pipeline for multiple outputs".into());}
+        let mut p=GraphicsPipeline::new(self.d,&v,&f,Some((texture,image.view)),state,self.cache.handle(),1)?;
         p.batchable=true;
+        let id=PipelineId(self.next_id);self.next_id=self.next_id.checked_add(1).ok_or("pipeline ID exhausted")?;
+        self.pipelines.insert(id,p);Ok(id)
+    }
+
+    /// Native MRT pipeline, optionally sampling a retained image. Contiguous
+    /// RGBA8 color exports share depth and blend state.
+    pub fn create_native_mrt_pipeline(&mut self,vertex:&[u8],fragment:&[u8],vgprs:[u16;2],
+        texture:Option<ImageId>,state:GraphicsState)->Result<PipelineId>{
+        use vortex_shader::{ir,spirv_graphics::{self,Stage}};
+        self.ready()?;
+        let v=spirv_graphics::emit_graphics(&ir::build(vertex,false,vgprs[0])?,Stage::Vertex)?;
+        let program=ir::build(fragment,false,vgprs[1])?;
+        let f=spirv_graphics::emit_graphics(&program,Stage::Fragment)?;
+        let count=spirv_graphics::color_export_count(&program);
+        let limits=unsafe{self.instance.get_physical_device_properties(self.physical)}.limits;
+        if count<2||count>8||count>limits.max_color_attachments||count>limits.max_fragment_output_attachments{
+            return Err("native MRT count exceeds supported limits".into());
+        }
+        let sampled=program.blocks.iter().flat_map(|b|&b.insts).any(|i|matches!(i.fields,vortex_shader::gfx10::Fields::Image{..}));
+        if sampled!=texture.is_some(){return Err("native MRT texture binding mismatch".into());}
+        let view=if let Some(id)=texture{
+            let image=self.image(id)?;
+            if image.kind!=ImageKind::Rgba8{return Err("MRT texture must be RGBA8".into());}
+            let props=unsafe{self.instance.get_physical_device_format_properties(self.physical,image.kind.format())};
+            if state.linear_filter&&!props.optimal_tiling_features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR){
+                return Err("linear texture filtering unsupported".into());
+            }
+            Some((id,image.view))
+        }else{None};
+        let p=GraphicsPipeline::new(self.d,&v,&f,view,state,self.cache.handle(),count)?;
         let id=PipelineId(self.next_id);self.next_id=self.next_id.checked_add(1).ok_or("pipeline ID exhausted")?;
         self.pipelines.insert(id,p);Ok(id)
     }
@@ -1000,6 +1036,7 @@ impl<'a> Session<'a> {
                 }
                 Command::Draw { pipeline,color,depth,region,vertices,offset,count } => {
                     let p=self.pipeline(pipeline)?;
+                    if p.color_count!=1{return Err("MRT pipeline requires target array".into());}
                     if p.texture==Some(color)||p.texture==Some(depth){return Err("sampled attachment feedback unsupported".into());}
                     if let Some(id)=p.texture{self.image(id)?;}
                     let c = self.image(color)?;
@@ -1015,6 +1052,7 @@ impl<'a> Session<'a> {
                 }
                 Command::DrawIndexed { pipeline,color,depth,region,vertices,offset,indices,first,count,base_vertex } => {
                     let p=self.pipeline(pipeline)?;
+                    if p.color_count!=1{return Err("MRT pipeline requires target array".into());}
                     if p.texture==Some(color)||p.texture==Some(depth){return Err("sampled attachment feedback unsupported".into());}
                     if let Some(id)=p.texture{self.image(id)?;}
                     let c = self.image(color)?;
@@ -1026,6 +1064,28 @@ impl<'a> Session<'a> {
                     c.check(region)?;
                     d.check(region)?;
                     let bytes = indexed_vertex_bytes(&self.index(indices)?.words,first,count,base_vertex)?;
+                    check_range(self.buffer(vertices)?.bytes,offset,bytes)?;
+                }
+                Command::DrawIndexedTargets{pipeline,colors,depth,region,vertices,offset,indices,first,count,base_vertex,instances}=>{
+                    let p=self.pipeline(pipeline)?;
+                    let n=p.color_count as usize;
+                    if instances==0||n<2||n>8||colors[..n].iter().any(Option::is_none)||colors[n..].iter().any(Option::is_some){
+                        return Err("MRT count or instances invalid".into());
+                    }
+                    let z=self.image(depth)?;
+                    if z.kind!=ImageKind::Depth32||z.mips!=1{return Err("invalid MRT depth".into());}
+                    z.check(region)?;
+                    let mut seen=std::collections::BTreeSet::new();
+                    for &id in colors.iter().flatten(){
+                        if !seen.insert(id)||p.texture==Some(id)||id==depth{return Err("MRT feedback or duplicate attachment".into());}
+                        let c=self.image(id)?;
+                        if c.kind!=ImageKind::Rgba8||c.mips!=1||(c.width,c.height)!=(z.width,z.height){
+                            return Err("MRT dimensions or format mismatch".into());
+                        }
+                        c.check(region)?;
+                    }
+                    if let Some(id)=p.texture{self.image(id)?;}
+                    let bytes=indexed_vertex_bytes(&self.index(indices)?.words,first,count,base_vertex)?;
                     check_range(self.buffer(vertices)?.bytes,offset,bytes)?;
                 }
                 Command::Dispatch { binding,groups,.. } => {
@@ -1196,6 +1256,28 @@ impl<'a> Session<'a> {
                             _ => d.cmd_draw(cmd,count,1,0,0),
                         }
                         if !extends{d.cmd_end_rendering(cmd);}
+                    }
+                    Command::DrawIndexedTargets{pipeline,colors,depth,region,vertices,offset,indices,first,count,base_vertex,instances}=>{
+                        let p=self.pipeline(pipeline)?;
+                        let mut attachments=Vec::new();
+                        for &id in colors.iter().flatten(){
+                            attachments.push(vk::RenderingAttachmentInfo::default().image_view(self.image(id)?.view)
+                                .image_layout(vk::ImageLayout::GENERAL).load_op(vk::AttachmentLoadOp::LOAD).store_op(vk::AttachmentStoreOp::STORE));
+                        }
+                        let z=vk::RenderingAttachmentInfo::default().image_view(self.image(depth)?.view)
+                            .image_layout(vk::ImageLayout::GENERAL).load_op(vk::AttachmentLoadOp::LOAD).store_op(vk::AttachmentStoreOp::STORE);
+                        let area=vk::Rect2D{offset:vk::Offset2D{x:region.x as i32,y:region.y as i32},
+                            extent:vk::Extent2D{width:region.width,height:region.height}};
+                        let viewport=[vk::Viewport{x:region.x as f32,y:region.y as f32,width:region.width as f32,height:region.height as f32,min_depth:0.,max_depth:1.}];
+                        stats.draws+=1;stats.draw_render_scopes+=1;stats.graphics_pipeline_binds+=1;
+                        d.cmd_begin_rendering(cmd,&vk::RenderingInfo::default().render_area(area).layer_count(1)
+                            .color_attachments(&attachments).depth_attachment(&z));
+                        d.cmd_bind_pipeline(cmd,vk::PipelineBindPoint::GRAPHICS,p.pipeline);
+                        if p.texture.is_some(){d.cmd_bind_descriptor_sets(cmd,vk::PipelineBindPoint::GRAPHICS,p.layout,0,&[p.descriptor_set],&[]);}
+                        d.cmd_set_viewport(cmd,0,&viewport);d.cmd_set_scissor(cmd,0,&[area]);
+                        d.cmd_bind_vertex_buffers(cmd,0,&[self.buffer(vertices)?.handle],&[offset]);
+                        d.cmd_bind_index_buffer(cmd,self.index(indices)?.buffer.handle,0,vk::IndexType::UINT32);
+                        d.cmd_draw_indexed(cmd,count,instances,first,base_vertex,0);d.cmd_end_rendering(cmd);
                     }
                     Command::Dispatch { binding,groups,constants } => {
                         let b = self.compute_binding(binding)?;
@@ -1980,6 +2062,12 @@ pub(crate) fn emit_native_graphics(dir:&std::path::Path) -> Result<()> {
     let (v,f)=vortex_shader::spirv_graphics::math_fixtures();
     let (v,f)=vortex_shader::spirv_graphics::extra_modules(&v,&f)?;
     modules.push(("math.vert.spv".to_owned(),v));modules.push(("math.frag.spv".to_owned(),f));
+    for count in [2,4,8]{for depth in [false,true]{
+        let(v,f)=vortex_shader::spirv_graphics::mrt_fixtures(count,depth);
+        let(v,f)=vortex_shader::spirv_graphics::extra_modules(&v,&f)?;
+        let prefix=format!("mrt_{count}_{depth}");
+        modules.push((format!("{prefix}.vert.spv"),v));modules.push((format!("{prefix}.frag.spv"),f));
+    }}
     for (name,words) in modules {
         let path=dir.join(name);
         std::fs::write(&path,words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>())?;
@@ -2243,6 +2331,53 @@ pub(crate) fn verify_native_mips(context:&mut Context)->Result<()> {
     }
     println!("PASS: native FP32 fract, sqrt, reciprocal, ceil and min");
     s.destroy_graphics_pipeline(p)?;s.destroy_image(tex)?;
+    Ok(())
+}
+
+pub(crate) fn verify_native_mrt(context:&mut Context)->Result<()>{
+    let mut s=Session::new(context)?;
+    let depth=s.create_depth_image(8,8)?;
+    let full=ImageRegion{x:0,y:0,width:8,height:8};
+    let vertices=s.create_buffer(4*VERTEX_BYTES,MemoryKind::HostVisible)?;
+    let mut data=Vec::new();
+    for(x,y)in[(-1f32,-1f32),(1.,-1.),(1.,1.),(-1.,1.)]{
+        data.extend([x,y,0.5,0.,0.,0.,1.].map(f32::to_bits));
+    }
+    s.write_words(vertices,0,&data)?;
+    let indices=s.create_index_buffer(&[0,1,2,0,2,3])?;
+    let output=s.create_buffer(9*256,MemoryKind::HostVisible)?;
+    let limit=unsafe{s.instance.get_physical_device_properties(s.physical)}.limits;
+    for n in [2u8,4,8]{
+        if u32::from(n)>limit.max_color_attachments||u32::from(n)>limit.max_fragment_output_attachments{
+            println!("SKIP: {n} MRT unsupported by hardware limits");continue;
+        }
+        let mut colors=[None;8];
+        for target in &mut colors[..n as usize]{*target=Some(s.create_image(8,8)?);}
+        for export_depth in [false,true]{
+            let(v,f)=vortex_shader::spirv_graphics::mrt_fixtures(n,export_depth);
+            let p=s.create_native_mrt_pipeline(&v,&f,[8,13],None,GraphicsState::default())?;
+            let draw=|colors|Command::DrawIndexedTargets{pipeline:p,colors,depth,region:full,vertices,offset:0,indices,first:0,count:6,base_vertex:0,instances:2};
+            let mut bad=colors;bad[1]=bad[0];
+            if s.submit(&[draw(bad)]).is_ok(){return Err("accepted duplicate MRT target".into());}
+            let mut commands=vec![Command::ClearDepth{dst:depth,depth:1.}];
+            for &id in colors.iter().flatten(){commands.push(Command::ClearImage{dst:id,rgba:[0.5;4]});}
+            commands.push(draw(colors));
+            for (i,&id) in colors.iter().flatten().enumerate(){
+                commands.push(Command::ReadImage{src:id,region:full,dst:output,offset:i as u64*256});
+            }
+            commands.push(Command::ReadImage{src:depth,region:full,dst:output,offset:8*256});
+            s.submit(&commands)?;
+            for t in 0..n{
+                let expected=u32::from_le_bytes([if t&1!=0{255}else{0},if t&2!=0{255}else{0},if t&4!=0{255}else{0},255]);
+                if s.read_words(output,u64::from(t)*256,64)?!=vec![expected;64]{return Err(format!("MRT {t} mismatch").into());}
+            }
+            let z=if export_depth{0.25f32}else{0.5};
+            if s.read_words(output,8*256,64)?!=vec![z.to_bits();64]{return Err("MRT depth mismatch".into());}
+            s.destroy_graphics_pipeline(p)?;
+            println!("PASS: native {n} MRT indexed instanced draw, fragment depth={export_depth}");
+        }
+        for id in colors.into_iter().flatten(){s.destroy_image(id)?;}
+    }
     Ok(())
 }
 
