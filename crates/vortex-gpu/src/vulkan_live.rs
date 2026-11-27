@@ -110,9 +110,43 @@ impl Drop for Retained{
     fn drop(&mut self){crate::resource::release_live(self.get());}
 }
 
+// Like XCL's cpu_writes design (xcl-dev/xcl commit 6089122), markers
+// may live outside resource objects. Vortex keeps them in command order
+// and checks the Windows mapping again after Vulkan has completed.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub(crate) struct HostMarker {
+    address:usize,
+    allocation:usize,
+    kind:u32,
+}
+impl HostMarker {
+    fn query(address:u64,bytes:usize)->Option<Self>{
+        use windows_sys::Win32::System::Memory::{
+            VirtualQuery,MEMORY_BASIC_INFORMATION,MEM_COMMIT,MEM_PRIVATE,MEM_MAPPED,
+            PAGE_READWRITE,
+        };
+        let address=usize::try_from(address).ok()?;
+        if address==0||!matches!(bytes,4|8)||address%bytes!=0{return None;}
+        let end=address.checked_add(bytes)?;
+        let mut m:MEMORY_BASIC_INFORMATION=unsafe{std::mem::zeroed()};
+        if unsafe{VirtualQuery(address as *const _,&mut m,std::mem::size_of_val(&m))}==0
+            || m.State!=MEM_COMMIT || !matches!(m.Type,MEM_PRIVATE|MEM_MAPPED)
+            || m.Protect!=PAGE_READWRITE
+            || (m.BaseAddress as usize)>address
+            || (m.BaseAddress as usize).checked_add(m.RegionSize)?<end{return None;}
+        Some(Self{address,allocation:m.AllocationBase as usize,kind:m.Type})
+    }
+    fn still_valid(self,bytes:usize)->bool{
+        Self::query(self.address as u64,bytes)==Some(self)
+    }
+}
+pub(crate) enum MarkerTarget{
+    Buffer{resource:Retained,offset:u64},
+    Host(HostMarker),
+}
 pub(crate) enum Op{
     Sync,
-    Write32{resource:Retained,offset:u64,value:u32},
+    WriteMarker{target:MarkerTarget,value:u64,bytes:usize},
     Copy{dst:Retained,src:Retained,dst_offset:u64,src_offset:u64,len:u64},
     ClearColor{resource:Retained,spec:ImageSpec,rgba:[f32;4]},
     ClearDepth{resource:Retained,spec:ImageSpec,z:f32},
@@ -133,22 +167,32 @@ pub(crate) struct Recording{closed:bool,ops:Vec<Op>,
 
 impl Recording{
     pub(crate) fn push(&mut self,op:Op){if self.closed{stop("recording into closed guest list");}self.ops.push(op);}
-    pub(crate) fn write32(&mut self,address:u64,value:u32,flush:u32,flags:u32){
+    pub(crate) fn write_marker(&mut self,address:u64,value:u64,bytes:usize,flush:u32,flags:u32){
         if self.closed{stop("recording write into closed guest list");}
-        if flags!=0||address%4!=0{
-            stop(format_args!("unsupported write32 flags or alignment: address={address:#x} flush={flush:#x} flags={flags:#x}"));
+        if flags!=0||!matches!(bytes,4|8)||address==0||address%(bytes as u64)!=0{
+            stop(format_args!("unsupported marker flags or alignment: address={address:#x} flush={flush:#x} flags={flags:#x} bytes={bytes}"));
         }
         let location={
             let resources=RESOURCES.lock().unwrap_or_else(|e|e.into_inner());
-            classify_address(&resources,address,4)
+            classify_address(&resources,address,bytes as u64)
         };
-        let AddressClass::Unique{key,offset,..}=location else{
-            stop(format_args!("write32 address {address:#x} is not a unique registered buffer: {location:?} flush={flush:#x} flags={flags:#x}"));
+        let target=match location{
+            AddressClass::Unique{key,offset,..}=>MarkerTarget::Buffer{resource:Retained::new(key as This),offset},
+            AddressClass::Unmapped=>{
+                let mapping=HostMarker::query(address,bytes).unwrap_or_else(||stop(format_args!(
+                    "marker address {address:#x} is neither a registered buffer nor committed writable data memory")));
+                static FIRST_HOST:std::sync::Once=std::sync::Once::new();
+                FIRST_HOST.call_once(||tracing::info!(address,bytes,allocation=mapping.allocation,kind=mapping.kind,"VULKAN_GUEST_HOST_MARKER_RECORDED"));
+                MarkerTarget::Host(mapping)
+            }
+            _=>stop(format_args!("ambiguous or null marker address {address:#x}: {location:?}")),
         };
-        let resource=Retained::new(key as This);
-        self.push(Op::Write32{resource,offset,value});
+        self.push(Op::WriteMarker{target,value,bytes});
         static FIRST:std::sync::Once=std::sync::Once::new();
-        FIRST.call_once(||tracing::info!(address,value,flush,flags,"VULKAN_GUEST_WRITE32_RECORDED"));
+        FIRST.call_once(||tracing::info!(address,value,bytes,flush,flags,"VULKAN_GUEST_WRITE_RECORDED"));
+    }
+    pub(crate) fn write32(&mut self,address:u64,value:u32,flush:u32,flags:u32){
+        self.write_marker(address,u64::from(value),4,flush,flags);
     }
     pub(crate) fn close(&mut self){if self.closed{stop("guest list already closed");}self.closed=true;}
     pub(crate) fn reset(&mut self){self.ops.clear();self.closed=false;self.pipeline=None;self.roots=Default::default();self.heaps.clear();}
@@ -220,19 +264,19 @@ impl Recording{
                     static FIRST:std::sync::Once=std::sync::Once::new();
                     FIRST.call_once(||println!("VULKAN_GUEST_SYNC_OK: native synchronization2 barrier submitted and completed"));
                 }
-                Op::Write32{resource,offset,value}=>{
-                    // Current live backend completes each submitted operation
-                    // synchronously; widen the guest flush to a full GPU sync.
+                Op::WriteMarker{target,value,bytes}=>{
+                    // Never publish a progress value if Vulkan submission failed.
                     let _=call(Task::Sync);
-                    let address=range(resource.get(),*offset,4);
-                    let bytes=value.to_le_bytes();
-                    let mut actual=0usize;
-                    use windows_sys::Win32::System::{Diagnostics::Debug::WriteProcessMemory,Threading::GetCurrentProcess};
-                    if unsafe{WriteProcessMemory(GetCurrentProcess(),address as *mut _,bytes.as_ptr().cast(),bytes.len(),&mut actual)}==0||actual!=bytes.len(){
-                        stop("guest write32 destination is not writable");
-                    }
+                    let address=match target{
+                        MarkerTarget::Buffer{resource,offset}=>range(resource.get(),*offset,*bytes as u64),
+                        MarkerTarget::Host(mapping)=>{
+                            if !mapping.still_valid(*bytes){stop("guest marker mapping changed before completion");}
+                            mapping.address
+                        }
+                    };
+                    if !write_marker_bytes(address,*value,*bytes){stop("guest marker destination is not writable");}
                     static FIRST:std::sync::Once=std::sync::Once::new();
-                    FIRST.call_once(||println!("VULKAN_GUEST_WRITE32_OK: ordered write to registered guest buffer"));
+                    FIRST.call_once(||println!("VULKAN_GUEST_WRITE_OK: ordered {bytes}-byte marker after Vulkan completion"));
                 }
                 Op::Copy{dst,src,dst_offset,src_offset,len}=>copy(dst.get(),src.get(),*dst_offset,*src_offset,*len),
                 Op::ClearColor{resource,spec,rgba}=>{
@@ -248,6 +292,43 @@ impl Recording{
                     let _=call(Task::CopyImage{src:*from,dst:*to});
                 }
             }
+        }
+    }
+}
+fn write_marker_bytes(address:usize,value:u64,bytes:usize)->bool{
+    use windows_sys::Win32::System::{Diagnostics::Debug::WriteProcessMemory,Threading::GetCurrentProcess};
+    if !matches!(bytes,4|8)||address==0||address%bytes!=0{return false;}
+    let data=value.to_le_bytes();
+    let mut actual=0usize;
+    let ok=unsafe{WriteProcessMemory(GetCurrentProcess(),address as *mut _,data.as_ptr().cast(),bytes,&mut actual)};
+    ok!=0&&actual==bytes
+}
+#[cfg(test)]
+mod marker_tests{
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        VirtualAlloc,VirtualFree,MEM_COMMIT,MEM_RESERVE,MEM_RELEASE,PAGE_READWRITE,PAGE_READONLY,
+    };
+    #[test]
+    fn host_marker_requires_writable_mapping_and_preserves_adjacent_word(){
+        unsafe{
+            let p=VirtualAlloc(std::ptr::null(),4096,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+            assert!(!p.is_null());
+            let address=p as usize;
+            let marker=HostMarker::query(address as u64,4).unwrap();
+            assert!(marker.still_valid(4));
+            assert!(HostMarker::query(address as u64+1,4).is_none());
+            assert!(write_marker_bytes(address,0x12345678,4));
+            assert_eq!(p.cast::<u32>().read(),0x12345678);
+            assert_eq!(p.cast::<u32>().add(1).read(),0);
+            assert!(write_marker_bytes(address,0x123456789abcdef0,8));
+            assert_eq!(p.cast::<u64>().read(),0x123456789abcdef0);
+            assert_ne!(VirtualFree(p,0,MEM_RELEASE),0);
+            assert!(!marker.still_valid(4));
+            let q=VirtualAlloc(std::ptr::null(),4096,MEM_COMMIT|MEM_RESERVE,PAGE_READONLY);
+            assert!(!q.is_null());
+            assert!(HostMarker::query(q as u64,4).is_none());
+            assert_ne!(VirtualFree(q,0,MEM_RELEASE),0);
         }
     }
 }
