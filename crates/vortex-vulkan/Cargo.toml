@@ -9,4 +9,4 @@ publish.workspace = true
 
 [dependencies]
 ash = "=0.38.0"
-vortex-shader = { workspace = true, default-features = false }
+vortex-shader = { path = "../vortex-shader", default-features = false }
