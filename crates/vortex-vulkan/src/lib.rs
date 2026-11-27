@@ -67,6 +67,11 @@ impl Context {
         commands::verify_indexed(self,vert,frag)
     }
 
+    /// Verify reusable compute pipelines and ordered dispatches.
+    pub fn verify_dispatch(&mut self,path:&Path) -> Result<()> {
+        commands::verify_dispatch(self,path)
+    }
+
     /// Verify sparse non-uniform runtime descriptor arrays on supported hardware.
     pub fn verify_bindless(&mut self, path: &Path) -> Result<()> {
         descriptors::run_bindless(&self.instance, self.physical, &self.device, self.family, path)
