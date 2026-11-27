@@ -674,7 +674,7 @@ impl<'a> Session<'a> {
         Ok(id)
     }
 
-    /// Compile the uniform native CFG backend and require actual AMD wave size.
+    /// Compile the bounded native CFG backend and require actual AMD wave size.
     pub fn create_native_cfg_pipeline(&mut self,code:&[u8],wave64:bool,vgprs:u16) -> Result<ComputeId> {
         self.ready()?;
         let program = vortex_shader::ir::build(code,wave64,vgprs)?;
