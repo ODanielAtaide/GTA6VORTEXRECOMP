@@ -38,6 +38,7 @@ const TEX:u32=20;
 const DEPTH_PTR:u32=21;
 const DEPTH:u32=22;
 const GLSL:u32=23;
+const TEX_SECOND:u32=31;
 // IDs 24..30 are locations 1..7 of fragment color outputs.
 fn color_id(target:u8)->u32{if target==0{OUTPUT0}else{23+u32::from(target)}}
 
@@ -98,10 +99,11 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
         return Err(err(b.offset,"graphics control flow"));
     }
     let sampled=b.insts.iter().any(|i|matches!(i.fields,Fields::Image{..}));
+    let second_texture=texture_count(p)==2;
     let interp=b.insts.iter().any(|i|matches!(i.fields,Fields::Vintrp{..}));
     let depth=b.insts.iter().any(|i|matches!(i.fields,Fields::Exp{target:8,..}));
     if stage!=Stage::Fragment&&(sampled||interp||depth){return Err(err(0,"fragment-only graphics effect"));}
-    let mut e=Emit{next:31,constants:BTreeMap::new(),declarations:vec![],body:vec![],
+    let mut e=Emit{next:32,constants:BTreeMap::new(),declarations:vec![],body:vec![],
         values:BTreeMap::new(),defined:BTreeSet::new()};
     op(&mut e.body,54,&[VOID,MAIN,0,FN]);op(&mut e.body,248,&[ENTRY]);
     let first=e.value(61,if stage==Stage::Vertex{VEC3}else{VEC4},&[INPUT0]);
@@ -115,6 +117,7 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
             Reg::V(n @ 0..=3) if stage==Stage::Fragment&&!interp=>(first,n),
             Reg::S(124) if interp=>continue,
             Reg::S(4..=15) if sampled=>continue,
+            Reg::S(16..=27) if second_texture=>continue,
             Reg::S(n) if n==EXEC||(p.wave64&&n==EXEC+1)=>{masks.insert(r,v);continue;},
             Reg::V(_) => {
                 // SSA reads an old VGPR even for writes under full EXEC.
@@ -139,7 +142,7 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
         }
         if i.reads.iter().any(|(r,_)|!matches!(r,Reg::V(0..=63))&&!masks.contains_key(r)
             && !(matches!(i.fields,Fields::Vintrp{..})&&*r==Reg::S(124))
-            && !(matches!(i.fields,Fields::Image{..})&&matches!(r,Reg::S(4..=15))))
+            && !(matches!(i.fields,Fields::Image{..})&&(matches!(r,Reg::S(4..=15))||(second_texture&&matches!(r,Reg::S(16..=27))))))
             ||i.writes.iter().any(|(r,_)|!matches!(r,Reg::V(0..=63))){return Err(reject());}
         match &i.fields {
             Fields::Valu(v)=>{
@@ -211,10 +214,13 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
             Fields::Image{data,addr,rsrc,sampler,dmask,dim,unorm,r128,a16,d16,tfe,lwe,cache}=>{
                 let explicit=i.name()=="image_sample_l";
                 if !(explicit||i.name()=="image_sample")||*dim!=1||*dmask==0||*dmask>15||*unorm||*r128
-                    ||*a16||*d16||*tfe||*lwe||cache.glc||cache.slc||cache.dlc
-                    ||*rsrc!=(Operand::Scalar{code:4,dwords:8})
-                    ||*sampler!=Some(Operand::Scalar{code:12,dwords:4}){return Err(reject());}
-                if (4..=15).any(|r|entry_value(Reg::S(r)).is_none()||i.read(Reg::S(r))!=entry_value(Reg::S(r))){return Err(reject());}
+                    ||*a16||*d16||*tfe||*lwe||cache.glc||cache.slc||cache.dlc{return Err(reject());}
+                let (base_s,tex_id)=match (*rsrc,*sampler){
+                    (Operand::Scalar{code:4,dwords:8},Some(Operand::Scalar{code:12,dwords:4}))=>(4,TEX),
+                    (Operand::Scalar{code:16,dwords:8},Some(Operand::Scalar{code:24,dwords:4}))=>(16,TEX_SECOND),
+                    _=>return Err(reject()),
+                };
+                if (base_s..base_s+12).any(|r|entry_value(Reg::S(r)).is_none()||i.read(Reg::S(r))!=entry_value(Reg::S(r))){return Err(reject());}
                 let [Operand::Vector{reg:base,dwords:n}]=addr.as_slice() else{return Err(reject());};
                 if *n!=(if explicit{3}else{2})||*base>61{return Err(reject());}
                 let Operand::Vector{reg:dest,dwords}=*data else{return Err(reject());};
@@ -223,7 +229,7 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
                 let u=e.word(i,Operand::Vector{reg:*base,dwords:1})?;
                 let v=e.word(i,Operand::Vector{reg:*base+1,dwords:1})?;
                 let u=e.float(u);let v=e.float(v);let uv=e.value(80,VEC2,&[u,v]);
-                let tex=e.value(61,SAMPLED,&[TEX]);
+                let tex=e.value(61,SAMPLED,&[tex_id]);
                 let rgba=if explicit{
                     let lod=e.word(i,Operand::Vector{reg:*base+2,dwords:1})?;
                     let lod=e.float(lod);e.value(88,VEC4,&[tex,uv,2,lod])
@@ -281,6 +287,7 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
     if stage==Stage::Fragment{op(&mut out,16,&[MAIN,7]);} // OriginUpperLeft
     if depth{op(&mut out,16,&[MAIN,12]);op(&mut out,71,&[DEPTH,11,22]);}
     if sampled{op(&mut out,71,&[TEX,34,0]);op(&mut out,71,&[TEX,33,0]);}
+    if second_texture{op(&mut out,71,&[TEX_SECOND,34,0]);op(&mut out,71,&[TEX_SECOND,33,1]);}
     op(&mut out,71,&[INPUT0,30,0]);op(&mut out,71,&[OUTPUT0,30,0]);
     if stage==Stage::Vertex{op(&mut out,71,&[INPUT1,30,1]);op(&mut out,71,&[POSITION,11,0]);}
     else{for t in 1..colors as u8{op(&mut out,71,&[color_id(t),30,u32::from(t)]);}}
@@ -298,6 +305,7 @@ pub fn emit_graphics(p:&ir::Program,stage:Stage)->Result<Vec<u32>,ShaderError> {
     if stage==Stage::Vertex{op(&mut out,59,&[IN4,INPUT1,1]);op(&mut out,59,&[OUT4,POSITION,3]);}
     if stage==Stage::Fragment{for t in 1..colors as u8{op(&mut out,59,&[OUT4,color_id(t),3]);}}
     if sampled{op(&mut out,59,&[TEX_PTR,TEX,0]);}
+    if second_texture{op(&mut out,59,&[TEX_PTR,TEX_SECOND,0]);}
     if depth{op(&mut out,59,&[DEPTH_PTR,DEPTH,3]);}
     out.extend(e.body);Ok(out)
 }
@@ -396,6 +404,21 @@ pub fn mrt_fixtures(count:u8,depth:bool)->(Vec<u8>,Vec<u8>){
 }
 /// Report the validated contiguous color export count. Caller must still
 /// compile the same program with emit_graphics before using the result.
+/// Number of fixed sampled resource slots required by this program.
+pub fn texture_count(p:&ir::Program)->usize{
+    p.blocks.iter().flat_map(|b|&b.insts).filter_map(|i|match i.fields{
+        Fields::Image{rsrc:Operand::Scalar{code:16,..},..}=>Some(2),
+        Fields::Image{..}=>Some(1),_=>None
+    }).max().unwrap_or(0)
+}
+pub fn dual_texture_fixtures()->(Vec<u8>,Vec<u8>){
+    let(v,_)=texture_fixtures(false,false);
+    let words=[0xc810_0000u32,0xc811_0001,0xc814_0100,0xc815_0101,
+        0xf080_0f08,0x0061_0804,0xbf8c_0000,
+        0xf080_0f08,0x00c4_0c04,0xbf8c_0000,
+        0xf800_080f,0x0b0a_0d08,0xbf81_0000];
+    (v,words.into_iter().flat_map(u32::to_le_bytes).collect())
+}
 pub fn color_export_count(p:&ir::Program)->u32{
     p.blocks.iter().flat_map(|b|&b.insts).filter_map(|i|match i.fields{
         Fields::Exp{target: t @ 0..=7,..}=>Some(t),_=>None
@@ -419,6 +442,14 @@ mod tests {
             let (v,f)=mip_fixtures(lod,packed);assert!(extra_modules(&v,&f).is_ok());
         }}
         let (v,f)=math_fixtures();assert!(extra_modules(&v,&f).is_ok());
+    }
+    #[test]
+    fn two_texture_modules_emit(){
+        let(v,f)=dual_texture_fixtures();
+        let p=ir::build(&f,false,16).unwrap();
+        assert_eq!(texture_count(&p),2);
+        assert!(emit_graphics(&p,Stage::Fragment).is_ok());
+        assert!(emit_graphics(&ir::build(&v,false,8).unwrap(),Stage::Vertex).is_ok());
     }
     #[test]
     fn multiple_render_targets_emit(){
