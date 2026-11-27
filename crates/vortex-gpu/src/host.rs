@@ -6640,7 +6640,22 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            // Do not count rejected or occluded presents as a displayed frame.
+            // The first successful host present is a separate milestone from
+            // guest PresentX calls, which may have no usable source resource.
+            let hr = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if hr.is_err() {
+                tracing::error!(frame, width, height, error = ?hr, "DXGI Present failed");
+                return None;
+            }
+            if hr.0 != 0 {
+                tracing::warn!(frame, status = ?hr, "DXGI Present returned non-S_OK status");
+                return None;
+            }
+            static FIRST_PRESENT: std::sync::Once = std::sync::Once::new();
+            FIRST_PRESENT.call_once(|| {
+                tracing::info!(frame, width, height, "FIRST_HOST_PRESENT_OK (D3D12/DXGI)");
+            });
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
