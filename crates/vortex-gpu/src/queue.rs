@@ -38,6 +38,8 @@ struct Queue {
     /// reached, in order; it runs when the fence gets there.
     #[cfg(windows)]
     held: std::sync::Mutex<Vec<Held>>,
+    #[cfg(all(windows,feature = "vulkan"))]
+    live_id:u64,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
@@ -447,6 +449,8 @@ pub(crate) extern "system" fn create(
         return E_INVALIDARG;
     };
     tracing::debug!(?desc, "command queue");
+    #[cfg(all(windows,feature = "vulkan"))]
+    static NEXT_LIVE_ID:AtomicU64=AtomicU64::new(1);
     let queue = Box::new(Queue {
         object: if crate::device::newer() {
             Object::new(&NEWER_FUNCTIONS)
@@ -457,6 +461,8 @@ pub(crate) extern "system" fn create(
         desc,
         #[cfg(windows)]
         held: Default::default(),
+        #[cfg(all(windows,feature = "vulkan"))]
+        live_id:NEXT_LIVE_ID.fetch_add(1,Ordering::Relaxed),
     });
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
@@ -518,9 +524,11 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if crate::vulkan_live::enabled(){
         if count==0{return;}
         if lists.is_null()||count>1_048_576{crate::vulkan_live::stop("invalid live submission");}
-        let _lock=crate::vulkan_live::submit_lock();
+        if this.is_null(){crate::vulkan_live::stop("null guest queue");}
         let lists=unsafe{std::slice::from_raw_parts(lists,count as usize)};
-        for &list in lists{crate::list::execute_live(list);}
+        let mut ops=Vec::new();
+        for &list in lists{ops.extend(crate::list::snapshot_live(list));}
+        crate::vulkan_live::submit(queue(this).live_id,ops);
         return;
     }
     if lists.is_null() {
@@ -625,8 +633,8 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     #[cfg(all(windows,feature = "vulkan"))]
     if crate::vulkan_live::enabled(){
-        let _lock=crate::vulkan_live::submit_lock();
-        crate::fence::set(fence,value);return S_OK;
+        if this.is_null(){return E_INVALIDARG;}
+        crate::vulkan_live::queue_signal(queue(this).live_id,fence,value);return S_OK;
     }
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
@@ -655,7 +663,8 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     }
     #[cfg(all(windows,feature = "vulkan"))]
     if crate::vulkan_live::enabled(){
-        if crate::fence::completed(fence)<value{crate::vulkan_live::stop("pending cross-queue guest fence wait not ported");}
+        if this.is_null(){return E_INVALIDARG;}
+        crate::vulkan_live::queue_wait(queue(this).live_id,fence,value);
         return S_OK;
     }
     #[cfg(windows)]
@@ -774,7 +783,7 @@ pub(crate) fn presented() -> u64 {
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
 extern "system" fn present(
-    _: This,
+    _this: This,
     planes: u32,
     plane_parameters: *const Plane,
     _parameters: *const u8,
@@ -784,7 +793,8 @@ extern "system" fn present(
         if planes!=1||plane_parameters.is_null(){crate::vulkan_live::stop("unsupported guest present planes");}
         let plane=unsafe{&*plane_parameters};
         if plane.count!=1||plane.resources.is_null(){crate::vulkan_live::stop("unsupported guest present source count");}
-        crate::vulkan_live::present(unsafe{*plane.resources});
+        if _this.is_null(){return E_INVALIDARG;}
+        crate::vulkan_live::queue_present(queue(_this).live_id,unsafe{*plane.resources});
         return S_OK;
     }
     #[cfg(all(windows, feature = "diagnostics"))]
