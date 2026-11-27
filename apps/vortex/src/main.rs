@@ -100,6 +100,9 @@ enum Command {
         /// Reanalyze containers instead of using the metadata cache.
         #[arg(long)]
         refresh: bool,
+        /// Restrict the scan to EXE, DLL and SGD5 files; skip opaque archives.
+        #[arg(long)]
+        code_only: bool,
     },
     /// Verify the shared Vulkan host library from the main executable.
     #[cfg(feature = "vulkan")]
@@ -223,8 +226,8 @@ fn main() -> Result<()> {
             translate::run(paths, validate, pipelines, list, jobs)
         }
         #[cfg(feature = "vulkan")]
-        Command::VulkanPrecompile { game_dir, workers, validate, refresh } =>
-            precompile::run(&game_dir, workers, validate, refresh),
+        Command::VulkanPrecompile { game_dir, workers, validate, refresh, code_only } =>
+            precompile::run(&game_dir, workers, validate, refresh, code_only),
         #[cfg(feature = "vulkan")]
         Command::VulkanCheck { bindless_shader, async_check } => {
             let mut host = vortex_vulkan::Context::new()

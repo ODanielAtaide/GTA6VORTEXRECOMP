@@ -4,6 +4,7 @@ param(
     [ValidateRange(1,8)][int]$Workers = 6,
     [string]$BackupDirectory = "C:\GTA6VORTEXRECOMP_BACKUPS",
     [switch]$Refresh,
+    [switch]$CodeOnly,
     [switch]$Launch
 )
 $ErrorActionPreference = "Stop"
@@ -42,6 +43,7 @@ if (Get-Command spirv-val -ErrorAction SilentlyContinue) {
     Write-Warning "spirv-val nao encontrado; analise sem validacao SPIR-V"
 }
 if ($Refresh) { $scanArgs += "--refresh" }
+if ($CodeOnly) { $scanArgs += "--code-only" }
 $env:RUST_LOG = "warn"
 & $binary @scanArgs
 Check "Falha na analise previa"

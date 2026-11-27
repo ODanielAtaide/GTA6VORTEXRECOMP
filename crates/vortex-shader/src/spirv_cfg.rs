@@ -73,7 +73,7 @@ impl Emit {
             Operand::Const(n @ 128..=192)=>Ok(self.c(u32::from(n-128))),
             Operand::Const(n @ 193..=208)=>Ok(self.c(0u32.wrapping_sub(u32::from(n-192)))),
             Operand::Scalar{code,dwords:1} if scalar(code)&&!(self.multi&&second_descriptor(Reg::S(code)))=>self.reg(Reg::S(code)),
-            Operand::Vector{reg,dwords:1} if reg<=31=>self.reg(Reg::V(reg)),
+            Operand::Vector{reg,dwords:1}=>self.reg(Reg::V(reg)),
             _=>Err(unsupported(0,"CFG operand")),
         }
     }
@@ -132,14 +132,14 @@ impl Emit {
     fn end_guard(&mut self,merge:u32) { self.op(249,&[merge]);self.op(248,&[merge]); }
 }
 fn scalar(r:u8)->bool { (r<=105 && !(4..=7).contains(&r)) || r==VCC || r==VCC+1 }
-fn ordinary(r:Reg)->bool { matches!(r,Reg::S(n) if scalar(n)) || matches!(r,Reg::Scc|Reg::V(0..=31)) }
+fn ordinary(r:Reg)->bool { matches!(r,Reg::S(n) if scalar(n)) || matches!(r,Reg::Scc|Reg::V(_)) }
 fn descriptor(r:Reg)->bool { matches!(r,Reg::S(4..=7)) }
 fn second_descriptor(r:Reg)->bool { matches!(r,Reg::S(8..=11)) }
 fn exec(r:Reg)->bool { matches!(r,Reg::S(n) if n==EXEC||n==EXEC+1) }
 fn writes(inst:&ir::Inst,expected:&[Reg])->bool {
     inst.writes.len()==expected.len() && expected.iter().all(|r|inst.write(*r).is_some())
 }
-fn vector(o:Operand)->Option<u8> { match o { Operand::Vector{reg,dwords:1} if reg<=31=>Some(reg),_=>None } }
+fn vector(o:Operand)->Option<u8> { match o { Operand::Vector{reg,dwords:1}=>Some(reg),_=>None } }
 
 fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
     let err=||unsupported(i.machine.offset,"native CFG instruction or operand");
@@ -246,7 +246,8 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
         }
         Fields::Valu(v)=>{
             let mbcnt=matches!(name,"v_mbcnt_lo_u32_b32"|"v_mbcnt_hi_u32_b32");
-            if !(matches!(i.machine.encoding,Encoding::Vop1|Encoding::Vop2|Encoding::Vopc)||mbcnt)
+            let integer_vop3=matches!(name,"v_lshl_add_u32"|"v_lshl_or_b32"|"v_add_lshl_u32"|"v_and_or_b32"|"v_or3_b32"|"v_add3_u32"|"v_xor3_b32"|"v_mul_lo_u32"|"v_min_u32"|"v_max_u32"|"v_bcnt_u32_b32"|"v_subrev_nc_u32");
+            if !(matches!(i.machine.encoding,Encoding::Vop1|Encoding::Vop2|Encoding::Vopc)||mbcnt||integer_vop3)
                 || v.carry.is_some() || v.neg!=0 || v.abs!=0 || v.neg_hi!=0 || v.opsel!=0
                 || v.opsel_hi!=0 || v.clamp || v.omod!=0 || v.sdwa.is_some() || v.dpp.is_some() {
                 return Err(err());
@@ -297,6 +298,26 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
                 ("v_and_b32",&[a,b])=>e.u(199,a,b),
                 ("v_or_b32",&[a,b])=>e.u(197,a,b),
                 ("v_xor_b32",&[a,b])=>e.u(198,a,b),
+                ("v_subrev_nc_u32",&[a,b])=>e.u(130,b,a),
+                ("v_mul_lo_u32",&[a,b])=>e.u(132,a,b),
+                ("v_min_u32"|"v_max_u32",&[a,b])=>{
+                    let cond=e.test(if name=="v_min_u32"{176}else{172},a,b);
+                    e.select(cond,a,b)
+                }
+                ("v_bcnt_u32_b32",&[a,b])=>{
+                    let count=e.value(205,UINT,&[a]);e.u(128,count,b)
+                }
+                ("v_lshl_add_u32"|"v_lshl_or_b32",&[a,b,c])=>{
+                    let mask=e.c(31);let shift=e.u(199,b,mask);let t=e.u(196,a,shift);
+                    e.u(if name=="v_lshl_add_u32"{128}else{197},t,c)
+                }
+                ("v_add_lshl_u32",&[a,b,c])=>{
+                    let sum=e.u(128,a,b);let mask=e.c(31);let shift=e.u(199,c,mask);e.u(196,sum,shift)
+                }
+                ("v_and_or_b32"|"v_or3_b32"|"v_add3_u32"|"v_xor3_b32",&[a,b,c])=>{
+                    let (first,second)=match name{"v_and_or_b32"=>(199,197),"v_or3_b32"=>(197,197),"v_add3_u32"=>(128,128),_=>(198,198)};
+                    let t=e.u(first,a,b);e.u(second,t,c)
+                }
                 ("v_lshlrev_b32"|"v_lshrrev_b32",&[a,b])=>{
                     let m=e.c(31);let n=e.u(199,a,m);e.u(if name=="v_lshlrev_b32"{196}else{194},b,n)
                 }
@@ -317,7 +338,7 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
             let Some(Operand::Vector{reg,dwords})=*data else{return Err(err());};
             let atomic=name.starts_with("buffer_atomic_");
             let cmp=name=="buffer_atomic_cmpswap";
-            if reg==0 || reg>31 || dwords!=(if cmp{2}else{1}) || (cmp&&reg==31) {return Err(err());}
+            if reg==0 || dwords!=(if cmp{2}else{1}) || (cmp&&reg==u8::MAX) {return Err(err());}
             let r=Reg::V(reg);
             let expected=if name=="buffer_load_dword" || (atomic&&cache.glc){vec![r]}else{vec![]};
             if !writes(i,&expected){return Err(err());}
@@ -392,11 +413,14 @@ pub fn emit_cfg(p:&ir::Program)->Result<Vec<u32>,ShaderError> { emit_cfg_inner(p
 pub fn emit_cfg_two_resources(p:&ir::Program)->Result<Vec<u32>,ShaderError> { emit_cfg_inner(p,true) }
 
 fn emit_cfg_inner(p:&ir::Program,multi:bool)->Result<Vec<u32>,ShaderError> {
-    if p.blocks.is_empty()||p.blocks.len()>256||p.vgprs>32
-        || p.blocks.iter().map(|b|b.insts.len()).sum::<usize>()>4096 {
-        return Err(unsupported(0,"CFG size"));
+    if p.blocks.is_empty()||p.blocks.len()>1024 {
+        return Err(unsupported(0,"CFG block count"));
     }
-    if p.inputs.iter().any(|(r,_)|!matches!(r,Reg::S(0..=1)|Reg::V(0..=31))&&!descriptor(*r)&&!(multi&&second_descriptor(*r))&&!exec(*r)){
+    if p.vgprs>256 {return Err(unsupported(0,"CFG VGPR count"));}
+    if p.blocks.iter().map(|b|b.insts.len()).sum::<usize>()>16384{
+        return Err(unsupported(0,"CFG instruction count"));
+    }
+    if p.inputs.iter().any(|(r,_)|!matches!(r,Reg::S(0..=1)|Reg::V(_))&&!descriptor(*r)&&!(multi&&second_descriptor(*r))&&!exec(*r)){
         return Err(unsupported(0,"undeclared CFG input"));
     }
     // MBCNT can overwrite v0. The fixture storage ABI may only use the

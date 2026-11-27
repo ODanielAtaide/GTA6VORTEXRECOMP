@@ -220,7 +220,7 @@ fn section(w:&mut impl Write,name:&str,values:&Counts)->Result<()>{
     for (key,count) in rows{writeln!(w,"{count:>9}  {key}")?;}
     Ok(())
 }
-pub fn run(root:&Path,workers:usize,validate:bool,refresh:bool)->Result<()>{
+pub fn run(root:&Path,workers:usize,validate:bool,refresh:bool,code_only:bool)->Result<()>{
     anyhow::ensure!((1..=8).contains(&workers),"workers must be 1..=8");
     let root=fs::canonicalize(root)?;
     anyhow::ensure!(root.is_dir(),"game-dir must be a directory");
@@ -258,16 +258,20 @@ pub fn run(root:&Path,workers:usize,validate:bool,refresh:bool)->Result<()>{
     let report=cache_base.join(format!("report-{stamp}-{}",std::process::id()));
     vortex_core::ensure_outside_repo(&report)?;
     fs::create_dir(&report)?;
-    let mut files=Vec::new();let mut walk_errors=Vec::new();
+    let mut files=Vec::new();let mut walk_errors=Vec::new();let mut excluded=0usize;
     for entry in walkdir::WalkDir::new(&root).follow_links(false){
         match entry{
-            Ok(e) if e.file_type().is_file()=>files.push(e.into_path()),
+            Ok(e) if e.file_type().is_file()=>{
+                let selected=!code_only||e.path().extension().and_then(|v|v.to_str()).is_some_and(|v|
+                    ["exe","dll","sgd5"].iter().any(|ext|v.eq_ignore_ascii_case(ext)));
+                if selected{files.push(e.into_path());}else{excluded+=1;}
+            }
             Ok(_)=>{},
             Err(e)=>walk_errors.push(e.to_string()),
         }
     }
     files.sort();
-    println!("VULKAN_PRECOMPILE_START files={} workers={workers} report={}",files.len(),report.display());
+    println!("VULKAN_PRECOMPILE_START files={} excluded={excluded} code_only={code_only} workers={workers} report={}",files.len(),report.display());
     let shared=Shared{cache,validate,refresh,seen:Mutex::new(BTreeMap::new()),totals:Mutex::new(Analysis::default()),
         duplicates:AtomicUsize::new(0),hits:AtomicUsize::new(0),unique:AtomicUsize::new(0)};
     let next=AtomicUsize::new(0);
@@ -306,7 +310,7 @@ pub fn run(root:&Path,workers:usize,validate:bool,refresh:bool)->Result<()>{
     let totals=shared.totals.into_inner().unwrap_or_else(|e|e.into_inner());
     let unique=shared.unique.load(Ordering::Relaxed);let duplicates=shared.duplicates.load(Ordering::Relaxed);let hits=shared.hits.load(Ordering::Relaxed);
     let mut w=BufWriter::new(File::create(report.join("report.txt"))?);
-    writeln!(w,"VULKAN OFFLINE COVERAGE (not playable compatibility)\nfiles={} read_errors={errors} walk_errors={}\nfile_bytes={total_bytes} scanned_bytes={read_bytes}\nraw_containers={raw} packed_containers={packed} unique_containers={unique} duplicates={duplicates} metadata_cache_hits={hits}\nprograms={} decoded={} IR={} resource_tracking={} stage_io={} structured={}\ndiagnostic_SPIRV_candidates={} validator_passed={} guest_pipelines_ready=0\nOpaque/unsupported archives and runtime-created pipeline states are not resolved. Candidate modules use fixture ABI and must not execute guest work.",
+    writeln!(w,"VULKAN OFFLINE COVERAGE (not playable compatibility)\ncode_only={code_only} excluded_files={excluded}\nfiles={} read_errors={errors} walk_errors={}\nfile_bytes={total_bytes} scanned_bytes={read_bytes}\nraw_containers={raw} packed_containers={packed} unique_containers={unique} duplicates={duplicates} metadata_cache_hits={hits}\nprograms={} decoded={} IR={} resource_tracking={} stage_io={} structured={}\ndiagnostic_SPIRV_candidates={} validator_passed={} guest_pipelines_ready=0\nOpaque/unsupported archives and runtime-created pipeline states are not resolved. Candidate modules use fixture ABI and must not execute guest work.",
         files.len(),walk_errors.len(),totals.programs,totals.decoded,totals.ir_ok,totals.resources_ok,totals.io_ok,totals.structured,totals.candidate,totals.validated)?;
     for e in &walk_errors{writeln!(w,"walk error: {}",clean(e))?;}
     section(&mut w,"Hardware stages",&totals.stages)?;
