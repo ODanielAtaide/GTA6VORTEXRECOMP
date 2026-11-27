@@ -477,8 +477,11 @@ fn emit_cfg_inner(p:&ir::Program,multi:bool)->Result<Vec<u32>,ShaderError> {
     }
     let entry=e.id();e.op(54,&[1,MAIN,0,2]);e.op(248,&[entry]);
     for r in used {let id=e.id();e.regs.insert(r,id);e.op(59,&[FUNCTION_PTR,id,7]);}
-    e.pc=e.id();e.op(59,&[FUNCTION_PTR,e.pc,7]);
-    e.budget=e.id();e.op(59,&[FUNCTION_PTR,e.budget,7]);
+    let straight = p.blocks.len() == 1 && p.blocks[0].exit == Exit::End;
+    if !straight {
+        e.pc=e.id();e.op(59,&[FUNCTION_PTR,e.pc,7]);
+        e.budget=e.id();e.op(59,&[FUNCTION_PTR,e.budget,7]);
+    }
     e.active=e.id();e.op(59,&[FUNCTION_PTR,e.active,7]);
     let global=e.value(61,5,&[GLOBAL]);
     e.global_index=e.value(81,UINT,&[global,0]);
@@ -494,55 +497,63 @@ fn emit_cfg_inner(p:&ir::Program,multi:bool)->Result<Vec<u32>,ShaderError> {
             _=>e.c(0),
         };e.put(r,val)?;
     }
-    let zero=e.c(0);let one=e.c(1);let stop=e.c(u32::MAX);let cap=e.c(4096);
-    e.op(62,&[e.pc,zero]);e.op(62,&[e.budget,cap]);e.op(62,&[e.active,one]);
-    let header=e.id();let dispatch=e.id();let cont=e.id();let end=e.id();let join=e.id();let default=e.id();
-    let labels:Vec<u32>=(0..p.blocks.len()).map(|_|e.id()).collect();
-    e.op(249,&[header]);e.op(248,&[header]);
-    let pc=e.load(e.pc);let budget=e.load(e.budget);
-    let live=e.test(171,pc,stop);let remaining=e.test(171,budget,zero);
-    let cond=e.value(167,BOOL,&[live,remaining]);
-    e.op(246,&[end,cont,0]);e.op(250,&[cond,dispatch,end]);
-    e.op(248,&[dispatch]);e.op(247,&[join,0]);
-    let mut cases=vec![pc,default];
-    for (i,&label) in labels.iter().enumerate(){cases.extend([i as u32,label]);}
-    e.op(251,&cases);
-    for (b,&label) in p.blocks.iter().zip(&labels) {
-        e.op(248,&[label]);
-        for i in &b.insts {lower(&mut e,i)?;}
-        let next=match b.exit {
-            Exit::End=>stop,
-            Exit::Jump(n)=>e.c(n as u32),
-            Exit::Branch{taken,not_taken}=>{
-                let last=b.insts.last().ok_or(unsupported(b.offset,"empty branch"))?;
-                let cond=match last.name() {
-                    "s_cbranch_scc0"|"s_cbranch_scc1"=>{
-                        let scc=e.reg(Reg::Scc)?;
-                        e.test(if last.name()=="s_cbranch_scc0"{170}else{171},scc,zero)
-                    }
-                    "s_cbranch_vccz"|"s_cbranch_vccnz"=>{
-                        let lo=e.reg(Reg::S(VCC))?;
-                        let hi=if e.wave64{e.reg(Reg::S(VCC+1))?}else{zero};
-                        let mask=e.u(197,lo,hi);
-                        e.test(if last.name()=="s_cbranch_vccz"{170}else{171},mask,zero)
-                    }
-                    "s_cbranch_execz"|"s_cbranch_execnz"=>{
-                        let active=e.active_condition();let scope=e.c(3);
-                        let any=e.value(335,BOOL,&[scope,active]);
-                        if last.name()=="s_cbranch_execz"{e.value(168,BOOL,&[any])}else{any}
-                    }
-                    _=>return Err(unsupported(b.offset,"unsupported branch condition")),
-                };
-                let yes=e.c(taken as u32);let no=e.c(not_taken as u32);e.select(cond,yes,no)
-            }
-            Exit::Indirect=>return Err(unsupported(b.offset,"indirect branch")),
-        };
-        e.op(62,&[e.pc,next]);e.op(249,&[join]);
+    let one=e.c(1);e.op(62,&[e.active,one]);
+    if straight {
+        // No synthetic program counter, switch, or visit budget is needed.
+        // Instruction-local guards and EXEC semantics remain identical.
+        for i in &p.blocks[0].insts { lower(&mut e,i)?; }
+    } else {
+        let zero=e.c(0);let stop=e.c(u32::MAX);let cap=e.c(4096);
+        e.op(62,&[e.pc,zero]);e.op(62,&[e.budget,cap]);
+        let header=e.id();let dispatch=e.id();let cont=e.id();let end=e.id();let join=e.id();let default=e.id();
+        let labels:Vec<u32>=(0..p.blocks.len()).map(|_|e.id()).collect();
+        e.op(249,&[header]);e.op(248,&[header]);
+        let pc=e.load(e.pc);let budget=e.load(e.budget);
+        let live=e.test(171,pc,stop);let remaining=e.test(171,budget,zero);
+        let cond=e.value(167,BOOL,&[live,remaining]);
+        e.op(246,&[end,cont,0]);e.op(250,&[cond,dispatch,end]);
+        e.op(248,&[dispatch]);e.op(247,&[join,0]);
+        let mut cases=vec![pc,default];
+        for (i,&label) in labels.iter().enumerate(){cases.extend([i as u32,label]);}
+        e.op(251,&cases);
+        for (b,&label) in p.blocks.iter().zip(&labels) {
+            e.op(248,&[label]);
+            for i in &b.insts {lower(&mut e,i)?;}
+            let next=match b.exit {
+                Exit::End=>stop,
+                Exit::Jump(n)=>e.c(n as u32),
+                Exit::Branch{taken,not_taken}=>{
+                    let last=b.insts.last().ok_or(unsupported(b.offset,"empty branch"))?;
+                    let cond=match last.name() {
+                        "s_cbranch_scc0"|"s_cbranch_scc1"=>{
+                            let scc=e.reg(Reg::Scc)?;
+                            e.test(if last.name()=="s_cbranch_scc0"{170}else{171},scc,zero)
+                        }
+                        "s_cbranch_vccz"|"s_cbranch_vccnz"=>{
+                            let lo=e.reg(Reg::S(VCC))?;
+                            let hi=if e.wave64{e.reg(Reg::S(VCC+1))?}else{zero};
+                            let mask=e.u(197,lo,hi);
+                            e.test(if last.name()=="s_cbranch_vccz"{170}else{171},mask,zero)
+                        }
+                        "s_cbranch_execz"|"s_cbranch_execnz"=>{
+                            let active=e.active_condition();let scope=e.c(3);
+                            let any=e.value(335,BOOL,&[scope,active]);
+                            if last.name()=="s_cbranch_execz"{e.value(168,BOOL,&[any])}else{any}
+                        }
+                        _=>return Err(unsupported(b.offset,"unsupported branch condition")),
+                    };
+                    let yes=e.c(taken as u32);let no=e.c(not_taken as u32);e.select(cond,yes,no)
+                }
+                Exit::Indirect=>return Err(unsupported(b.offset,"indirect branch")),
+            };
+            e.op(62,&[e.pc,next]);e.op(249,&[join]);
+        }
+        e.op(248,&[default]);e.op(62,&[e.pc,stop]);e.op(249,&[join]);
+        e.op(248,&[join]);e.op(249,&[cont]);e.op(248,&[cont]);
+        let budget=e.load(e.budget);let next=e.u(130,budget,one);e.op(62,&[e.budget,next]);e.op(249,&[header]);
+        e.op(248,&[end]);
     }
-    e.op(248,&[default]);e.op(62,&[e.pc,stop]);e.op(249,&[join]);
-    e.op(248,&[join]);e.op(249,&[cont]);e.op(248,&[cont]);
-    let budget=e.load(e.budget);let next=e.u(130,budget,one);e.op(62,&[e.budget,next]);e.op(249,&[header]);
-    e.op(248,&[end]);e.op(253,&[]);e.op(56,&[]);
+    e.op(253,&[]);e.op(56,&[]);
     // Module layout: declarations, constants, globals, then function.
     let mut out=vec![0x07230203,0x00010300,0,e.next,0];
     let o=|out:&mut Vec<u32>,op,a:&[u32]|inst(out,op,a);
@@ -573,6 +584,27 @@ fn emit_cfg_inner(p:&ir::Program,multi:bool)->Result<Vec<u32>,ShaderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn has_opcode(words: &[u32], opcode: u32) -> bool {
+        let mut pos = 5;
+        while pos < words.len() {
+            let count = (words[pos] >> 16) as usize;
+            assert!(count > 0 && count <= words.len() - pos);
+            if words[pos] & 0xffff == opcode { return true; }
+            pos += count;
+        }
+        false
+    }
+    #[test]
+    fn straight_line_skips_dispatcher() {
+        let code: Vec<u8> = [0x4a02_0200u32, 0x3a04_0201, 0xbf81_0000]
+            .into_iter().flat_map(u32::to_le_bytes).collect();
+        let p = ir::build(&code, false, 4).unwrap();
+        assert_eq!(p.blocks.len(), 1);
+        let words = emit_cfg(&p).unwrap();
+        assert_eq!(words[0], 0x07230203);
+        assert!(!has_opcode(&words, 246)); // OpLoopMerge
+        assert!(!has_opcode(&words, 251)); // OpSwitch
+    }
     #[test]
     fn native_loop_and_branch_emit() {
         let code:Vec<u8>=[0xbe82_0380u32,0xbe83_0380,0xbf09_0003,0xbf85_0003,
@@ -580,7 +612,10 @@ mod tests {
             0xe070_2000,0x8001_0300,0xbf81_0000].into_iter().flat_map(u32::to_le_bytes).collect();
         let p=ir::build(&code,false,4).unwrap();
         assert!(p.blocks.len()>1);
-        assert_eq!(emit_cfg(&p).unwrap()[0],0x07230203);
+        let words = emit_cfg(&p).unwrap();
+        assert_eq!(words[0],0x07230203);
+        assert!(has_opcode(&words, 246));
+        assert!(has_opcode(&words, 251));
         assert!(diagnose_instructions(&p).is_empty());
     }
 }
