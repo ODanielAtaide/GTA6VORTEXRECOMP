@@ -63,7 +63,8 @@ impl Context {
 
     /// Verify the reusable graphics pipeline with trusted fixture SPIR-V.
     pub fn verify_draws(&mut self,vert:&Path,frag:&Path) -> Result<()> {
-        commands::verify_draws(self,vert,frag)
+        commands::verify_draws(self,vert,frag)?;
+        commands::verify_indexed(self,vert,frag)
     }
 
     /// Verify sparse non-uniform runtime descriptor arrays on supported hardware.
