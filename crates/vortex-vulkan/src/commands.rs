@@ -593,6 +593,23 @@ impl<'a> Session<'a> {
         Ok(id)
     }
 
+    /// Decode native GFX10 words, build SSA, and lower the supported diagnostic
+    /// subset directly to SPIR-V. This is not a general shader ABI: scalar
+    /// programs must be closed and vector programs use the documented synthetic
+    /// v0/v1/v2/EXEC inputs. Unsupported instructions are returned as errors,
+    /// before creating Vulkan objects.
+    pub fn create_native_compute_pipeline(&mut self,code:&[u8],wave64:bool,vgprs:u16,
+                                          output:vortex_shader::ir::Reg) -> Result<ComputeId> {
+        use vortex_shader::{ir,spirv_scalar,spirv_vector};
+        self.ready()?;
+        let program = ir::build(code,wave64,vgprs)?;
+        let words = match output {
+            ir::Reg::S(_) | ir::Reg::Scc => spirv_scalar::emit_scalar(&program,output)?,
+            ir::Reg::V(_) => spirv_vector::emit_vector(&program,output)?,
+        };
+        self.create_compute_pipeline(&words)
+    }
+
     pub fn create_compute_binding(&mut self,pipeline:ComputeId,buffer:BufferId,offset:u64,bytes:u64) -> Result<ComputeBindingId> {
         self.ready()?;
         let p = self.compute_pipeline(pipeline)?;
@@ -1217,6 +1234,60 @@ pub(crate) fn verify_dispatch(context:&mut Context,path:&std::path::Path) -> Res
     s.destroy_buffer(b)?;
     println!("PASS: dispatch bounds and compute resource lifetime validation");
     println!("PASS: reusable Vulkan compute pipeline and dispatch executor verified");
+    Ok(())
+}
+
+/// End-to-end native instruction decoding through the reusable session.
+/// These original fixtures deliberately exercise only the supported diagnostic
+/// ABI; the reference functions do not depend on generated SPIR-V.
+pub(crate) fn verify_native_dispatch(context:&mut Context) -> Result<()> {
+    use vortex_shader::ir::Reg;
+    const N:usize = 1_048_576;
+    const BYTES:u64 = N as u64*4;
+    let mut s = Session::new(context)?;
+    let local = s.create_buffer(BYTES,MemoryKind::DeviceLocal)?;
+    let output = s.create_buffer(BYTES,MemoryKind::HostVisible)?;
+    let scalar = [0xbe80_0385u32,0xbe81_0387,0x8002_0100,0x8903_8302,0xbf81_0000];
+    let vector = [0x7e02_0300u32,0x4a02_0287,0x3a04_0283,0x3404_0481,0x4c04_04c0,0xbf81_0000];
+    let encode = |words:&[u32]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
+    let scalar_code = encode(&scalar);
+    let vector_code = encode(&vector);
+    for (label,code,wave64,vgprs,reg) in [
+        ("scalar",scalar_code.as_slice(),false,0,Reg::S(3)),
+        ("vector32 logical lanes",vector_code.as_slice(),false,3,Reg::V(2)),
+        ("vector64 logical lanes",vector_code.as_slice(),true,3,Reg::V(2)),
+    ] {
+        let started = std::time::Instant::now();
+        let p = s.create_native_compute_pipeline(code,wave64,vgprs,reg)?;
+        let compile_ms = started.elapsed().as_secs_f64()*1000.;
+        let binding = s.create_compute_binding(p,local,0,BYTES)?;
+        let epoch = s.submit(&[
+            Command::Fill { dst:local,offset:0,bytes:BYTES,value:0xdeadbeef },
+            Command::Dispatch { binding,groups:N as u32/COMPUTE_LANES,constants:[0,0] },
+            Command::Copy { src:local,src_offset:0,dst:output,dst_offset:0,bytes:BYTES },
+        ])?;
+        let actual = s.read_words(output,0,N)?;
+        for (i,&v) in actual.iter().enumerate() {
+            let i = i as u32;
+            let expected = match reg {
+                Reg::S(3) => 15,
+                _ if if wave64 { (i&1==0)==(i&32==0) } else { i&1==0 } =>
+                    64u32.wrapping_sub(((i+7)^3)<<1),
+                _ => 0xcafe_babe,
+            };
+            if v != expected { return Err(format!("{label}: mismatch at {i}: {v:#x} != {expected:#x}").into()); }
+        }
+        println!("PASS: {label}: decoded GFX10 -> SSA -> SPIR-V -> Vulkan Dispatch; {N} words; pipeline {:.3} ms; timeline {epoch}",compile_ms);
+        s.destroy_compute_binding(binding)?;
+        s.destroy_compute_pipeline(p)?;
+    }
+    // Live scalar input is outside the closed scalar diagnostic ABI.
+    let unsupported = encode(&[0xbe80_0301,0xbf81_0000]);
+    if s.create_native_compute_pipeline(&unsupported,false,0,Reg::S(0)).is_ok() {
+        return Err("unsupported native shader was accepted".into());
+    }
+    println!("PASS: unsupported native shader rejected before pipeline creation");
+    println!("PASS: native GFX10 diagnostic compiler integrated with Vulkan command executor");
     Ok(())
 }
 
