@@ -23,7 +23,7 @@ walkdir.workspace = true
 
 [features]
 # Experimental Vulkan host library, separate from the legacy title renderer.
-vulkan = ["dep:vortex-vulkan"]
+vulkan = ["dep:vortex-vulkan", "vortex-hle/vulkan"]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.
 diagnostics = [

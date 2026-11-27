@@ -122,7 +122,7 @@ enum Command {
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
-        /// Graphics backend. Vulkan title execution remains unavailable.
+        /// Graphics backend. Vulkan is experimental and stops at unsupported live calls.
         #[arg(long, value_enum, default_value_t = Backend::D3d12)]
         backend: Backend,
         /// What unimplemented imports do when called.
@@ -276,7 +276,13 @@ fn main() -> Result<()> {
             title_args: _,
         } => {
             if matches!(backend, Backend::Vulkan) {
-                anyhow::bail!("Vulkan title execution is not implemented. Build with --features vulkan and use vulkan-check; no D3D12 fallback is performed.");
+                #[cfg(all(windows, feature = "vulkan"))]
+                {
+                    vortex_hle::modules::d3d12x::enable_native_vulkan();
+                    println!("LIVE_VULKAN_REQUESTED: guest runtime, no host D3D12 fallback");
+                }
+                #[cfg(not(all(windows, feature = "vulkan")))]
+                anyhow::bail!("Live Vulkan requires Windows and --features vulkan");
             }
             run::run(&exe, unimplemented, strict, execute, console)
         }

@@ -716,6 +716,7 @@ dependencies = [
  "vortex-formats",
  "vortex-pipeline",
  "vortex-shader",
+ "vortex-vulkan",
  "windows",
  "windows-sys",
 ]

@@ -15,6 +15,7 @@ anyhow.workspace = true
 vortex-formats.workspace = true
 vortex-pipeline.workspace = true
 vortex-shader.workspace = true
+vortex-vulkan = { path = "../vortex-vulkan", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -22,6 +23,7 @@ tempfile.workspace = true
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
+vulkan = ["dep:vortex-vulkan"]
 
 [lints]
 workspace = true

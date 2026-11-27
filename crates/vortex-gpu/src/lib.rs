@@ -55,6 +55,8 @@ pub mod signature;
 pub mod vulkan_upload;
 /// Experimental sparse descriptor publication journal.
 pub mod vulkan_descriptors;
+#[cfg(all(windows,feature = "vulkan"))]
+pub mod vulkan_live;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]

@@ -115,6 +115,8 @@ struct List {
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
     uploads: std::sync::Mutex<Vec<Vec<u8>>>,
+    #[cfg(all(windows,feature = "vulkan"))]
+    live:std::sync::Mutex<crate::vulkan_live::Recording>,
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
     #[cfg(windows)]
@@ -173,6 +175,8 @@ pub(crate) fn tables_done(lists: &[This]) {
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){crate::vulkan_live::stop("legacy command list path requested");}
     if this.is_null() {
         return None;
     }
@@ -557,12 +561,21 @@ fn new_list(
         return E_INVALIDARG;
     }
     tracing::debug!(kind, "command list");
+    #[cfg(all(windows,feature = "vulkan"))]
+    let live=crate::vulkan_live::enabled();
+    #[cfg(not(all(windows,feature = "vulkan")))]
+    let live=false;
+    #[cfg(all(windows,feature = "vulkan"))]
+    if live&&!pipeline.is_null(){crate::vulkan_live::stop("initial guest pipeline is not translated");}
     let list = Box::new(List {
-        object: if crate::device::newer() {
-            Object::new(&NEWER_LIST_FUNCTIONS)
-        } else {
-            Object::new(&LIST_FUNCTIONS)
+        object: {
+            #[cfg(all(windows,feature = "vulkan"))]
+            if live {Object::new(if crate::device::newer(){&LIVE_NEWER_LIST_FUNCTIONS}else{&LIVE_LIST_FUNCTIONS})}
+            else {Object::new(if crate::device::newer(){&NEWER_LIST_FUNCTIONS}else{&LIST_FUNCTIONS})}
+            #[cfg(not(all(windows,feature = "vulkan")))]
+            {Object::new(if crate::device::newer(){&NEWER_LIST_FUNCTIONS}else{&LIST_FUNCTIONS})}
         },
+        /* live and legacy share the guest inline layout; their tables differ. */
         kind,
         put: [0; 5],
         reserved: [0; 64],
@@ -571,18 +584,21 @@ fn new_list(
         pipeline_shadow: [0; 8],
         newer: [0; 256],
         uploads: Default::default(),
+        #[cfg(all(windows,feature = "vulkan"))]
+        live:Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().and_then(|h| match h.new_list() {
+        host: if live{None}else{crate::host::host().and_then(|h| match h.new_list() {
+
             Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
                 None
             }
-        }),
+        })},
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
-            state.set_pipeline(pipeline);
+            if !live{state.set_pipeline(pipeline);}
             std::sync::Mutex::new(state)
         },
         #[cfg(windows)]
@@ -618,6 +634,8 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){live_record(this).close();return S_OK;}
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
@@ -627,6 +645,14 @@ extern "system" fn close(this: This) -> HRESULT {
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
     if allocator.is_null() {
         return E_INVALIDARG;
+    }
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){
+        if !pipeline.is_null(){crate::vulkan_live::stop("reset with untranslated guest pipeline");}
+        live_record(this).reset();
+        // SAFETY: guest owns the list and may reset only after submission.
+        unsafe{&(*this.cast::<List>()).uploads}.lock().unwrap_or_else(|e|e.into_inner()).clear();
+        return S_OK;
     }
     // A wait recorded and never submitted goes with the recording.
     VALUE_WAITS
@@ -2164,6 +2190,85 @@ const fn list_table(newer: bool) -> [*const (); 160] {
     }
     f
 }
+
+#[cfg(all(windows,feature = "vulkan"))]
+fn live_record(this:This)->std::sync::MutexGuard<'static,crate::vulkan_live::Recording>{
+    if this.is_null(){crate::vulkan_live::stop("null live command list");}
+    // SAFETY: guest passes its own live list and does not release it while
+    // recording or executing. The recording mutex guards mutable contents.
+    unsafe{&(*this.cast::<List>()).live}.lock().unwrap_or_else(|e|e.into_inner())
+}
+
+#[cfg(all(windows,feature = "vulkan"))]
+pub(crate) fn execute_live(this:This){live_record(this).execute();}
+
+#[cfg(all(windows,feature = "vulkan"))]
+extern "system" fn live_copy_buffer(this:This,dst:This,dst_offset:u64,src:This,src_offset:u64,len:u64){
+    use crate::vulkan_live::{Op,Retained};
+    live_record(this).push(Op::Copy{dst:Retained::new(dst),src:Retained::new(src),dst_offset,src_offset,len});
+}
+#[cfg(all(windows,feature = "vulkan"))]
+extern "system" fn live_copy_resource(this:This,dst:This,src:This){
+    use crate::vulkan_live::{Op,Retained,stop,registered};
+    if !registered(src)||!registered(dst){stop("invalid guest copy resource");}
+    match(crate::resource::buffer_bytes(src),crate::resource::buffer_bytes(dst)){
+        (Some((_,from)),Some((_,to))) if from==to=>live_copy_buffer(this,dst,0,src,0,from),
+        (None,None)=>{
+            let from=crate::resource::live_image_spec(src).unwrap_or_else(||stop("unsupported source image copy"));
+            let to=crate::resource::live_image_spec(dst).unwrap_or_else(||stop("unsupported destination image copy"));
+            live_record(this).push(Op::CopyImage{src:Retained::new(src),dst:Retained::new(dst),from,to});
+        }
+        _=>stop("incompatible guest resource copy"),
+    }
+}
+#[cfg(all(windows,feature = "vulkan"))]
+extern "system" fn live_clear_rtv(this:This,handle:u64,color:*const [f32;4],count:u32,_rects:*const Rect){
+    use crate::vulkan_live::{Op,Retained,stop};
+    if count!=0{stop("partial guest RTV clear not ported");}
+    let view=crate::descriptor::rtv_record(handle).unwrap_or_else(||stop("invalid RTV"));
+    let spec=crate::resource::live_image_spec(view.resource).unwrap_or_else(||stop("guest RTV format/layout not ported"));
+    if spec.depth||!view.native_full_view(false){stop("unsupported guest RTV view");}
+    let rgba=unsafe{color.as_ref()}.copied().unwrap_or_else(||stop("null RTV clear value"));
+    live_record(this).push(Op::ClearColor{resource:Retained::new(view.resource),spec,rgba});
+}
+#[cfg(all(windows,feature = "vulkan"))]
+extern "system" fn live_clear_dsv(this:This,handle:u64,flags:u32,depth:f32,_stencil:u8,count:u32,_rects:*const Rect){
+    use crate::vulkan_live::{Op,Retained,stop};
+    if count!=0||flags!=1{stop("partial or stencil guest clear not ported");}
+    let view=crate::descriptor::dsv_record(handle).unwrap_or_else(||stop("invalid DSV"));
+    let spec=crate::resource::live_image_spec(view.resource).unwrap_or_else(||stop("guest DSV format/layout not ported"));
+    if !spec.depth||!view.native_full_view(true){stop("unsupported guest DSV view");}
+    live_record(this).push(Op::ClearDepth{resource:Retained::new(view.resource),spec,z:depth});
+}
+#[cfg(all(windows,feature = "vulkan"))]
+extern "system" fn live_barrier(_this:This,count:u32,barriers:*const Barrier)->u32{
+    if count==0{return 0;}
+    if barriers.is_null()||count>1_048_576{crate::vulkan_live::stop("invalid guest barrier array");}
+    // All implemented operations complete in submission order and use
+    // GENERAL layouts. Ordinary transitions/UAV dependencies are covered
+    // by those full waits. Split or aliasing barriers require a real port.
+    let barriers=unsafe{std::slice::from_raw_parts(barriers,count as usize)};
+    if barriers.iter().any(|b|b.flags!=0||!matches!(b.kind,0|2)){
+        crate::vulkan_live::stop("split/aliasing guest barrier not ported");
+    }
+    0
+}
+#[cfg(all(windows,feature = "vulkan"))]
+const fn live_list_table(newer:bool)->[ *const ();160]{
+    let mut f=object::d3d12_object(object::missing_table::<LIST,160>());
+    f[0]=list_query as *const ();f[2]=list_release as *const ();
+    f[7]=object::parent_device as *const ();f[8]=list_type as *const ();
+    f[9]=close as *const ();f[10]=reset as *const ();
+    f[15]=live_copy_buffer as *const ();f[17]=live_copy_resource as *const ();
+    f[26]=live_barrier as *const ();f[51]=live_clear_dsv as *const ();f[52]=live_clear_rtv as *const ();
+    f[if newer{newer_slot(137)}else{137}]=reset_x as *const ();
+    if newer{f[148]=allocate_upload as *const ();}
+    f
+}
+#[cfg(all(windows,feature = "vulkan"))]
+static LIVE_LIST_FUNCTIONS:Table<160>=Table(live_list_table(false));
+#[cfg(all(windows,feature = "vulkan"))]
+static LIVE_NEWER_LIST_FUNCTIONS:Table<160>=Table(live_list_table(true));
 
 /// Every slot up to the limit exists and logs, for the methods newer
 /// titles add.

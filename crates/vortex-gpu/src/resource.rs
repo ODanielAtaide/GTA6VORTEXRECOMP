@@ -1775,6 +1775,11 @@ fn hand_out_resource(
             placed: std::sync::atomic::AtomicBool::new(false),
         },
     });
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){
+        crate::vulkan_live::register(std::ptr::from_ref::<Resource>(&resource) as usize);
+        return object::hand_out(RESOURCE,resource,iid,&RESOURCE_IIDS,out);
+    }
     // The host copy waits for the texture's first use ([`Hosted`]).
     #[cfg(windows)]
     if desc.dimension != BUFFER {
@@ -1801,6 +1806,13 @@ fn hand_out_resource(
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        #[cfg(all(windows,feature = "vulkan"))]
+        if crate::vulkan_live::enabled(){
+            let key=std::ptr::from_ref::<Resource>(self) as usize;
+            crate::vulkan_live::forget(key);
+            crate::descriptor::forget(key);
+            return;
+        }
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
@@ -2121,6 +2133,22 @@ extern "system" fn resource_query(this: This, iid: *const Iid, out: *mut This) -
         out,
     )
 }
+#[cfg(all(windows,feature = "vulkan"))]
+pub(crate) fn release_live(this:This){let _=resource_release(this);}
+
+#[cfg(all(windows,feature = "vulkan"))]
+pub(crate) fn live_image_spec(this:This)->Option<vortex_vulkan::live::ImageSpec>{
+    if !crate::vulkan_live::registered(this){return None;}
+    let r=resource(this);let d=r.desc;
+    // Real target contents can be represented without guest swizzle or
+    // aliasing only for this small initial committed-image subset.
+    if !matches!(&r.backing,Backing::Committed(_))||d.dimension!=3||d.width==0||d.height==0
+        ||d.width>i32::MAX as u64||d.height>i32::MAX as u32||d.depth_or_array_size!=1
+        ||d.mip_levels!=1||d.sample_count!=1||d.sample_quality!=0||d.flags&4!=0{return None;}
+    let depth=match d.format{28 if d.flags&1!=0&&d.flags&2==0=>false,40 if d.flags&2!=0&&d.flags&1==0=>true,_=>return None};
+    Some(vortex_vulkan::live::ImageSpec{key:this as usize,width:d.width as u32,height:d.height,depth})
+}
+
 extern "system" fn resource_release(this: This) -> u32 {
     object::release_boxed::<Resource>(this)
 }

@@ -10,7 +10,7 @@ static SUBMIT:Mutex<()>=Mutex::new(());
 static RESOURCES:Mutex<std::collections::BTreeSet<usize>>=Mutex::new(std::collections::BTreeSet::new());
 
 pub fn enable(){ENABLED.store(true,Ordering::Release);}
-pub(crate) fn enabled()->bool{ENABLED.load(Ordering::Acquire)}
+pub fn enabled()->bool{ENABLED.load(Ordering::Acquire)}
 pub(crate) fn stop(message:impl std::fmt::Display)->!{
     eprintln!("VULKAN_RUNTIME_BLOCKER: {message}; no D3D12 fallback");
     tracing::error!(%message,"VULKAN_RUNTIME_BLOCKER");

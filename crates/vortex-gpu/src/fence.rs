@@ -88,6 +88,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     if event.is_null() {
+        #[cfg(all(windows,feature = "vulkan"))]
+        if crate::vulkan_live::enabled(){crate::vulkan_live::stop("pending blocking guest fence wait not ported");}
         // With submissions sent to the card and not waited for
         // (`crate::host::late`) the signal may be behind them: they are
         // settled, which sets it.
@@ -124,6 +126,8 @@ pub(crate) fn set(this: This, value: u64) {
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     set(this, value);
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){return S_OK;}
     // A queue may have waited for it: what it held runs now.
     #[cfg(windows)]
     crate::queue::release_held(false);

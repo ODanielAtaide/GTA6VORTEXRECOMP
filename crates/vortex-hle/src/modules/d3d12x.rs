@@ -39,7 +39,12 @@ fn host_gpu_failed(what: &str) -> ! {
 /// Keeps the host's translations of the title's shaders in `dir` (a
 /// folder of the cache) across runs, and its compiled pipelines beside it
 /// (`pipelines`).
+#[cfg(all(windows,feature = "vulkan"))]
+pub fn enable_native_vulkan(){vortex_gpu::vulkan_live::enable();}
+
 pub fn use_shader_cache(dir: std::path::PathBuf) {
+    #[cfg(all(windows,feature = "vulkan"))]
+    if vortex_gpu::vulkan_live::enabled(){return;}
     #[cfg(windows)]
     {
         vortex_gpu::pipeline::use_pipeline_cache(dir.with_file_name("pipelines"));

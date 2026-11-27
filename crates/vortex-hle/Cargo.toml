@@ -48,6 +48,7 @@ windows-core = { workspace = true, optional = true }
 tempfile.workspace = true
 
 [features]
+vulkan = ["vortex-gpu/vulkan"]
 # Debugging switches (scripted keys and the like).
 diagnostics = ["vortex-gpu/diagnostics", "vortex-loader/diagnostics", "dep:windows", "dep:windows-core"]
 

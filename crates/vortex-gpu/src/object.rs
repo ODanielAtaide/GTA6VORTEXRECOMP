@@ -280,6 +280,10 @@ static REPORTED: [[AtomicBool; MAX_SLOTS]; KINDS.len()] =
 /// image for title calls). Wrong for a slot that returns a value instead of
 /// an `HRESULT`.
 extern "system" fn missing<const KIND: usize, const SLOT: usize>() -> HRESULT {
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){
+        crate::vulkan_live::stop(format_args!("{} slot {:#x}, caller {}",KINDS[KIND],SLOT*8,caller()));
+    }
     if !REPORTED[KIND][SLOT].swap(true, Ordering::Relaxed) {
         tracing::warn!(
             object = KINDS[KIND],

@@ -514,6 +514,15 @@ extern "system" fn release(this: This) -> u32 {
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){
+        if count==0{return;}
+        if lists.is_null()||count>1_048_576{crate::vulkan_live::stop("invalid live submission");}
+        let _lock=crate::vulkan_live::submit_lock();
+        let lists=unsafe{std::slice::from_raw_parts(lists,count as usize)};
+        for &list in lists{crate::list::execute_live(list);}
+        return;
+    }
     if lists.is_null() {
         return;
     }
@@ -614,6 +623,11 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){
+        let _lock=crate::vulkan_live::submit_lock();
+        crate::fence::set(fence,value);return S_OK;
+    }
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
     if hold(this, || Held::Signal(fence as usize, value)) {
@@ -638,6 +652,11 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
+    }
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){
+        if crate::fence::completed(fence)<value{crate::vulkan_live::stop("pending cross-queue guest fence wait not ported");}
+        return S_OK;
     }
     #[cfg(windows)]
     if !this.is_null() {
@@ -760,6 +779,14 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){
+        if planes!=1||plane_parameters.is_null(){crate::vulkan_live::stop("unsupported guest present planes");}
+        let plane=unsafe{&*plane_parameters};
+        if plane.count!=1||plane.resources.is_null(){crate::vulkan_live::stop("unsupported guest present source count");}
+        crate::vulkan_live::present(unsafe{*plane.resources});
+        return S_OK;
+    }
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     // Submissions sent to the card and not waited for are settled first,

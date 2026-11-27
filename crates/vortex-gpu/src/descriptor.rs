@@ -140,6 +140,8 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
 /// is in a shader-visible heap.
 #[cfg(windows)]
 fn mirror(handle: u64) {
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){return;}
     let Some((heap, index)) = shader_slot(handle) else {
         return;
     };
@@ -202,6 +204,11 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    #[cfg(all(windows,feature = "vulkan"))]
+    pub(crate) fn native_full_view(&self,depth:bool)->bool{
+        self.described==0||(self.desc[0]==if depth{40}else{28}
+            &&self.desc[1]==if depth{3}else{4}&&self.desc[2..].iter().all(|&v|v==0))
+    }
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(

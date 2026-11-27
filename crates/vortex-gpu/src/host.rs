@@ -486,6 +486,8 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){crate::vulkan_live::stop("legacy host GPU path requested");}
     static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
@@ -6712,7 +6714,7 @@ impl Host {
 
 /// A visible top-level window of this process: the one the title made, if
 /// it made one.
-fn title_window() -> Option<HWND> {
+pub(crate) fn title_window() -> Option<HWND> {
     extern "system" fn visit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
         let mut process = 0;
         // SAFETY: a window handle from the enumeration; `found` is ours.
@@ -6967,7 +6969,7 @@ pub(crate) fn transition(
 }
 
 /// A window of the given client size, owned by its own message thread.
-fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
+pub(crate) fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("vortex-window".into())

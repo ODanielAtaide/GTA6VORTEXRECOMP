@@ -118,7 +118,13 @@ pub(crate) static DEVICE: Device = Device {
     out_of_line: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
 };
 
+#[cfg(all(windows,feature = "vulkan"))]
+static LIVE_DEVICE:Device=Device{object:Object::new(&LIVE_FUNCTIONS),null_constant_buffer:0,
+    out_of_line:[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]};
+
 pub(crate) fn device() -> This {
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){return (&raw const LIVE_DEVICE).cast();}
     (&raw const DEVICE).cast()
 }
 
@@ -153,6 +159,8 @@ pub extern "system" fn create(
     if *iid == LEVEL_IIDS[8] {
         NEWER.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){crate::vulkan_live::initialize();}
     object::answer(object::DEVICE, iid, Some(device()), out)
 }
 
@@ -457,6 +465,34 @@ static FUNCTIONS: Table<160> = {
     f[127] = resource::create_committed3 as *const (); // 0x3f8
     f[133] = resource::create_at_address as *const (); // 0x428
     Table(f)
+};
+
+// Only CPU-side guest ABI services and explicitly ported command entry
+// points are shared. Pipeline creation is deliberately NOT routed to DXIL.
+#[cfg(all(windows,feature = "vulkan"))]
+static LIVE_FUNCTIONS:Table<160>={
+    let mut f=object::d3d12_object(object::missing_table::<{object::DEVICE},160>());
+    f[0]=query_interface as *const ();f[7]=node_count as *const ();
+    f[8]=queue::create as *const ();f[9]=list::create_allocator as *const ();
+    f[12]=list::create_list as *const ();f[13]=check_feature_support as *const ();
+    f[14]=descriptor::create_heap as *const ();f[15]=descriptor::increment_size as *const ();
+    f[16]=root::create as *const ();f[17]=descriptor::create_cbv as *const ();
+    f[18]=descriptor::create_srv as *const ();f[19]=descriptor::create_uav as *const ();
+    f[20]=descriptor::create_rtv as *const ();f[21]=descriptor::create_dsv as *const ();
+    f[22]=descriptor::create_sampler as *const ();f[23]=descriptor::copy as *const ();
+    f[24]=descriptor::copy_simple as *const ();f[25]=resource::allocation_info as *const ();
+    f[26]=resource::custom_heap_properties as *const ();f[27]=resource::create_committed as *const ();
+    f[28]=resource::create_heap as *const ();f[29]=resource::create_placed as *const ();
+    f[36]=fence::create as *const ();f[38]=resource::copyable_footprints as *const ();
+    f[39]=query::create as *const ();f[41]=signature::create as *const ();
+    f[48]=queue::create_x as *const ();f[61]=descriptor::create_sampler_x as *const ();
+    f[69]=object::ignore as *const ();f[70]=descriptor::create_placed_srv as *const ();
+    f[71]=descriptor::create_placed_uav as *const ();f[73]=list::create_list_x as *const ();
+    f[74]=resource::register_page_pool as *const ();f[75]=resource::unregister_page_pool as *const ();
+    f[76]=resource::create_committed as *const ();f[78]=frame::set_interval as *const ();
+    f[79]=frame::schedule as *const ();f[80]=frame::wait as *const ();f[81]=frame::statistics as *const ();
+    f[108]=resource::allocation_info2 as *const ();f[127]=resource::create_committed3 as *const ();
+    f[133]=resource::create_at_address as *const ();Table(f)
 };
 
 #[cfg(test)]

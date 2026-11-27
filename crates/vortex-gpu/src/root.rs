@@ -52,6 +52,8 @@ type SerializeVersioned =
 
 /// An export of the host's `d3d12.dll` in System32, looked up once.
 fn host_export(cache: &OnceLock<Option<usize>>, name: &CStr) -> Option<usize> {
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){crate::vulkan_live::stop(format_args!("native root signature conversion missing: {name:?}"));}
     *cache.get_or_init(|| {
         #[cfg(windows)]
         {
