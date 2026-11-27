@@ -21,6 +21,94 @@ fn read(address:usize,n:usize)->Result<Vec<u8>,String>{
     Ok(bytes)
 }
 
+// Retail serialized PSOs (OpenScarlett device_x.cpp, 48a98fcd):
+// q0 is the root, q1/2 and q3/4 are state blocks, subsequent pairs
+// point to GPU-pool ISA and stage metadata. No D3D12 stand-in PSO.
+const RETAIL_POOL_LIMIT:usize=1024*1024;
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+struct RetailStage{ name:&'static str, code:usize, size:usize, meta:usize, meta_size:usize }
+fn retail_stages(q:&[u64],compute:bool)->Result<Vec<RetailStage>,String>{
+    let mut stages=Vec::new();
+    let pairs:&[(&str,usize)]=if compute{&[("compute",5)]}else{&[("pixel",5),("vertex",9),("mesh",13)]};
+    for &(name,i) in pairs{
+        let Some(&code)=q.get(i)else{continue;};
+        let size=q.get(i+1).copied().unwrap_or(0);
+        if code==0&&size==0{continue;}
+        let code=usize::try_from(code).map_err(|_|"retail code address overflow")?;
+        let size=usize::try_from(size).map_err(|_|"retail code size overflow")?;
+        if code<0x10000||size<40||size>RETAIL_POOL_LIMIT||size%4!=0||code.checked_add(size).is_none(){
+            return Err(format!("invalid {name} retail shader span ({size} bytes)"));
+        }
+        stages.push(RetailStage{name,code,size,meta:q.get(i+2).copied().unwrap_or(0) as usize,
+            meta_size:q.get(i+3).copied().unwrap_or(0) as usize});
+    }
+    if stages.is_empty(){return Err("serialized PSO has no recognized ISA spans".into());}
+    Ok(stages)
+}
+fn retail_code(bytes:&[u8])->Result<&[u8],String>{
+    if bytes.len()<40||bytes.len()%4!=0{return Err("invalid retail ISA size".into());}
+    let word=|i:usize|u32::from_le_bytes(bytes[i*4..i*4+4].try_into().unwrap());
+    // The optional 9-dword pool hash prefix is not shader machine code.
+    let start=if word(0)&0xffff0000==0xd5800000&&word(6)==0xd5800000&&word(7)&0xfffe0000==0x03fe0000{36}else{0};
+    // Do not truncate at an arbitrary dword which might be a literal.
+    // The existing GFX10 decoder follows actual instruction boundaries.
+    Ok(&bytes[start..])
+}
+pub(crate) fn inspect_serialized(desc:usize,compute:bool){
+    static SEEN:Mutex<Option<std::collections::BTreeSet<(String,&'static str)>>>=Mutex::new(None);
+    let result=(||->Result<(),String>{
+        let n=if compute{9}else{17};
+        let bytes=read(desc,n*8).or_else(|e|if !compute{read(desc,13*8)}else{Err(e)})?;
+        let q:Vec<u64>=bytes.chunks_exact(8).map(|v|u64::from_le_bytes(v.try_into().unwrap())).collect();
+        let stages=retail_stages(&q,compute)?;
+        let root_known=crate::root::live_snapshot(q[0] as This).is_some();
+        if compute&&q[2]>=28&&q[2]<=0x4000{
+            if let Ok(block)=read(q[1] as usize,28){
+                let d:Vec<u32>=block.chunks_exact(4).map(|v|u32::from_le_bytes(v.try_into().unwrap())).collect();
+                let threads=[d[3]&0xffff,d[3]>>16,d[4]&0xffff];
+                tracing::debug!(?threads,rsrc2=d[6],root_known,"VULKAN_RETAIL_COMPUTE_STATE");
+            }
+        }
+        for stage in stages{
+            let raw=match read(stage.code,stage.size){Ok(b)=>b,Err(e)=>{tracing::warn!(stage=stage.name,error=%e,"VULKAN_RETAIL_ISA_READ_GAP");continue;}};
+            let code=match retail_code(&raw){Ok(b)=>b,Err(e)=>{tracing::warn!(stage=stage.name,error=%e,"VULKAN_RETAIL_ISA_READ_GAP");continue;}};
+            let hash=blake3::hash(code).to_hex().as_str()[..16].to_owned();
+            {
+                let mut seen=SEEN.lock().unwrap_or_else(|e|e.into_inner());
+                if !seen.get_or_insert_with(Default::default).insert((hash.clone(),stage.name)){continue;}
+            }
+            match vortex_shader::gfx10::decode(code){
+                Ok(instructions)=>{
+                    let mut opcodes=BTreeMap::new();
+                    for i in &instructions{
+                        *opcodes.entry(i.name().unwrap_or("unknown")).or_insert(0usize)+=1;
+                    }
+                    tracing::info!(stage=stage.name,%hash,code_bytes=code.len(),ops=instructions.len(),
+                        metadata_bytes=stage.meta_size,root_known,?opcodes,"VULKAN_RETAIL_SHADER_DECODED");
+                    if let Some(n)=opcodes.get("unknown"){tracing::warn!(stage=stage.name,%hash,count=*n,"VULKAN_RETAIL_OPCODE_GAP");}
+                }
+                Err(e)=>tracing::warn!(stage=stage.name,%hash,error=%e,"VULKAN_RETAIL_DECODE_GAP"),
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e)=result{tracing::debug!(compute,error=%e,"VULKAN_RETAIL_PSO_DESCRIPTION_GAP");}
+}
+#[cfg(test)]
+mod retail_tests{
+    use super::*;
+    #[test]fn retail_stage_pairs_are_bounded(){
+        let mut q=[0u64;17];q[5]=0x10000;q[6]=64;q[13]=0x20000;q[14]=128;
+        let stages=retail_stages(&q,false).unwrap();
+        assert_eq!(stages.iter().map(|s|s.name).collect::<Vec<_>>(),["pixel","mesh"]);
+        q[14]=u64::MAX;assert!(retail_stages(&q,false).is_err());
+    }
+    #[test]fn pool_hash_prefix_is_removed(){
+        let mut words=[0u32;12];words[0]=0xd5800000;words[6]=0xd5800000;words[7]=0x03fe0000;words[9]=0xbf810000;
+        let bytes:Vec<_>=words.into_iter().flat_map(u32::to_le_bytes).collect();
+        assert_eq!(retail_code(&bytes).unwrap(),&bytes[36..]);
+    }
+}
 struct Stage{
     name:&'static str,hash:String,bytes:Vec<u8>,
 }
