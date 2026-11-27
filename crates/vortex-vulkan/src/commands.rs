@@ -1586,11 +1586,8 @@ fn advanced_fixtures(wave64:bool) -> Vec<(&'static str,Vec<u8>,u16)> {
     // restore of the original mask from s12[:13].
     let save=if wave64{0xbe8c_246au32}else{0xbe8c_3c6a};
     let restore=if wave64{0xbefe_040cu32}else{0xbefe_030c};
-    let vcc=vec![0x7e06_0289u32,0x7d88_0001,0xbf86_0002,
-        save,0x7e06_028b,0xbf82_0000,restore,0xe070_2000,0x8001_0300,0xbf81_0000];
-    // Avoid restoring an uninitialized mask on the VCCZ edge: save even when
-    // the mask is empty, branch over only the masked ALU.
-    let vcc=vec![vcc[0],vcc[1],save,0xbf86_0001,0x7e06_028b,restore,
+    // Save even when VCC is empty; branch over only the masked ALU.
+    let vcc=vec![0x7e06_0289u32,0x7d88_0001,save,0xbf86_0001,0x7e06_028b,restore,
         0xe070_2000,0x8001_0300,0xbf81_0000];
     vec![
         ("vcc_saveexec",make(&vcc),4),
