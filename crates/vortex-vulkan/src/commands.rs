@@ -1555,6 +1555,8 @@ pub(crate) fn verify_native_records(context:&mut Context) -> Result<()> {
 fn advanced_fixtures() -> Vec<(&'static str,Vec<u8>,u16)> {
     let make = |words:&[u32]| words.iter().flat_map(|w|w.to_le_bytes()).collect::<Vec<u8>>();
     vec![
+        ("cfg_branch",make(&[0xbf06_8000,0xbf85_0002,0xbe82_0387,0xbf82_0001,
+            0xbe82_0389,0x7e06_0202,0xe070_2000,0x8001_0300,0xbf81_0000]),4),
         ("cfg_loop",make(&[0xbe82_0380,0xbe83_0380,0xbf09_0003,0xbf85_0003,
             0x8002_0102,0x8003_8103,0xbf82_fffb,0x7e06_0202,
             0xe070_2000,0x8001_0300,0xbf81_0000]),4),
@@ -1568,6 +1570,8 @@ fn advanced_fixtures() -> Vec<(&'static str,Vec<u8>,u16)> {
         ("atomic_max",make(&[0x3608_0081,0x7e06_0300,0xe0e0_2000,0x8001_0304,0xbf81_0000]),5),
         // Unique addresses, no races. Swap to 9 and compare-swap 17 -> 9.
         ("atomic_swap",make(&[0x7e06_0289,0xe0c0_2000,0x8001_0300,0xbf81_0000]),4),
+        ("atomic_return",make(&[0x7e06_0289,0xe0c0_6000,0x8001_0300,0xbf8c_0000,
+            0x4a06_0681,0xe070_2000,0x8001_0300,0xbf81_0000]),4),
         ("atomic_cas",make(&[0x7e06_0289,0x7e08_0291,0xe0c4_2000,0x8001_0300,0xbf81_0000]),5),
         // Each workgroup writes local LDS, barriers, reads its adjacent lane.
         // The physical SubgroupSize builtin is added to the result.
@@ -1610,6 +1614,7 @@ pub(crate) fn verify_advanced(context:&mut Context) -> Result<()> {
             let mut expected=initial.clone();
             match label {
                 "cfg_loop"=>expected.fill(91),
+                "cfg_branch"=>expected.fill(7),
                 "dynamic_address"=>{
                     for (i,v) in initial.iter_mut().enumerate(){*v=(i as u32).wrapping_mul(13);}
                     expected.clone_from(&initial);
@@ -1619,6 +1624,7 @@ pub(crate) fn verify_advanced(context:&mut Context) -> Result<()> {
                 "atomic_min"=>{expected[0]=0;expected[1]=1;},
                 "atomic_max"=>{expected[0]=126;expected[1]=127;},
                 "atomic_swap"|"atomic_cas"=>expected.fill(9),
+                "atomic_return"=>expected.fill(18),
                 "lds_wave"=>{for (i,v) in expected.iter_mut().enumerate(){*v=(i as u32^1)+wave;}},
                 _=>return Err("unknown advanced fixture".into()),
             }
@@ -1633,16 +1639,27 @@ pub(crate) fn verify_advanced(context:&mut Context) -> Result<()> {
                 let i=actual.iter().zip(&expected).position(|(a,b)|a!=b).unwrap_or(0);
                 return Err(format!("{label} wave{wave} mismatch at {i}: {} != {}",actual[i],expected[i]).into());
             }
-            if label=="cfg_loop" {
+            if matches!(label,"cfg_loop"|"cfg_branch") {
                 s.submit(&[Command::Dispatch{binding:b,groups:2,constants:[0,7]},
                     Command::Copy{src:local,src_offset:0,dst:out,dst_offset:0,bytes:BYTES}])?;
-                if s.read_words(out,0,N)?!=vec![0;N]{return Err("zero iteration loop mismatch".into());}
+                let expected_zero=if label=="cfg_loop"{0}else{9};
+                if s.read_words(out,0,N)?!=vec![expected_zero;N]{return Err("alternate branch or zero iteration loop mismatch".into());}
             }
             println!("PASS: native {label}, physical wave{wave}, timeline {epoch}");
             s.destroy_compute_binding(b)?;
             s.destroy_compute_pipeline(p)?;
         }
     }
+    // Reject a potentially racing ordinary store to a dynamic index and a
+    // branch on EXEC (not part of the uniform CFG ABI).
+    for invalid in [
+        vec![0x3608_0081u32,0x7e06_0281,0xe070_2000,0x8001_0304,0xbf81_0000],
+        vec![0xbf88_0001u32,0xbe82_0380,0xbf81_0000],
+    ] {
+        let code:Vec<u8>=invalid.into_iter().flat_map(u32::to_le_bytes).collect();
+        if s.create_native_cfg_pipeline(&code,false,5).is_ok(){return Err("accepted unsupported advanced native operation".into());}
+    }
+    println!("PASS: unsafe dynamic store and unsupported EXEC branch rejected");
     println!("PASS: bounded uniform native CFG, dynamic addresses, five atomic operations, LDS/barrier and physical wave32/64 verified");
     Ok(())
 }
