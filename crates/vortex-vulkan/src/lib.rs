@@ -76,7 +76,8 @@ impl Context {
     pub fn verify_native_dispatch(&mut self) -> Result<()> {
         commands::verify_native_dispatch(self)?;
         commands::verify_native_buffers(self)?;
-        commands::verify_native_memory(self)
+        commands::verify_native_memory(self)?;
+        commands::verify_native_records(self)
     }
 
     /// Verify sparse non-uniform runtime descriptor arrays on supported hardware.
