@@ -1804,7 +1804,32 @@ pub(crate) fn verify_native_graphics(context:&mut Context) -> Result<()> {
     }}
     println!("PASS: native GFX10 vertex + pixel -> SSA -> SPIR-V -> indexed rasterization; 64 RGBA8 pixels and D32 depths verified at timeline {epoch}");
     println!("PASS: native floating point ALU, POS0/PARAM0/MRT0 exports and depth rejection verified");
-    // Swapping stages or omitting an export must fail before Vulkan creation.
+    // A nonconstant varying verifies real rasterizer interpolation between
+    // vertex and pixel stages. Keep z and w constant so interpolation is affine.
+    let mut gradient=Vec::new();
+    for (x,y) in [(-1f32,-1f32),(1.,-1.),(1.,1.),(-1.,1.)] {
+        gradient.extend([x,y,0.375,(x+1.)*0.5,0.,0.,1.].map(f32::to_bits));
+    }
+    s.write_words(upload,0,&gradient)?;
+    s.submit(&[
+        Command::Copy{src:upload,src_offset:0,dst:vertices,dst_offset:0,bytes:gradient.len() as u64*4},
+        Command::ClearAttachments{color,depth,region:full,rgba:[0.;4],z:1.},
+        draw(0,full),
+        Command::ReadImage{src:color,region:full,dst:output,offset:0},
+        Command::ReadImage{src:depth,region:full,dst:output,offset:256},
+    ])?;
+    let actual=s.read_words(output,0,128)?;
+    for y in 0..8 {for x in 0..8 {
+        let i=y*8+x;
+        let red=((0.25+0.5*(x as f32+0.5)/8.)*255.).round() as i32;
+        let expected=[red,64,64,255];
+        if actual[i].to_le_bytes().iter().zip(expected).any(|(&a,b)|i32::from(a).abs_diff(b)>1)
+            || actual[64+i]!=0.375f32.to_bits(){
+            return Err(format!("native gradient interpolation mismatch {x},{y}").into());
+        }
+    }}
+    println!("PASS: varying PARAM0 interpolated across native vertex/pixel stages, 64 gradient pixels verified");
+    // Swapping stages must fail before Vulkan creation.
     if s.create_native_graphics_pipeline(&f,&v,[4,8]).is_ok(){
         return Err("accepted incompatible native stages".into());
     }
