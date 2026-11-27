@@ -90,6 +90,16 @@ impl Context {
         commands::verify_advanced(self)
     }
 
+    /// Emit original native vertex and fragment modules without a GPU.
+    pub fn emit_native_graphics(dir:&Path) -> Result<()> {
+        commands::emit_native_graphics(dir)
+    }
+
+    /// Verify native graphics stage lowering and indexed rasterization.
+    pub fn verify_native_graphics(&mut self) -> Result<()> {
+        commands::verify_native_graphics(self)
+    }
+
     /// Verify sparse non-uniform runtime descriptor arrays on supported hardware.
     pub fn verify_bindless(&mut self, path: &Path) -> Result<()> {
         descriptors::run_bindless(&self.instance, self.physical, &self.device, self.family, path)
