@@ -20,6 +20,9 @@ blake3.workspace = true
 memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
+serde.workspace = true
+toml.workspace = true
+tempfile.workspace = true
 
 [features]
 # Experimental Vulkan host library, separate from the legacy title renderer.

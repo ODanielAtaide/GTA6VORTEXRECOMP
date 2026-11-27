@@ -8,6 +8,8 @@ mod inspect;
 mod run;
 mod shader;
 mod translate;
+#[cfg(feature = "vulkan")]
+mod precompile;
 
 use std::path::PathBuf;
 
@@ -84,6 +86,20 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+    },
+    /// Read-only inventory and offline Vulkan shader compatibility survey.
+    #[cfg(feature = "vulkan")]
+    VulkanPrecompile {
+        #[arg(long)]
+        game_dir: PathBuf,
+        #[arg(long, default_value_t = 4)]
+        workers: usize,
+        /// Validate diagnostic SPIR-V using spirv-val from PATH.
+        #[arg(long)]
+        validate: bool,
+        /// Reanalyze containers instead of using the metadata cache.
+        #[arg(long)]
+        refresh: bool,
     },
     /// Verify the shared Vulkan host library from the main executable.
     #[cfg(feature = "vulkan")]
@@ -206,6 +222,9 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        #[cfg(feature = "vulkan")]
+        Command::VulkanPrecompile { game_dir, workers, validate, refresh } =>
+            precompile::run(&game_dir, workers, validate, refresh),
         #[cfg(feature = "vulkan")]
         Command::VulkanCheck { bindless_shader, async_check } => {
             let mut host = vortex_vulkan::Context::new()
