@@ -12,7 +12,8 @@
 //! ordinary reads and LDS accesses are race free. LDS/barriers are rejected in
 //! programs with EXEC mutations or wave-dependent branches. No indirect jumps,
 //! arbitrary descriptors, VCC branches or general mask dataflow yet.
-//! Execution is capped at 4096 basic-block visits to avoid unbounded GPU hangs.
+//! Multi-block execution is capped at 4096 basic-block visits to avoid unbounded GPU hangs.
+//! FP32 arithmetic assumes ordinary finite values; guest FP MODE is not modeled.
 use std::collections::BTreeMap;
 use crate::{ShaderError, gfx10::{Fields, Operand, Encoding}, ir::{self, Reg, Exit, EXEC, VCC}};
 
@@ -31,10 +32,25 @@ const MAIN:u32=19;
 const SUBGROUP_LANE:u32=26;
 const MASK_TYPE:u32=27;
 const STORAGE_SECOND:u32=28;
+const FLOAT:u32=29;
 
 fn inst(out:&mut Vec<u32>,opcode:u16,args:&[u32]) {
     out.push(((args.len() as u32+1)<<16)|u32::from(opcode));
     out.extend_from_slice(args);
+}
+// RDNA2 inline constant encodings, also documented by RDNA2 Commons
+// engine/tools/rdna2_decode.py (blob d5037846572aea6a7864819c9d9e449019fbb8b1).
+// Keep words in their native bit representation until the typed lowering.
+fn inline_word(code: u8) -> Option<u32> {
+    match code {
+        128..=192 => Some(u32::from(code - 128)),
+        193..=208 => Some(0u32.wrapping_sub(u32::from(code - 192))),
+        240..=248 => {
+            const FLOATS: [f32; 9] = [0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0, 0.15915494];
+            Some(FLOATS[usize::from(code - 240)].to_bits())
+        }
+        _ => None,
+    }
 }
 fn unsupported(offset:usize,what:&'static str)->ShaderError {
     ShaderError::Unsupported { offset,what }
@@ -57,6 +73,13 @@ impl Emit {
     }
     fn u(&mut self,code:u16,a:u32,b:u32)->u32 { self.value(code,UINT,&[a,b]) }
     fn test(&mut self,code:u16,a:u32,b:u32)->u32 { self.value(code,BOOL,&[a,b]) }
+    // Diagnostic ordinary FP32 semantics, not guest MODE/denormal emulation.
+    fn fp(&mut self, code: u16, a: u32, b: u32) -> u32 {
+        let a = self.value(124, FLOAT, &[a]);
+        let b = self.value(124, FLOAT, &[b]);
+        let f = self.value(code, FLOAT, &[a, b]);
+        self.value(124, UINT, &[f])
+    }
     fn select(&mut self,condition:u32,a:u32,b:u32)->u32 { self.value(169,UINT,&[condition,a,b]) }
     fn flag(&mut self,condition:u32)->u32 { let a=self.c(1);let b=self.c(0);self.select(condition,a,b) }
     fn load(&mut self,p:u32)->u32 { self.value(61,UINT,&[p]) }
@@ -70,8 +93,8 @@ impl Emit {
     fn operand(&mut self,o:Operand)->Result<u32,ShaderError> {
         match o {
             Operand::Literal(n)=>Ok(self.c(n)),
-            Operand::Const(n @ 128..=192)=>Ok(self.c(u32::from(n-128))),
-            Operand::Const(n @ 193..=208)=>Ok(self.c(0u32.wrapping_sub(u32::from(n-192)))),
+            Operand::Const(n)=>inline_word(n).map(|word| self.c(word))
+                .ok_or(unsupported(0,"CFG inline constant")),
             Operand::Scalar{code,dwords:1} if scalar(code)&&!(self.multi&&second_descriptor(Reg::S(code)))=>self.reg(Reg::S(code)),
             Operand::Vector{reg,dwords:1}=>self.reg(Reg::V(reg)),
             _=>Err(unsupported(0,"CFG operand")),
@@ -293,6 +316,13 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
             let args:Vec<u32>=v.src.iter().map(|o|e.operand(*o)).collect::<Result<_,_>>()?;
             let val=match (name,args.as_slice()) {
                 ("v_mov_b32",&[a])=>a,
+                ("v_add_f32",&[a,b])=>e.fp(129,a,b),
+                ("v_sub_f32",&[a,b])=>e.fp(131,a,b),
+                ("v_subrev_f32",&[a,b])=>e.fp(131,b,a),
+                ("v_mul_f32",&[a,b])=>e.fp(133,a,b),
+                ("v_cvt_f32_u32",&[a])=>{
+                    let f=e.value(112,FLOAT,&[a]); e.value(124,UINT,&[f])
+                }
                 ("v_add_nc_u32",&[a,b])=>e.u(128,a,b),
                 ("v_sub_nc_u32",&[a,b])=>e.u(130,a,b),
                 ("v_and_b32",&[a,b])=>e.u(199,a,b),
@@ -567,6 +597,7 @@ fn emit_cfg_inner(p:&ir::Program,multi:bool)->Result<Vec<u32>,ShaderError> {
     if multi {o(&mut out,71,&[STORAGE_SECOND,34,0]);o(&mut out,71,&[STORAGE_SECOND,33,1]);}
     o(&mut out,71,&[8,2]);o(&mut out,72,&[8,0,35,0]);o(&mut out,72,&[8,1,35,4]);
     o(&mut out,19,&[1]);o(&mut out,33,&[2,1]);o(&mut out,21,&[UINT,32,0]);o(&mut out,20,&[BOOL]);
+    o(&mut out,22,&[FLOAT,32]);
     o(&mut out,23,&[5,UINT,3]);o(&mut out,23,&[MASK_TYPE,UINT,4]);o(&mut out,29,&[6,UINT]);o(&mut out,30,&[7,6]);
     o(&mut out,30,&[8,UINT,UINT]);o(&mut out,43,&[UINT,20,64]);o(&mut out,28,&[9,UINT,20]);
     for (id,storage,ty) in [(FUNCTION_PTR,7,UINT),(STORAGE_PTR,12,UINT),(PUSH_PTR,9,UINT),
@@ -593,6 +624,25 @@ mod tests {
             pos += count;
         }
         false
+    }
+    #[test]
+    fn inline_constants_preserve_word_bits() {
+        assert_eq!(inline_word(128), Some(0));
+        assert_eq!(inline_word(193), Some(u32::MAX));
+        assert_eq!(inline_word(241), Some((-0.5f32).to_bits()));
+        assert_eq!(inline_word(242), Some(1.0f32.to_bits()));
+        assert_eq!(inline_word(248), Some(0x3e22f983));
+        assert_eq!(inline_word(249), None);
+    }
+    #[test]
+    fn native_fp32_mul_emits_typed_operation() {
+        // v_mov_b32 v7, 0.25; v_mul_f32 v7, 1.0, v7; s_endpgm.
+        let code: Vec<u8> = [0x7e0e_02ffu32, 0.25f32.to_bits(), 0x1e0e_0ef2, 0xbf81_0000]
+            .into_iter().flat_map(u32::to_le_bytes).collect();
+        let p = ir::build(&code, false, 8).unwrap();
+        let words = emit_cfg(&p).unwrap();
+        assert!(has_opcode(&words, 133)); // OpFMul
+        assert!(has_opcode(&words, 124)); // OpBitcast
     }
     #[test]
     fn straight_line_skips_dispatcher() {
