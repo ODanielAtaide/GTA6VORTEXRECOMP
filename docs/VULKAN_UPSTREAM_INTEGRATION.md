@@ -42,3 +42,11 @@ From the same Belobug IR source blob `410d97fb89f91effec66111b9599fbfc672cbbf0`:
 - `8290601d79ec59177822d853dc891619a0db75ae`: import more precise unspill analysis for reused lanes and register lifetimes, including control-flow tracking and pairing. Adapt the instruction construction to the existing Vortex API instead of changing the public decoder struct.
 
 The second import is pending local validation. The new lowering is still a diagnostic subset; these optimizations are compiler-front-end work, not a replacement for Vulkan command submission. Decoder name caching and native/resource metadata changes remain separate candidates because they have wider dependencies. No FPS claim is made.
+
+## Third import — control flow and scalar propagation
+
+At commit dc213dc the maintainer ran the complete vortex-shader library test suite: 224 passed, 0 failed, 2 ignored, 27.42 seconds. The 4096-block stress test passed. This includes legacy emitter tests; it is not evidence of a complete Vulkan backend.
+
+- c12229757810d7a813a1c3791e9ec4087dc741a4: imported the upstream control-flow analysis for long-distance early-outs and scalar copy propagation across Phi joins, from Belobug IR blob 410d97fb89f91effec66111b9599fbfc672cbbf0. Added a local regression distinguishing identical from different scalar sources. Pending local compilation and full regression.
+
+The imported passes retain their existing call sites and assumptions about masked effects; they must not be enabled in a future Vulkan lowering until its effect and subgroup semantics are verified. No runtime backend or FPS improvement is claimed.
