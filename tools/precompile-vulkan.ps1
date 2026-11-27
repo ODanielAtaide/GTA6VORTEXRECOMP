@@ -5,7 +5,11 @@ param(
     [string]$BackupDirectory = "C:\GTA6VORTEXRECOMP_BACKUPS",
     [switch]$Refresh,
     [switch]$CodeOnly,
-    [switch]$Launch
+    [switch]$Launch,
+    [string]$CommonsDir,
+    [string]$ShaderArchive,
+    [string]$ExternalOutput = "vortex-external-offline",
+    [switch]$Wave64Emulate
 )
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
@@ -17,6 +21,10 @@ if ($Launch) {
     $Exe = (Resolve-Path -LiteralPath $Exe).Path
     if (!(Test-Path -LiteralPath $Exe -PathType Leaf)) { throw "Executavel invalido" }
 }
+if (($CommonsDir -and !$ShaderArchive) -or ($ShaderArchive -and !$CommonsDir)) {
+    throw "Informe -CommonsDir e -ShaderArchive juntos"
+}
+if ($Wave64Emulate -and !$CommonsDir) { throw "-Wave64Emulate requer -CommonsDir" }
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
 New-Item -ItemType Directory -Force -Path $BackupDirectory | Out-Null
 function Backup($stage) {
@@ -47,6 +55,13 @@ if ($CodeOnly) { $scanArgs += "--code-only" }
 $env:RUST_LOG = "warn"
 & $binary @scanArgs
 Check "Falha na analise previa"
+if ($CommonsDir) {
+    $externalArgs = @("tools/rdna2-commons-offline.py", "--commons", $CommonsDir,
+        "--archive", $ShaderArchive, "--out", $ExternalOutput, "--jobs", "$Workers")
+    if ($Wave64Emulate) { $externalArgs += "--wave64-emulate" }
+    python -I @externalArgs
+    Check "Falha no tradutor externo; nenhum pipeline do jogo foi habilitado"
+}
 if ($Launch) {
     $env:RUST_LOG = "info"
     Write-Host "A analise nao corrige automaticamente os pipelines. Iniciando runtime experimental Vulkan."
