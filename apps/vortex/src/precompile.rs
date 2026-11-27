@@ -4,7 +4,7 @@
 //! no game code is executed. Fixture-ABI SPIR-V is never a guest pipeline.
 use anyhow::{Context,Result};
 use serde::{Deserialize,Serialize};
-use std::{collections::{BTreeMap,HashSet},fs::{self,File},io::{Read,Seek,SeekFrom,Write,BufWriter},path::{Path,PathBuf},
+use std::{collections::BTreeMap,fs::{self,File},io::{Read,Seek,SeekFrom,Write,BufWriter},path::{Path,PathBuf},
     sync::{Mutex,atomic::{AtomicUsize,Ordering}},time::{SystemTime,UNIX_EPOCH}};
 use vortex_shader::{Container,FourCC,HwStage,ShaderError,ir,gfx10,resource,structure,io as stage_io};
 
@@ -60,19 +60,20 @@ fn digest_file(path:&Path)->Result<String>{
 }
 struct Shared {
     cache:PathBuf, validate:bool,refresh:bool,
-    seen:Mutex<HashSet<String>>,
+    seen:Mutex<BTreeMap<String,String>>,
     totals:Mutex<Analysis>,
     duplicates:AtomicUsize, hits:AtomicUsize, unique:AtomicUsize,
 }
 impl Shared {
-    fn analyze(&self,bytes:&[u8])->Result<()>{
+    fn analyze(&self,bytes:&[u8],origin:String)->Result<()>{
         let Some(n)=length(bytes)else{return Ok(());};
         let Some(bytes)=bytes.get(..n)else{return Ok(());};
         let Ok(c)=Container::parse(bytes)else{return Ok(());};
         let hash=blake3::hash(bytes).to_hex().to_string();
         {
             let mut seen=self.seen.lock().unwrap_or_else(|e|e.into_inner());
-            if !seen.insert(hash.clone()){self.duplicates.fetch_add(1,Ordering::Relaxed);return Ok(());}
+            if seen.contains_key(&hash){self.duplicates.fetch_add(1,Ordering::Relaxed);return Ok(());}
+            seen.insert(hash.clone(),origin);
         }
         self.unique.fetch_add(1,Ordering::Relaxed);
         let path=self.cache.join(format!("{hash}.toml"));
@@ -187,7 +188,7 @@ fn scan(path:&Path,shared:&Shared,row:&mut FileResult)->Result<()>{
             let mut bytes=vec![0u8;total];bytes[..32].copy_from_slice(&header);
             if lookup.read_exact(&mut bytes[32..]).is_err(){continue;}
             if Container::parse(&bytes).is_err(){continue;}
-            row.accepted+=1;shared.analyze(&bytes)?;
+            row.accepted+=1;shared.analyze(&bytes,format!("{}@{off:#x}",path.display()))?;
         }
         carry=len.min(3);buffer.copy_within(len-carry..len,0);pos+=n as u64;
     }
@@ -199,7 +200,7 @@ fn scan(path:&Path,shared:&Shared,row:&mut FileResult)->Result<()>{
             for record in vortex_game::sgd5::records(&data){
                 if let Some(bytes)=record.unpack(){
                     if length(&bytes).is_some_and(|n|n<=bytes.len())&&Container::parse(&bytes).is_ok(){
-                        row.packed+=1;shared.analyze(&bytes)?;
+                        row.packed+=1;shared.analyze(&bytes,format!("{}@{:#x} (SGD5)",path.display(),record.offset))?;
                     }
                 }
             }
@@ -226,8 +227,22 @@ pub fn run(root:&Path,workers:usize,validate:bool,refresh:bool)->Result<()>{
     vortex_core::ensure_outside_repo(&root)?;
     let cfg=vortex_core::Config::load()?;
     // Resolve cache before any output, and refuse writes below the scanned tree.
-    let cache_base=cfg.cache_subdir("vulkan-precompile")?;
-    let cache_base=fs::canonicalize(cache_base)?;
+    let requested=cfg.cache_dir.join("vulkan-precompile");
+    // Resolve the existing ancestor before creating directories. Refuse
+    // symlink/junction aliases into the source tree or scanned tree.
+    let absolute=if requested.is_absolute(){requested}else{std::env::current_dir()?.join(requested)};
+    let mut ancestor=absolute.as_path();let mut tail=Vec::new();
+    while !ancestor.exists(){
+        let name=ancestor.file_name().context("cannot resolve cache location")?;
+        tail.push(name.to_os_string());
+        ancestor=ancestor.parent().context("cache has no existing parent")?;
+    }
+    let mut resolved=fs::canonicalize(ancestor)?;
+    for name in tail.iter().rev(){resolved.push(name);}
+    anyhow::ensure!(!resolved.starts_with(&root),"cache must be outside scanned directory");
+    vortex_core::ensure_outside_repo(&resolved)?;
+    fs::create_dir_all(&resolved)?;
+    let cache_base=fs::canonicalize(resolved)?;
     anyhow::ensure!(!cache_base.starts_with(&root),"cache must be outside scanned directory");
     let exe=std::env::current_exe()?;
     let compiler=digest_file(&exe)?;
@@ -253,7 +268,7 @@ pub fn run(root:&Path,workers:usize,validate:bool,refresh:bool)->Result<()>{
     }
     files.sort();
     println!("VULKAN_PRECOMPILE_START files={} workers={workers} report={}",files.len(),report.display());
-    let shared=Shared{cache,validate,refresh,seen:Mutex::new(HashSet::new()),totals:Mutex::new(Analysis::default()),
+    let shared=Shared{cache,validate,refresh,seen:Mutex::new(BTreeMap::new()),totals:Mutex::new(Analysis::default()),
         duplicates:AtomicUsize::new(0),hits:AtomicUsize::new(0),unique:AtomicUsize::new(0)};
     let next=AtomicUsize::new(0);
     let results=Mutex::new(Vec::new());
@@ -282,6 +297,12 @@ pub fn run(root:&Path,workers:usize,validate:bool,refresh:bool)->Result<()>{
         writeln!(inventory,"{}\t{}\t{}\t{}\t{}\t{}\t{}",clean(&relative.to_string_lossy()),row.size,row.read,row.markers,row.accepted,row.packed,clean(&row.status))?;
     }
     inventory.flush()?;
+    let mut index=BufWriter::new(File::create(report.join("containers.tsv"))?);
+    writeln!(index,"blake3\tfirst_location\tmetadata_cached")?;
+    for (hash,origin) in shared.seen.into_inner().unwrap_or_else(|e|e.into_inner()){
+        writeln!(index,"{hash}\t{}\t{}",clean(&origin),shared.cache.join(format!("{hash}.toml")).is_file())?;
+    }
+    index.flush()?;
     let totals=shared.totals.into_inner().unwrap_or_else(|e|e.into_inner());
     let unique=shared.unique.load(Ordering::Relaxed);let duplicates=shared.duplicates.load(Ordering::Relaxed);let hits=shared.hits.load(Ordering::Relaxed);
     let mut w=BufWriter::new(File::create(report.join("report.txt"))?);
@@ -304,6 +325,22 @@ mod tests{
         h[24..28].copy_from_slice(&32u32.to_le_bytes());assert_eq!(length(&h),Some(32));
         h[24..28].copy_from_slice(&u32::MAX.to_le_bytes());assert_eq!(length(&h),None);
         assert_eq!(length(b"DXBC"),None);
+    }
+    #[test]fn scan_boundary_and_duplicate(){
+        let temp=tempfile::tempdir().unwrap();
+        let cache=temp.path().join("cache");fs::create_dir(&cache).unwrap();
+        let path=temp.path().join("fixture.bin");
+        let mut bytes=vec![0u8;BLOCK-2];let mut h=[0u8;32];
+        h[..4].copy_from_slice(b"DXBC");h[24..28].copy_from_slice(&32u32.to_le_bytes());
+        bytes.extend(h);bytes.extend(h);
+        fs::write(&path,&bytes).unwrap();
+        let shared=Shared{cache,validate:false,refresh:false,seen:Mutex::new(BTreeMap::new()),
+            totals:Mutex::new(Analysis::default()),duplicates:AtomicUsize::new(0),
+            hits:AtomicUsize::new(0),unique:AtomicUsize::new(0)};
+        let mut row=FileResult::default();scan(&path,&shared,&mut row).unwrap();
+        assert_eq!(row.accepted,2);assert_eq!(row.read,bytes.len() as u64);
+        assert_eq!(shared.unique.load(Ordering::Relaxed),1);
+        assert_eq!(shared.duplicates.load(Ordering::Relaxed),1);
     }
     #[test]fn metadata_roundtrip(){
         let mut a=Analysis{programs:2,ir_ok:1,..Default::default()};
