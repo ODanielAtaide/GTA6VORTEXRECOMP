@@ -14,7 +14,7 @@
 //! arbitrary descriptors, VCC branches or general mask dataflow yet.
 //! Execution is capped at 4096 basic-block visits to avoid unbounded GPU hangs.
 use std::collections::BTreeMap;
-use crate::{ShaderError, gfx10::{Fields, Operand, Encoding}, ir::{self, Reg, Exit, EXEC}};
+use crate::{ShaderError, gfx10::{Fields, Operand, Encoding}, ir::{self, Reg, Exit, EXEC, VCC}};
 
 const UINT:u32=3;
 const BOOL:u32=4;
@@ -29,6 +29,8 @@ const PUSH_PTR:u32=17;
 const LDS_PTR:u32=18;
 const MAIN:u32=19;
 const SUBGROUP_LANE:u32=26;
+const MASK_TYPE:u32=27;
+const STORAGE_SECOND:u32=28;
 
 fn inst(out:&mut Vec<u32>,opcode:u16,args:&[u32]) {
     out.push(((args.len() as u32+1)<<16)|u32::from(opcode));
@@ -39,7 +41,7 @@ fn unsupported(offset:usize,what:&'static str)->ShaderError {
 }
 struct Emit {
     next:u32, globals:Vec<u32>, body:Vec<u32>, constants:BTreeMap<u32,u32>,
-    regs:BTreeMap<Reg,u32>, pc:u32,budget:u32, active:u32, global_index:u32, length:u32, wave64:bool,
+    regs:BTreeMap<Reg,u32>, pc:u32,budget:u32, active:u32, global_index:u32, length:u32, length_second:u32, wave64:bool, multi:bool,
 }
 impl Emit {
     fn id(&mut self)->u32 { let n=self.next; self.next+=1; n }
@@ -70,13 +72,51 @@ impl Emit {
             Operand::Literal(n)=>Ok(self.c(n)),
             Operand::Const(n @ 128..=192)=>Ok(self.c(u32::from(n-128))),
             Operand::Const(n @ 193..=208)=>Ok(self.c(0u32.wrapping_sub(u32::from(n-192)))),
-            Operand::Scalar{code,dwords:1} if scalar(code)=>self.reg(Reg::S(code)),
+            Operand::Scalar{code,dwords:1} if scalar(code)&&!(self.multi&&second_descriptor(Reg::S(code)))=>self.reg(Reg::S(code)),
             Operand::Vector{reg,dwords:1} if reg<=31=>self.reg(Reg::V(reg)),
             _=>Err(unsupported(0,"CFG operand")),
         }
     }
     fn active_condition(&mut self)->u32 {
         let a=self.load(self.active);let z=self.c(0);self.test(171,a,z)
+    }
+    fn ballot(&mut self,cond:u32)->[u32;2] {
+        let scope=self.c(3);
+        let v=self.value(339,MASK_TYPE,&[scope,cond]);
+        [self.value(81,UINT,&[v,0]),self.value(81,UINT,&[v,1])]
+    }
+    fn exec_words(&mut self)->[u32;2] {
+        let active=self.active_condition();self.ballot(active)
+    }
+    fn set_exec_words(&mut self,words:[u32;2]) {
+        let lane=self.load(SUBGROUP_LANE);let thirtyone=self.c(31);let bit=self.u(199,lane,thirtyone);
+        let word=if self.wave64 {
+            let limit=self.c(32);let hi=self.test(174,lane,limit);self.select(hi,words[1],words[0])
+        }else{words[0]};
+        let shifted=self.u(194,word,bit);let one=self.c(1);let value=self.u(199,shifted,one);
+        self.op(62,&[self.active,value]);
+    }
+    fn mask_operand(&mut self,o:Operand,width:u8)->Result<[u32;2],ShaderError> {
+        match o {
+            Operand::Scalar{code,dwords} if dwords==width=>{
+                if code==EXEC {return Ok(self.exec_words());}
+                if (0..width).any(|j|descriptor(Reg::S(code.saturating_add(j)))||(self.multi&&second_descriptor(Reg::S(code.saturating_add(j))))) {
+                    return Err(unsupported(0,"resource descriptor used as mask"));
+                }
+                let lo=self.reg(Reg::S(code))?;
+                let hi=if width==2{self.reg(Reg::S(code.checked_add(1).ok_or(unsupported(0,"mask range"))?))?}else{self.c(0)};
+                Ok([lo,hi])
+            }
+            Operand::Const(193) => {let lo=self.c(u32::MAX);let hi=if width==2{lo}else{self.c(0)};Ok([lo,hi])}
+            Operand::Const(128) => {let z=self.c(0);Ok([z,z])}
+            _=>Err(unsupported(0,"unsupported mask operand")),
+        }
+    }
+    fn put_mask(&mut self,code:u8,width:u8,words:[u32;2])->Result<(),ShaderError> {
+        if code==EXEC {self.set_exec_words(words);return Ok(());}
+        self.put(Reg::S(code),words[0])?;
+        if width==2{self.put(Reg::S(code+1),words[1])?;}
+        Ok(())
     }
     fn put_vector(&mut self,r:Reg,v:u32)->Result<(),ShaderError> {
         let old=self.reg(r)?;let cond=self.active_condition();let result=self.select(cond,v,old);
@@ -91,9 +131,10 @@ impl Emit {
     }
     fn end_guard(&mut self,merge:u32) { self.op(249,&[merge]);self.op(248,&[merge]); }
 }
-fn scalar(r:u8)->bool { r<=105 && !(4..=7).contains(&r) }
+fn scalar(r:u8)->bool { (r<=105 && !(4..=7).contains(&r)) || r==VCC || r==VCC+1 }
 fn ordinary(r:Reg)->bool { matches!(r,Reg::S(n) if scalar(n)) || matches!(r,Reg::Scc|Reg::V(0..=31)) }
 fn descriptor(r:Reg)->bool { matches!(r,Reg::S(4..=7)) }
+fn second_descriptor(r:Reg)->bool { matches!(r,Reg::S(8..=11)) }
 fn exec(r:Reg)->bool { matches!(r,Reg::S(n) if n==EXEC||n==EXEC+1) }
 fn writes(inst:&ir::Inst,expected:&[Reg])->bool {
     inst.writes.len()==expected.len() && expected.iter().all(|r|inst.write(*r).is_some())
@@ -104,10 +145,10 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
     let err=||unsupported(i.machine.offset,"native CFG instruction or operand");
     let name=i.name();
     if i.reads.iter().any(|(r,_)|!ordinary(*r)&&!descriptor(*r)&&!exec(*r))
-        || i.writes.iter().any(|(r,_)|(!ordinary(*r)&&!exec(*r))||*r==Reg::V(0)) { return Err(err()); }
+        || i.writes.iter().any(|(r,_)|(!ordinary(*r)&&!exec(*r))||*r==Reg::V(0)||(e.multi&&second_descriptor(*r))) { return Err(err()); }
     match &i.fields {
         Fields::Sopp{..} => match name {
-            "s_branch"|"s_cbranch_scc0"|"s_cbranch_scc1"|"s_cbranch_execz"|"s_cbranch_execnz"|"s_endpgm" if i.writes.is_empty()=>Ok(()),
+            "s_branch"|"s_cbranch_scc0"|"s_cbranch_scc1"|"s_cbranch_execz"|"s_cbranch_execnz"|"s_cbranch_vccz"|"s_cbranch_vccnz"|"s_endpgm" if i.writes.is_empty()=>Ok(()),
             "s_barrier" if i.writes.is_empty() => {
                 // The preflight rejects wave-dependent control in barrier programs.
                 let scope=e.c(2);let semantics=e.c(0x108);
@@ -116,6 +157,42 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
             _=>Err(err()),
         },
         Fields::Sop{dst,src,imm:None}=>{
+            let width=if e.wave64{2}else{1};
+            let save=name.ends_with("saveexec_b32")||name.ends_with("saveexec_b64");
+            let mask_move=matches!(name,"s_mov_b32"|"s_mov_b64") && matches!(dst,Some(Operand::Scalar{code,..}) if *code==EXEC)
+                && matches!(src.as_slice(),[Operand::Scalar{..}]);
+            if save||mask_move {
+                let Some(Operand::Scalar{code,dwords})=*dst else{return Err(err());};
+                if dwords!=width || (save && (exec(Reg::S(code))||code>104||!scalar(code)
+                    || (width==2&&!scalar(code+1)))) {return Err(err());}
+                let &[source]=src.as_slice()else{return Err(err());};
+                let words=e.mask_operand(source,width)?;
+                let mut expected:Vec<Reg>=(0..width).map(|j|Reg::S(code+j)).collect();
+                if save {
+                    let old=e.exec_words();
+                    expected.extend((0..width).map(|j|Reg::S(EXEC+j)));expected.push(Reg::Scc);
+                    if !writes(i,&expected){return Err(err());}
+                    let mut next=[e.c(0);2];
+                    for j in 0..usize::from(width) {
+                        next[j]=match name {
+                            "s_and_saveexec_b32"|"s_and_saveexec_b64"=>e.u(199,old[j],words[j]),
+                            "s_or_saveexec_b32"|"s_or_saveexec_b64"=>e.u(197,old[j],words[j]),
+                            "s_xor_saveexec_b32"|"s_xor_saveexec_b64"=>e.u(198,old[j],words[j]),
+                            "s_andn2_saveexec_b32"|"s_andn2_saveexec_b64"=>{
+                                let n=e.value(200,UINT,&[words[j]]);e.u(199,old[j],n)
+                            }
+                            _=>return Err(err()),
+                        };
+                    }
+                    e.put_mask(code,width,old)?;e.set_exec_words(next);
+                    let union=e.u(197,next[0],next[1]);let z=e.c(0);let cond=e.test(171,union,z);
+                    let flag=e.flag(cond);e.put(Reg::Scc,flag)?;
+                }else{
+                    if !writes(i,&expected){return Err(err());}
+                    e.set_exec_words(words);
+                }
+                return Ok(());
+            }
             if let Some(Operand::Scalar{code,dwords:1})=*dst {
                 if exec(Reg::S(code)) {
                     if name!="s_mov_b32" || !i.reads.is_empty() || !writes(i,&[Reg::S(code)])
@@ -176,14 +253,17 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
             if i.machine.encoding==Encoding::Vopc {
                 let args:Vec<u32>=v.src.iter().map(|o|e.operand(*o)).collect::<Result<_,_>>()?;
                 let &[a,b]=args.as_slice() else{return Err(err());};
-                let opcode=match name {"v_cmpx_lt_u32"=>176,"v_cmpx_gt_u32"=>172,
-                    "v_cmpx_le_u32"=>178,"v_cmpx_ge_u32"=>174,"v_cmpx_eq_u32"=>170,
-                    "v_cmpx_ne_u32"|"v_cmpx_lg_u32"=>171,_=>return Err(err())};
-                let expected=if e.wave64{vec![Reg::S(EXEC),Reg::S(EXEC+1)]}else{vec![Reg::S(EXEC)]};
+                let opcode=match name {"v_cmpx_lt_u32"|"v_cmp_lt_u32"=>176,"v_cmpx_gt_u32"|"v_cmp_gt_u32"=>172,
+                    "v_cmpx_le_u32"|"v_cmp_le_u32"=>178,"v_cmpx_ge_u32"|"v_cmp_ge_u32"=>174,"v_cmpx_eq_u32"|"v_cmp_eq_u32"=>170,
+                    "v_cmpx_ne_u32"|"v_cmpx_lg_u32"|"v_cmp_ne_u32"=>171,_=>return Err(err())};
+                let target=if name.starts_with("v_cmpx"){EXEC}else{VCC};
+                let expected=if e.wave64{vec![Reg::S(target),Reg::S(target+1)]}else{vec![Reg::S(target)]};
                 if !writes(i,&expected){return Err(err());}
                 let cmp=e.test(opcode,a,b);let active=e.active_condition();
-                let result=e.value(167,BOOL,&[cmp,active]);let result=e.flag(result);
-                e.op(62,&[e.active,result]);return Ok(());
+                let result=e.value(167,BOOL,&[cmp,active]);
+                if target==EXEC {let bit=e.flag(result);e.op(62,&[e.active,bit]);}
+                else {let mask=e.ballot(result);e.put_mask(VCC,if e.wave64{2}else{1},mask)?;}
+                return Ok(());
             }
             let dst=vector(v.dst.ok_or_else(err)?).ok_or_else(err)?;
             let r=Reg::V(dst);
@@ -205,8 +285,13 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
         Fields::Buffer{data,addr,rsrc,soffset,offset,offen,idxen,format,lds,tfe,cache}=>{
             if i.machine.encoding!=Encoding::Mubuf || *offen || !*idxen || offset%4!=0
                 || format.is_some() || *lds || *tfe || cache.slc || cache.dlc
-                || *rsrc!=(Operand::Scalar{code:4,dwords:4}) || *soffset!=Operand::Const(128)
-                || (4..=7).any(|r|i.read(Reg::S(r)).is_none()) {return Err(err());}
+                || *soffset!=Operand::Const(128) {return Err(err());}
+            let (base,length,sgpr)=match *rsrc {
+                Operand::Scalar{code:4,dwords:4}=>(STORAGE,e.length,4),
+                Operand::Scalar{code:8,dwords:4} if e.multi=>(STORAGE_SECOND,e.length_second,8),
+                _=>return Err(err()),
+            };
+            if (sgpr..sgpr+4).any(|r|i.read(Reg::S(r)).is_none()){return Err(err());}
             let address=vector(*addr).ok_or_else(err)?;
             let Some(Operand::Vector{reg,dwords})=*data else{return Err(err());};
             let atomic=name.starts_with("buffer_atomic_");
@@ -220,7 +305,7 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
             if name=="buffer_store_dword" && (address!=0||*offset!=0){return Err(err());}
             let raw=e.reg(Reg::V(address))?;let off=e.c(u32::from(*offset)/4);
             let index=e.u(128,raw,off);let no_wrap=e.test(174,index,raw);
-            let in_bounds=e.test(176,index,e.length);
+            let in_bounds=e.test(176,index,length);
             let bounded=e.value(167,BOOL,&[no_wrap,in_bounds]);
             let active=e.active_condition();let safe=e.value(167,BOOL,&[bounded,active]);
             // Out-of-range load/returning atomic produces zero. Store is skipped.
@@ -228,7 +313,7 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
             let compare=if cmp{Some(e.reg(Reg::V(reg+1))?)}else{None};
             if !expected.is_empty(){let z=e.c(0);e.put_vector(r,z)?;}
             let merge=e.guard(safe);let z=e.c(0);
-            let ptr=e.pointer(STORAGE_PTR,STORAGE,&[z,index]);
+            let ptr=e.pointer(STORAGE_PTR,base,&[z,index]);
             match name {
                 "buffer_load_dword"=>{let val=e.load(ptr);e.put(r,val)?;},
                 "buffer_store_dword"=>{let val=e.reg(r)?;e.op(62,&[ptr,val]);},
@@ -276,16 +361,21 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
 /// uniform within a physical subgroup; wave branches vote across all its lanes.
 fn has_wave_flow(p:&ir::Program)->bool {
     p.blocks.iter().flat_map(|b|&b.insts).any(|i|
-        i.writes.iter().any(|(r,_)|exec(*r)) || matches!(i.name(),"s_cbranch_execz"|"s_cbranch_execnz"))
+        i.writes.iter().any(|(r,_)|exec(*r)||matches!(r,Reg::S(106..=107))) || matches!(i.name(),"s_cbranch_execz"|"s_cbranch_execnz"|"s_cbranch_vccz"|"s_cbranch_vccnz"))
 }
 
 /// Barrier participation is workgroup-uniform only for the scalar-only path.
-pub fn emit_cfg(p:&ir::Program)->Result<Vec<u32>,ShaderError> {
+pub fn emit_cfg(p:&ir::Program)->Result<Vec<u32>,ShaderError> { emit_cfg_inner(p,false) }
+
+/// Explicit two-resource ABI: s[4:7] -> binding 0, s[8:11] -> binding 1.
+pub fn emit_cfg_two_resources(p:&ir::Program)->Result<Vec<u32>,ShaderError> { emit_cfg_inner(p,true) }
+
+fn emit_cfg_inner(p:&ir::Program,multi:bool)->Result<Vec<u32>,ShaderError> {
     if p.blocks.is_empty()||p.blocks.len()>256||p.vgprs>32
         || p.blocks.iter().map(|b|b.insts.len()).sum::<usize>()>4096 {
         return Err(unsupported(0,"CFG size"));
     }
-    if p.inputs.iter().any(|(r,_)|!matches!(r,Reg::S(0..=1)|Reg::V(0..=31))&&!descriptor(*r)&&!exec(*r)){
+    if p.inputs.iter().any(|(r,_)|!matches!(r,Reg::S(0..=1)|Reg::V(0..=31))&&!descriptor(*r)&&!(multi&&second_descriptor(*r))&&!exec(*r)){
         return Err(unsupported(0,"undeclared CFG input"));
     }
     if has_wave_flow(p)&&p.blocks.iter().flat_map(|b|&b.insts).any(|i|
@@ -293,14 +383,14 @@ pub fn emit_cfg(p:&ir::Program)->Result<Vec<u32>,ShaderError> {
         return Err(unsupported(0,"LDS or barrier in wave-dependent CFG"));
     }
     let mut e=Emit {next:32,globals:vec![],body:vec![],constants:BTreeMap::new(),
-        regs:BTreeMap::new(),pc:0,budget:0,active:0,global_index:0,length:0,wave64:p.wave64};
+        regs:BTreeMap::new(),pc:0,budget:0,active:0,global_index:0,length:0,length_second:0,wave64:p.wave64,multi};
     let mut used=std::collections::BTreeSet::new();
-    for &(r,_) in &p.inputs {if ordinary(r){used.insert(r);}}
+    for &(r,_) in &p.inputs {if ordinary(r)&&!(multi&&second_descriptor(r)){used.insert(r);}}
     for b in &p.blocks {
         for i in &b.insts {
-            for &(r,_) in i.reads.iter().chain(i.writes.iter()) {if ordinary(r){used.insert(r);}}
+            for &(r,_) in i.reads.iter().chain(i.writes.iter()) {if ordinary(r)&&!(multi&&second_descriptor(r)){used.insert(r);}}
         }
-        for phi in &b.phis {if ordinary(phi.reg){used.insert(phi.reg);}else if !exec(phi.reg){return Err(unsupported(b.offset,"CFG phi register"));}}
+        for phi in &b.phis {if ordinary(phi.reg)&&!(multi&&second_descriptor(phi.reg)){used.insert(phi.reg);}else if !exec(phi.reg){return Err(unsupported(b.offset,"CFG phi register"));}}
         if b.exit==Exit::Indirect||b.exit.successors().iter().any(|&b|b>=p.blocks.len()){
             return Err(unsupported(b.offset,"CFG indirect or invalid target"));
         }
@@ -313,6 +403,7 @@ pub fn emit_cfg(p:&ir::Program)->Result<Vec<u32>,ShaderError> {
     let global=e.value(61,5,&[GLOBAL]);
     e.global_index=e.value(81,UINT,&[global,0]);
     e.length=e.value(68,UINT,&[STORAGE,0]);
+    if multi { e.length_second=e.value(68,UINT,&[STORAGE_SECOND,0]); }
     let regs:Vec<_>=e.regs.keys().copied().collect();
     for r in regs {
         let val=match r {
@@ -349,6 +440,12 @@ pub fn emit_cfg(p:&ir::Program)->Result<Vec<u32>,ShaderError> {
                         let scc=e.reg(Reg::Scc)?;
                         e.test(if last.name()=="s_cbranch_scc0"{170}else{171},scc,zero)
                     }
+                    "s_cbranch_vccz"|"s_cbranch_vccnz"=>{
+                        let lo=e.reg(Reg::S(VCC))?;
+                        let hi=if e.wave64{e.reg(Reg::S(VCC+1))?}else{zero};
+                        let mask=e.u(197,lo,hi);
+                        e.test(if last.name()=="s_cbranch_vccz"{170}else{171},mask,zero)
+                    }
                     "s_cbranch_execz"|"s_cbranch_execnz"=>{
                         let active=e.active_condition();let scope=e.c(3);
                         let any=e.value(335,BOOL,&[scope,active]);
@@ -369,16 +466,17 @@ pub fn emit_cfg(p:&ir::Program)->Result<Vec<u32>,ShaderError> {
     // Module layout: declarations, constants, globals, then function.
     let mut out=vec![0x07230203,0x00010300,0,e.next,0];
     let o=|out:&mut Vec<u32>,op,a:&[u32]|inst(out,op,a);
-    o(&mut out,17,&[1]);o(&mut out,17,&[61]);o(&mut out,17,&[62]); // Shader, GroupNonUniform, Vote
+    o(&mut out,17,&[1]);o(&mut out,17,&[61]);o(&mut out,17,&[62]);o(&mut out,17,&[64]); // Shader, GroupNonUniform, Vote, Ballot
     o(&mut out,14,&[0,1]);o(&mut out,15,&[5,MAIN,0x6e69616d,0,GLOBAL,SUBGROUP,SUBGROUP_LANE]);
     o(&mut out,16,&[MAIN,17,64,1,1]);
     o(&mut out,71,&[GLOBAL,11,28]);o(&mut out,71,&[SUBGROUP,11,36]);
     o(&mut out,71,&[SUBGROUP_LANE,11,41]);
     o(&mut out,71,&[6,6,4]);o(&mut out,71,&[7,2]);o(&mut out,72,&[7,0,35,0]);
     o(&mut out,71,&[STORAGE,34,0]);o(&mut out,71,&[STORAGE,33,0]);
+    if multi {o(&mut out,71,&[STORAGE_SECOND,34,0]);o(&mut out,71,&[STORAGE_SECOND,33,1]);}
     o(&mut out,71,&[8,2]);o(&mut out,72,&[8,0,35,0]);o(&mut out,72,&[8,1,35,4]);
     o(&mut out,19,&[1]);o(&mut out,33,&[2,1]);o(&mut out,21,&[UINT,32,0]);o(&mut out,20,&[BOOL]);
-    o(&mut out,23,&[5,UINT,3]);o(&mut out,29,&[6,UINT]);o(&mut out,30,&[7,6]);
+    o(&mut out,23,&[5,UINT,3]);o(&mut out,23,&[MASK_TYPE,UINT,4]);o(&mut out,29,&[6,UINT]);o(&mut out,30,&[7,6]);
     o(&mut out,30,&[8,UINT,UINT]);o(&mut out,43,&[UINT,20,64]);o(&mut out,28,&[9,UINT,20]);
     for (id,storage,ty) in [(FUNCTION_PTR,7,UINT),(STORAGE_PTR,12,UINT),(PUSH_PTR,9,UINT),
         (LDS_PTR,4,UINT),(21,1,5),(22,12,7),(23,9,8),(24,4,9),(25,1,UINT)] {
@@ -388,6 +486,7 @@ pub fn emit_cfg(p:&ir::Program)->Result<Vec<u32>,ShaderError> {
     for (ty,id,storage) in [(21,GLOBAL,1),(22,STORAGE,12),(23,PUSH,9),(24,LDS,4),(25,SUBGROUP,1),(25,SUBGROUP_LANE,1)] {
         o(&mut out,59,&[ty,id,storage]);
     }
+    if multi {o(&mut out,59,&[22,STORAGE_SECOND,12]);}
     out.extend(e.body);Ok(out)
 }
 
