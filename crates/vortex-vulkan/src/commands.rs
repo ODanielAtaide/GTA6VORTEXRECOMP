@@ -25,11 +25,34 @@ pub struct ImageRegion {
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
 pub enum MemoryKind { DeviceLocal, HostVisible }
 
+/// Initial attachment formats; all supported texels occupy four bytes.
+#[derive(Debug,Clone,Copy,PartialEq,Eq)]
+pub enum ImageKind { Rgba8, Depth32 }
+
+impl ImageKind {
+    fn format(self) -> vk::Format {
+        match self { Self::Rgba8 => vk::Format::R8G8B8A8_UNORM, Self::Depth32 => vk::Format::D32_SFLOAT }
+    }
+    fn aspect(self) -> vk::ImageAspectFlags {
+        match self { Self::Rgba8 => vk::ImageAspectFlags::COLOR, Self::Depth32 => vk::ImageAspectFlags::DEPTH }
+    }
+    fn usage(self) -> vk::ImageUsageFlags {
+        let transfer = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        transfer | match self {
+            Self::Rgba8 => vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            Self::Depth32 => vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+        }
+    }
+}
+
 #[derive(Debug,Clone,Copy)]
 pub enum Command {
     Fill { dst: BufferId, offset: u64, bytes: u64, value: u32 },
     Copy { src: BufferId, src_offset: u64, dst: BufferId, dst_offset: u64, bytes: u64 },
     ClearImage { dst: ImageId, rgba: [f32;4] },
+    ClearDepth { dst: ImageId, depth: f32 },
+    /// Clear and store color and depth attachments over a render rectangle.
+    ClearAttachments { color: ImageId, depth: ImageId, region: ImageRegion, rgba: [f32;4], z: f32 },
     UploadImage { src: BufferId, offset: u64, dst: ImageId, region: ImageRegion },
     ReadImage { src: ImageId, region: ImageRegion, dst: BufferId, offset: u64 },
     CopyImage { src: ImageId, region: ImageRegion, dst: ImageId, x: u32, y: u32 },
@@ -94,18 +117,17 @@ impl<'a> Buffer<'a> {
     }
 }
 
-const IMAGE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
-const IMAGE_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
-    vk::ImageUsageFlags::TRANSFER_SRC.as_raw() | vk::ImageUsageFlags::TRANSFER_DST.as_raw()
-    | vk::ImageUsageFlags::SAMPLED.as_raw());
-
-fn color_range() -> vk::ImageSubresourceRange {
-    vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR)
+fn image_range(kind: ImageKind) -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange::default().aspect_mask(kind.aspect())
         .level_count(1).layer_count(1)
 }
-fn color_layers() -> vk::ImageSubresourceLayers {
-    vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1)
+fn image_layers(kind: ImageKind) -> vk::ImageSubresourceLayers {
+    vk::ImageSubresourceLayers::default().aspect_mask(kind.aspect()).layer_count(1)
 }
+fn valid_color(rgba: [f32;4]) -> bool {
+    rgba.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+}
+fn valid_depth(z: f32) -> bool { z.is_finite() && (0.0..=1.0).contains(&z) }
 fn image_offset(region: ImageRegion) -> vk::Offset3D {
     vk::Offset3D { x:region.x as i32,y:region.y as i32,z:0 }
 }
@@ -122,9 +144,9 @@ fn region_bytes(width:u32,height:u32,region:ImageRegion) -> Result<u64> {
     u64::from(region.width).checked_mul(u64::from(region.height))
         .and_then(|n| n.checked_mul(4)).ok_or_else(|| "image byte count overflow".into())
 }
-fn buffer_image_copy(offset:u64,region:ImageRegion) -> vk::BufferImageCopy {
+fn buffer_image_copy(offset:u64,region:ImageRegion,kind:ImageKind) -> vk::BufferImageCopy {
     vk::BufferImageCopy::default().buffer_offset(offset)
-        .image_subresource(color_layers()).image_offset(image_offset(region))
+        .image_subresource(image_layers(kind)).image_offset(image_offset(region))
         .image_extent(image_extent(region))
 }
 
@@ -132,6 +154,8 @@ struct Image<'a> {
     d: &'a ash::Device,
     handle: vk::Image,
     memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    kind: ImageKind,
     width: u32,
     height: u32,
     initialized: bool,
@@ -139,21 +163,22 @@ struct Image<'a> {
 impl Drop for Image<'_> {
     fn drop(&mut self) {
         unsafe {
+            self.d.destroy_image_view(self.view,None);
             self.d.destroy_image(self.handle,None);
             self.d.free_memory(self.memory,None);
         }
     }
 }
 impl<'a> Image<'a> {
-    fn new(d:&'a ash::Device,mem:&vk::PhysicalDeviceMemoryProperties,width:u32,height:u32) -> Result<Self> {
+    fn new(d:&'a ash::Device,mem:&vk::PhysicalDeviceMemoryProperties,width:u32,height:u32,kind:ImageKind) -> Result<Self> {
         let mut image = Self { d,handle:vk::Image::null(),memory:vk::DeviceMemory::null(),
-            width,height,initialized:false };
+            view:vk::ImageView::null(),kind,width,height,initialized:false };
         unsafe {
             image.handle = d.create_image(&vk::ImageCreateInfo::default()
-                .image_type(vk::ImageType::TYPE_2D).format(IMAGE_FORMAT)
+                .image_type(vk::ImageType::TYPE_2D).format(kind.format())
                 .extent(vk::Extent3D { width,height,depth:1 }).mip_levels(1).array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1).tiling(vk::ImageTiling::OPTIMAL)
-                .usage(IMAGE_USAGE).sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .usage(kind.usage()).sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .initial_layout(vk::ImageLayout::UNDEFINED),None)?;
             let req = d.get_image_memory_requirements(image.handle);
             use vk::MemoryPropertyFlags as F;
@@ -167,6 +192,9 @@ impl<'a> Image<'a> {
             image.memory = d.allocate_memory(&vk::MemoryAllocateInfo::default()
                 .allocation_size(req.size).memory_type_index(index),None)?;
             d.bind_image_memory(image.handle,image.memory,0)?;
+            image.view = d.create_image_view(&vk::ImageViewCreateInfo::default()
+                .image(image.handle).view_type(vk::ImageViewType::TYPE_2D)
+                .format(kind.format()).subresource_range(image_range(kind)),None)?;
         }
         Ok(image)
     }
@@ -174,6 +202,21 @@ impl<'a> Image<'a> {
     fn check(&self,region:ImageRegion) -> Result<u64> {
         region_bytes(self.width,self.height,region)
     }
+}
+
+// SAFETY: invoked only for the single initial clear of a newly allocated
+// image; its previous layout is UNDEFINED and no other operation owns it.
+fn initialize_layout(d:&ash::Device,cmd:vk::CommandBuffer,image:&Image<'_>) {
+    if image.initialized { return; }
+    let barriers = [vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+        .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+        .old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image.handle).subresource_range(image_range(image.kind))];
+    unsafe { d.cmd_pipeline_barrier2(cmd,&vk::DependencyInfo::default().image_memory_barriers(&barriers)); }
 }
 
 /// Owns resources and a command queue while exclusively borrowing Context.
@@ -258,25 +301,38 @@ impl<'a> Session<'a> {
         self.images.get(&id).ok_or_else(|| "unknown or retired image ID".into())
     }
 
-    /// Allocate an optimal-tiled RGBA8 2D image, clear it, and leave it in GENERAL.
-    /// Other formats, mips, layers, and rendering attachment usage are not yet supported.
+    /// Allocate an RGBA8 color image, compatible with rendering and transfers.
     pub fn create_image(&mut self,width:u32,height:u32) -> Result<ImageId> {
+        self.create_image_kind(width,height,ImageKind::Rgba8)
+    }
+
+    pub fn create_depth_image(&mut self,width:u32,height:u32) -> Result<ImageId> {
+        self.create_image_kind(width,height,ImageKind::Depth32)
+    }
+
+    fn create_image_kind(&mut self,width:u32,height:u32,kind:ImageKind) -> Result<ImageId> {
         self.ready()?;
         if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
             return Err("invalid image dimensions".into());
         }
         let properties = unsafe { self.instance.get_physical_device_image_format_properties(
-            self.physical,IMAGE_FORMAT,vk::ImageType::TYPE_2D,vk::ImageTiling::OPTIMAL,
-            IMAGE_USAGE,vk::ImageCreateFlags::empty())? };
-        if width > properties.max_extent.width || height > properties.max_extent.height {
+            self.physical,kind.format(),vk::ImageType::TYPE_2D,vk::ImageTiling::OPTIMAL,
+            kind.usage(),vk::ImageCreateFlags::empty())? };
+        let limits = unsafe { self.instance.get_physical_device_properties(self.physical) }.limits;
+        if width > properties.max_extent.width || height > properties.max_extent.height
+            || width > limits.max_framebuffer_width || height > limits.max_framebuffer_height {
             return Err("image dimensions exceed device limits".into());
         }
         let id = ImageId(self.next_id);
         self.next_id = self.next_id.checked_add(1).ok_or("image ID exhausted")?;
-        let image = Image::new(self.d,&self.memory,width,height)?;
+        let image = Image::new(self.d,&self.memory,width,height,kind)?;
         self.images.insert(id,image);
         // The ID is not exposed until this one-command initial clear completes.
-        self.submit(&[Command::ClearImage { dst:id,rgba:[0.;4] }])?;
+        let clear = match kind {
+            ImageKind::Rgba8 => Command::ClearImage { dst:id,rgba:[0.;4] },
+            ImageKind::Depth32 => Command::ClearDepth { dst:id,depth:1. },
+        };
+        self.submit(&[clear])?;
         self.images.get_mut(&id).expect("created image").initialized = true;
         Ok(id)
     }
@@ -328,13 +384,30 @@ impl<'a> Session<'a> {
                     check_range(self.buffer(dst)?.bytes,dst_offset,bytes)?;
                 }
                 Command::ClearImage { dst,rgba } => {
-                    self.image(dst)?;
-                    if rgba.iter().any(|v| !v.is_finite() || !(0.0..=1.0).contains(v)) {
-                        return Err("invalid normalized clear color".into());
+                    if self.image(dst)?.kind != ImageKind::Rgba8 || !valid_color(rgba) {
+                        return Err("invalid color image or clear color".into());
                     }
                 }
+                Command::ClearDepth { dst,depth } => {
+                    if self.image(dst)?.kind != ImageKind::Depth32 || !valid_depth(depth) {
+                        return Err("invalid depth image or clear value".into());
+                    }
+                }
+                Command::ClearAttachments { color,depth,region,rgba,z } => {
+                    let c = self.image(color)?;
+                    let d = self.image(depth)?;
+                    if c.kind != ImageKind::Rgba8 || d.kind != ImageKind::Depth32
+                        || (c.width,c.height) != (d.width,d.height)
+                        || !valid_color(rgba) || !valid_depth(z) {
+                        return Err("incompatible render attachments or clear values".into());
+                    }
+                    c.check(region)?;
+                    d.check(region)?;
+                }
                 Command::UploadImage { src,offset,dst,region } => {
-                    let bytes = self.image(dst)?.check(region)?;
+                    let image = self.image(dst)?;
+                    if image.kind != ImageKind::Rgba8 { return Err("depth upload not implemented".into()); }
+                    let bytes = image.check(region)?;
                     check_range(self.buffer(src)?.bytes,offset,bytes)?;
                 }
                 Command::ReadImage { src,region,dst,offset } => {
@@ -343,8 +416,11 @@ impl<'a> Session<'a> {
                 }
                 Command::CopyImage { src,region,dst,x,y } => {
                     if src == dst { return Err("same-image copy is not implemented".into()); }
-                    self.image(src)?.check(region)?;
-                    self.image(dst)?.check(ImageRegion { x,y,..region })?;
+                    let from = self.image(src)?;
+                    let to = self.image(dst)?;
+                    if from.kind != to.kind { return Err("image copy format mismatch".into()); }
+                    from.check(region)?;
+                    to.check(ImageRegion { x,y,..region })?;
                 }
             }
         }
@@ -366,12 +442,13 @@ impl<'a> Session<'a> {
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
             for (index,&command) in commands.iter().enumerate() {
                 if index != 0 {
-                    // Conservative transfer dependency, including WAR/WAW/RAW.
+                    // Conservative cross-command dependency covers transfers
+                    // and dynamic rendering attachment operations.
                     let barrier = [vk::MemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                        .src_access_mask(vk::AccessFlags2::TRANSFER_READ | vk::AccessFlags2::TRANSFER_WRITE)
-                        .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                        .dst_access_mask(vk::AccessFlags2::TRANSFER_READ | vk::AccessFlags2::TRANSFER_WRITE)];
+                        .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                        .src_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                        .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)];
                     d.cmd_pipeline_barrier2(cmd,&vk::DependencyInfo::default().memory_barriers(&barrier));
                 }
                 match command {
@@ -384,31 +461,46 @@ impl<'a> Session<'a> {
                     }
                     Command::ClearImage { dst,rgba } => {
                         let image = self.image(dst)?;
-                        if !image.initialized {
-                            let barriers = [vk::ImageMemoryBarrier2::default()
-                                .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                                .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                                .old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL)
-                                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                                .image(image.handle).subresource_range(color_range())];
-                            d.cmd_pipeline_barrier2(cmd,&vk::DependencyInfo::default().image_memory_barriers(&barriers));
-                        }
+                        initialize_layout(d,cmd,image);
                         d.cmd_clear_color_image(cmd,image.handle,vk::ImageLayout::GENERAL,
-                            &vk::ClearColorValue { float32:rgba },&[color_range()]);
+                            &vk::ClearColorValue { float32:rgba },&[image_range(image.kind)]);
+                    }
+                    Command::ClearDepth { dst,depth } => {
+                        let image = self.image(dst)?;
+                        initialize_layout(d,cmd,image);
+                        d.cmd_clear_depth_stencil_image(cmd,image.handle,vk::ImageLayout::GENERAL,
+                            &vk::ClearDepthStencilValue { depth,stencil:0 },&[image_range(image.kind)]);
+                    }
+                    Command::ClearAttachments { color,depth,region,rgba,z } => {
+                        let color = self.image(color)?;
+                        let depth = self.image(depth)?;
+                        let colors = [vk::RenderingAttachmentInfo::default().image_view(color.view)
+                            .image_layout(vk::ImageLayout::GENERAL)
+                            .load_op(vk::AttachmentLoadOp::CLEAR).store_op(vk::AttachmentStoreOp::STORE)
+                            .clear_value(vk::ClearValue { color:vk::ClearColorValue { float32:rgba } })];
+                        let depth_attachment = vk::RenderingAttachmentInfo::default().image_view(depth.view)
+                            .image_layout(vk::ImageLayout::GENERAL)
+                            .load_op(vk::AttachmentLoadOp::CLEAR).store_op(vk::AttachmentStoreOp::STORE)
+                            .clear_value(vk::ClearValue { depth_stencil:vk::ClearDepthStencilValue { depth:z,stencil:0 } });
+                        let area = vk::Rect2D {
+                            offset:vk::Offset2D { x:region.x as i32,y:region.y as i32 },
+                            extent:vk::Extent2D { width:region.width,height:region.height },
+                        };
+                        d.cmd_begin_rendering(cmd,&vk::RenderingInfo::default().render_area(area)
+                            .layer_count(1).color_attachments(&colors).depth_attachment(&depth_attachment));
+                        d.cmd_end_rendering(cmd);
                     }
                     Command::UploadImage { src,offset,dst,region } => {
                         d.cmd_copy_buffer_to_image(cmd,self.buffer(src)?.handle,self.image(dst)?.handle,
-                            vk::ImageLayout::GENERAL,&[buffer_image_copy(offset,region)]);
+                            vk::ImageLayout::GENERAL,&[buffer_image_copy(offset,region,self.image(dst)?.kind)]);
                     }
                     Command::ReadImage { src,region,dst,offset } => {
                         d.cmd_copy_image_to_buffer(cmd,self.image(src)?.handle,vk::ImageLayout::GENERAL,
-                            self.buffer(dst)?.handle,&[buffer_image_copy(offset,region)]);
+                            self.buffer(dst)?.handle,&[buffer_image_copy(offset,region,self.image(src)?.kind)]);
                     }
                     Command::CopyImage { src,region,dst,x,y } => {
-                        let copy = vk::ImageCopy::default().src_subresource(color_layers())
-                            .src_offset(image_offset(region)).dst_subresource(color_layers())
+                        let copy = vk::ImageCopy::default().src_subresource(image_layers(self.image(src)?.kind))
+                            .src_offset(image_offset(region)).dst_subresource(image_layers(self.image(dst)?.kind))
                             .dst_offset(image_offset(ImageRegion { x,y,..region })).extent(image_extent(region));
                         d.cmd_copy_image(cmd,self.image(src)?.handle,vk::ImageLayout::GENERAL,
                             self.image(dst)?.handle,vk::ImageLayout::GENERAL,&[copy]);
@@ -416,8 +508,8 @@ impl<'a> Session<'a> {
                 }
             }
             let host = [vk::MemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::HOST)
                 .dst_access_mask(vk::AccessFlags2::HOST_READ | vk::AccessFlags2::HOST_WRITE)];
             d.cmd_pipeline_barrier2(cmd,&vk::DependencyInfo::default().memory_barriers(&host));
@@ -514,6 +606,55 @@ pub(crate) fn verify_images(context:&mut Context) -> Result<()> {
     }
     println!("PASS: invalid image list and retired resource rejected");
     println!("PASS: reusable Vulkan image command executor verified");
+    Ok(())
+}
+
+pub(crate) fn verify_attachments(context:&mut Context) -> Result<()> {
+    let mut s = Session::new(context)?;
+    let full = ImageRegion { x:0,y:0,width:8,height:8 };
+    let partial = ImageRegion { x:2,y:3,width:4,height:2 };
+    let color = s.create_image(8,8)?;
+    let depth = s.create_depth_image(8,8)?;
+    let output = s.create_buffer(512,MemoryKind::HostVisible)?;
+    let epoch = s.submit(&[
+        Command::ClearAttachments { color,depth,region:full,rgba:[0.,0.,1.,1.],z:0.75 },
+        Command::ClearAttachments { color,depth,region:partial,rgba:[1.,0.,0.,1.],z:0.25 },
+        Command::ReadImage { src:color,region:full,dst:output,offset:0 },
+        Command::ReadImage { src:depth,region:full,dst:output,offset:256 },
+    ])?;
+    let mut expected = Vec::with_capacity(128);
+    for y in 0..8 {
+        for x in 0..8 {
+            let inside = (2..6).contains(&x) && (3..5).contains(&y);
+            expected.push(u32::from_le_bytes(if inside { [255,0,0,255] } else { [0,0,255,255] }));
+        }
+    }
+    for y in 0..8 {
+        for x in 0..8 {
+            let inside = (2..6).contains(&x) && (3..5).contains(&y);
+            expected.push(if inside { 0.25f32.to_bits() } else { 0.75f32.to_bits() });
+        }
+    }
+    if s.read_words(output,0,128)? != expected {
+        return Err("dynamic rendering color/depth rectangle mismatch".into());
+    }
+    println!("PASS: dynamic rendering RGBA8 and D32 color/depth attachment clears at timeline {epoch}");
+    let bad = s.create_depth_image(4,4)?;
+    if s.submit(&[
+        Command::ClearImage { dst:color,rgba:[0.;4] },
+        Command::ClearAttachments { color,depth:bad,region:full,rgba:[0.;4],z:0. },
+    ]).is_ok() { return Err("accepted mismatched attachments".into()); }
+    if s.submit(&[Command::ClearDepth { dst:color,depth:0. }]).is_ok()
+        || s.submit(&[Command::ClearDepth { dst:depth,depth:f32::NAN }]).is_ok() {
+        return Err("accepted invalid depth clear".into());
+    }
+    s.submit(&[
+        Command::ReadImage { src:color,region:full,dst:output,offset:0 },
+        Command::ReadImage { src:depth,region:full,dst:output,offset:256 },
+    ])?;
+    if s.read_words(output,0,128)? != expected { return Err("invalid render list changed attachments".into()); }
+    println!("PASS: mismatched attachments and invalid depth values rejected");
+    println!("PASS: reusable Vulkan color and depth attachment executor verified");
     Ok(())
 }
 
