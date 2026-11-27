@@ -10,6 +10,18 @@ use crate::{Context,Result};
 #[derive(Debug,Clone,Copy,PartialEq,Eq,PartialOrd,Ord)]
 pub struct BufferId(u64);
 
+#[derive(Debug,Clone,Copy,PartialEq,Eq,PartialOrd,Ord)]
+pub struct ImageId(u64);
+
+/// Tightly packed RGBA8 texels, mip 0, layer 0.
+#[derive(Debug,Clone,Copy,PartialEq,Eq)]
+pub struct ImageRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
 pub enum MemoryKind { DeviceLocal, HostVisible }
 
@@ -17,6 +29,10 @@ pub enum MemoryKind { DeviceLocal, HostVisible }
 pub enum Command {
     Fill { dst: BufferId, offset: u64, bytes: u64, value: u32 },
     Copy { src: BufferId, src_offset: u64, dst: BufferId, dst_offset: u64, bytes: u64 },
+    ClearImage { dst: ImageId, rgba: [f32;4] },
+    UploadImage { src: BufferId, offset: u64, dst: ImageId, region: ImageRegion },
+    ReadImage { src: ImageId, region: ImageRegion, dst: BufferId, offset: u64 },
+    CopyImage { src: ImageId, region: ImageRegion, dst: ImageId, x: u32, y: u32 },
 }
 
 struct Buffer<'a> {
@@ -78,11 +94,95 @@ impl<'a> Buffer<'a> {
     }
 }
 
+const IMAGE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+const IMAGE_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+    vk::ImageUsageFlags::TRANSFER_SRC.as_raw() | vk::ImageUsageFlags::TRANSFER_DST.as_raw()
+    | vk::ImageUsageFlags::SAMPLED.as_raw());
+
+fn color_range() -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR)
+        .level_count(1).layer_count(1)
+}
+fn color_layers() -> vk::ImageSubresourceLayers {
+    vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1)
+}
+fn image_offset(region: ImageRegion) -> vk::Offset3D {
+    vk::Offset3D { x:region.x as i32,y:region.y as i32,z:0 }
+}
+fn image_extent(region: ImageRegion) -> vk::Extent3D {
+    vk::Extent3D { width:region.width,height:region.height,depth:1 }
+}
+fn region_bytes(width:u32,height:u32,region:ImageRegion) -> Result<u64> {
+    if region.width == 0 || region.height == 0
+        || region.x > i32::MAX as u32 || region.y > i32::MAX as u32
+        || region.x.checked_add(region.width).is_none_or(|end| end > width)
+        || region.y.checked_add(region.height).is_none_or(|end| end > height) {
+        return Err("image rectangle is empty or out of bounds".into());
+    }
+    u64::from(region.width).checked_mul(u64::from(region.height))
+        .and_then(|n| n.checked_mul(4)).ok_or_else(|| "image byte count overflow".into())
+}
+fn buffer_image_copy(offset:u64,region:ImageRegion) -> vk::BufferImageCopy {
+    vk::BufferImageCopy::default().buffer_offset(offset)
+        .image_subresource(color_layers()).image_offset(image_offset(region))
+        .image_extent(image_extent(region))
+}
+
+struct Image<'a> {
+    d: &'a ash::Device,
+    handle: vk::Image,
+    memory: vk::DeviceMemory,
+    width: u32,
+    height: u32,
+    initialized: bool,
+}
+impl Drop for Image<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            self.d.destroy_image(self.handle,None);
+            self.d.free_memory(self.memory,None);
+        }
+    }
+}
+impl<'a> Image<'a> {
+    fn new(d:&'a ash::Device,mem:&vk::PhysicalDeviceMemoryProperties,width:u32,height:u32) -> Result<Self> {
+        let mut image = Self { d,handle:vk::Image::null(),memory:vk::DeviceMemory::null(),
+            width,height,initialized:false };
+        unsafe {
+            image.handle = d.create_image(&vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D).format(IMAGE_FORMAT)
+                .extent(vk::Extent3D { width,height,depth:1 }).mip_levels(1).array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1).tiling(vk::ImageTiling::OPTIMAL)
+                .usage(IMAGE_USAGE).sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED),None)?;
+            let req = d.get_image_memory_requirements(image.handle);
+            use vk::MemoryPropertyFlags as F;
+            let index = (0..mem.memory_type_count)
+                .filter(|&i| req.memory_type_bits & (1u32 << i) != 0)
+                .find(|&i| {
+                    let flags = mem.memory_types[i as usize].property_flags;
+                    flags.contains(F::DEVICE_LOCAL)
+                        && !flags.intersects(F::HOST_VISIBLE | F::DEVICE_COHERENT_AMD | F::DEVICE_UNCACHED_AMD)
+                }).ok_or("No dedicated device-local image memory")?;
+            image.memory = d.allocate_memory(&vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size).memory_type_index(index),None)?;
+            d.bind_image_memory(image.handle,image.memory,0)?;
+        }
+        Ok(image)
+    }
+
+    fn check(&self,region:ImageRegion) -> Result<u64> {
+        region_bytes(self.width,self.height,region)
+    }
+}
+
 /// Owns resources and a command queue while exclusively borrowing Context.
 /// IDs are valid only in the session that created them. Failed submissions
 /// poison the session; no resource is reused before completion is known.
 pub struct Session<'a> {
     d: &'a ash::Device,
+    instance: &'a ash::Instance,
+    physical: vk::PhysicalDevice,
     memory: vk::PhysicalDeviceMemoryProperties,
     queue: vk::Queue,
     pool: vk::CommandPool,
@@ -92,6 +192,7 @@ pub struct Session<'a> {
     next_id: u64,
     poisoned: bool,
     buffers: BTreeMap<BufferId,Buffer<'a>>,
+    images: BTreeMap<ImageId,Image<'a>>,
 }
 
 impl Drop for Session<'_> {
@@ -109,10 +210,11 @@ impl<'a> Session<'a> {
     pub(crate) fn new(context: &'a mut Context) -> Result<Self> {
         let d = &context.device;
         let mut session = Self {
-            d, memory:unsafe { context.instance.get_physical_device_memory_properties(context.physical) },
+            d, instance:&context.instance, physical:context.physical,
+            memory:unsafe { context.instance.get_physical_device_memory_properties(context.physical) },
             queue:unsafe { d.get_device_queue(context.family,0) },
             pool:vk::CommandPool::null(),command:vk::CommandBuffer::null(),
-            timeline:vk::Semaphore::null(),completed:0,next_id:1,poisoned:false,buffers:BTreeMap::new(),
+            timeline:vk::Semaphore::null(),completed:0,next_id:1,poisoned:false,buffers:BTreeMap::new(),images:BTreeMap::new(),
         };
         unsafe {
             session.pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default()
@@ -149,6 +251,39 @@ impl<'a> Session<'a> {
         self.ready()?;
         // Every successful submit has completed before this method returns.
         self.buffers.remove(&id).ok_or("unknown or retired buffer ID")?;
+        Ok(())
+    }
+
+    fn image(&self,id:ImageId) -> Result<&Image<'a>> {
+        self.images.get(&id).ok_or_else(|| "unknown or retired image ID".into())
+    }
+
+    /// Allocate an optimal-tiled RGBA8 2D image, clear it, and leave it in GENERAL.
+    /// Other formats, mips, layers, and rendering attachment usage are not yet supported.
+    pub fn create_image(&mut self,width:u32,height:u32) -> Result<ImageId> {
+        self.ready()?;
+        if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
+            return Err("invalid image dimensions".into());
+        }
+        let properties = unsafe { self.instance.get_physical_device_image_format_properties(
+            self.physical,IMAGE_FORMAT,vk::ImageType::TYPE_2D,vk::ImageTiling::OPTIMAL,
+            IMAGE_USAGE,vk::ImageCreateFlags::empty())? };
+        if width > properties.max_extent.width || height > properties.max_extent.height {
+            return Err("image dimensions exceed device limits".into());
+        }
+        let id = ImageId(self.next_id);
+        self.next_id = self.next_id.checked_add(1).ok_or("image ID exhausted")?;
+        let image = Image::new(self.d,&self.memory,width,height)?;
+        self.images.insert(id,image);
+        // The ID is not exposed until this one-command initial clear completes.
+        self.submit(&[Command::ClearImage { dst:id,rgba:[0.;4] }])?;
+        self.images.get_mut(&id).expect("created image").initialized = true;
+        Ok(id)
+    }
+
+    pub fn destroy_image(&mut self,id:ImageId) -> Result<()> {
+        self.ready()?;
+        self.images.remove(&id).ok_or("unknown or retired image ID")?;
         Ok(())
     }
 
@@ -192,6 +327,25 @@ impl<'a> Session<'a> {
                     check_range(self.buffer(src)?.bytes,src_offset,bytes)?;
                     check_range(self.buffer(dst)?.bytes,dst_offset,bytes)?;
                 }
+                Command::ClearImage { dst,rgba } => {
+                    self.image(dst)?;
+                    if rgba.iter().any(|v| !v.is_finite() || !(0.0..=1.0).contains(v)) {
+                        return Err("invalid normalized clear color".into());
+                    }
+                }
+                Command::UploadImage { src,offset,dst,region } => {
+                    let bytes = self.image(dst)?.check(region)?;
+                    check_range(self.buffer(src)?.bytes,offset,bytes)?;
+                }
+                Command::ReadImage { src,region,dst,offset } => {
+                    let bytes = self.image(src)?.check(region)?;
+                    check_range(self.buffer(dst)?.bytes,offset,bytes)?;
+                }
+                Command::CopyImage { src,region,dst,x,y } => {
+                    if src == dst { return Err("same-image copy is not implemented".into()); }
+                    self.image(src)?.check(region)?;
+                    self.image(dst)?.check(ImageRegion { x,y,..region })?;
+                }
             }
         }
         Ok(())
@@ -227,6 +381,37 @@ impl<'a> Session<'a> {
                     Command::Copy { src,src_offset,dst,dst_offset,bytes } => {
                         d.cmd_copy_buffer(cmd,self.buffer(src)?.handle,self.buffer(dst)?.handle,
                             &[vk::BufferCopy::default().src_offset(src_offset).dst_offset(dst_offset).size(bytes)]);
+                    }
+                    Command::ClearImage { dst,rgba } => {
+                        let image = self.image(dst)?;
+                        if !image.initialized {
+                            let barriers = [vk::ImageMemoryBarrier2::default()
+                                .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                                .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                                .old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL)
+                                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .image(image.handle).subresource_range(color_range())];
+                            d.cmd_pipeline_barrier2(cmd,&vk::DependencyInfo::default().image_memory_barriers(&barriers));
+                        }
+                        d.cmd_clear_color_image(cmd,image.handle,vk::ImageLayout::GENERAL,
+                            &vk::ClearColorValue { float32:rgba },&[color_range()]);
+                    }
+                    Command::UploadImage { src,offset,dst,region } => {
+                        d.cmd_copy_buffer_to_image(cmd,self.buffer(src)?.handle,self.image(dst)?.handle,
+                            vk::ImageLayout::GENERAL,&[buffer_image_copy(offset,region)]);
+                    }
+                    Command::ReadImage { src,region,dst,offset } => {
+                        d.cmd_copy_image_to_buffer(cmd,self.image(src)?.handle,vk::ImageLayout::GENERAL,
+                            self.buffer(dst)?.handle,&[buffer_image_copy(offset,region)]);
+                    }
+                    Command::CopyImage { src,region,dst,x,y } => {
+                        let copy = vk::ImageCopy::default().src_subresource(color_layers())
+                            .src_offset(image_offset(region)).dst_subresource(color_layers())
+                            .dst_offset(image_offset(ImageRegion { x,y,..region })).extent(image_extent(region));
+                        d.cmd_copy_image(cmd,self.image(src)?.handle,vk::ImageLayout::GENERAL,
+                            self.image(dst)?.handle,vk::ImageLayout::GENERAL,&[copy]);
                     }
                 }
             }
@@ -287,9 +472,63 @@ pub(crate) fn verify(context:&mut Context) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn verify_images(context:&mut Context) -> Result<()> {
+    let mut s = Session::new(context)?;
+    let full = ImageRegion { x:0,y:0,width:8,height:8 };
+    let part = ImageRegion { x:2,y:1,width:3,height:2 };
+    let upload = s.create_buffer(32,MemoryKind::HostVisible)?;
+    let output = s.create_buffer(256,MemoryKind::HostVisible)?;
+    let a = s.create_image(8,8)?;
+    let b = s.create_image(8,8)?;
+    s.submit(&[Command::ReadImage { src:a,region:full,dst:output,offset:0 }])?;
+    if s.read_words(output,0,64)? != vec![0;64] {
+        return Err("initial image clear mismatch".into());
+    }
+    let pixels = [0xff112233,0xff223344,0xff334455,0xff445566,0xff556677,0xff667788];
+    s.write_words(upload,4,&pixels)?;
+    let epoch = s.submit(&[
+        Command::ClearImage { dst:a,rgba:[0.,0.,0.,1.] },
+        Command::UploadImage { src:upload,offset:4,dst:a,region:part },
+        Command::ClearImage { dst:b,rgba:[1.,0.,0.,1.] },
+        Command::CopyImage { src:a,region:part,dst:b,x:4,y:5 },
+        Command::ReadImage { src:b,region:full,dst:output,offset:0 },
+    ])?;
+    let mut expected = vec![u32::from_le_bytes([255,0,0,255]);64];
+    for row in 0..2usize {
+        let start = (5+row)*8+4;
+        expected[start..start+3].copy_from_slice(&pixels[row*3..row*3+3]);
+    }
+    if s.read_words(output,0,64)? != expected {
+        return Err("image copy or untouched texel mismatch".into());
+    }
+    println!("PASS: RGBA8 clear, partial upload, image copy and full readback at timeline {epoch}");
+    if s.submit(&[
+        Command::ClearImage { dst:b,rgba:[0.;4] },
+        Command::UploadImage { src:upload,offset:4,dst:b,region:ImageRegion { x:7,..part } },
+    ]).is_ok() { return Err("accepted out-of-bounds image copy".into()); }
+    s.submit(&[Command::ReadImage { src:b,region:full,dst:output,offset:0 }])?;
+    if s.read_words(output,0,64)? != expected { return Err("rejected list altered image".into()); }
+    s.destroy_image(a)?;
+    if s.submit(&[Command::ReadImage { src:a,region:full,dst:output,offset:0 }]).is_ok() {
+        return Err("accepted retired image ID".into());
+    }
+    println!("PASS: invalid image list and retired resource rejected");
+    println!("PASS: reusable Vulkan image command executor verified");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn image_region_validation() {
+        let r = ImageRegion { x:2,y:1,width:3,height:2 };
+        assert_eq!(region_bytes(8,8,r).unwrap(),24);
+        assert!(region_bytes(8,8,ImageRegion { x:7,..r }).is_err());
+        assert!(region_bytes(8,8,ImageRegion { width:0,..r }).is_err());
+        assert!(region_bytes(u32::MAX,8,ImageRegion { x:u32::MAX,..r }).is_err());
+    }
+
     #[test]
     fn range_validation() {
         assert!(check_range(64,60,4).is_ok());
