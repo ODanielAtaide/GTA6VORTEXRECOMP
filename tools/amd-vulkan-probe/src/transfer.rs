@@ -357,3 +357,158 @@ pub fn run_parallel(instance: &ash::Instance, physical: vk::PhysicalDevice,
     Ok(())
     })
 }
+
+
+// Three independent slots bound CPU/GPU work in flight. Each owns its
+// command pools and backing buffers until its completion is observed.
+const ASYNC_SLOTS: usize = 3;
+const ASYNC_ROUNDS: u64 = 12;
+
+struct AsyncSlot<'a> {
+    resources: ParallelResources<'a>,
+    commands: Vec<vk::CommandBuffer>,
+    pending: Option<u64>,
+}
+
+impl<'a> AsyncSlot<'a> {
+    fn new(d: &'a ash::Device, mem: &vk::PhysicalDeviceMemoryProperties,
+           family: u32) -> crate::Result<Self> {
+        let mut resources = ParallelResources {
+            d,
+            local: Buffer::new(d,mem,vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,false)?,
+            readback: Buffer::new(d,mem,vk::BufferUsageFlags::TRANSFER_DST,true)?,
+            pools: Vec::new(), timeline: vk::Semaphore::null(),
+        };
+        let mut commands = Vec::new();
+        unsafe {
+            for _ in 0..=WORKERS {
+                let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(family),None)?;
+                resources.pools.push(pool);
+                commands.push(d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1))?[0]);
+            }
+        }
+        Ok(Self { resources, commands, pending: None })
+    }
+
+    fn retire(&mut self, timeline: vk::Semaphore) -> crate::Result<()> {
+        let Some(epoch) = self.pending else { return Ok(()); };
+        let d = self.resources.d;
+        unsafe {
+            d.wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&[timeline])
+                .values(&[epoch]),u64::MAX)?;
+            let ptr = d.map_memory(self.resources.readback.memory,0,BYTES as u64,vk::MemoryMapFlags::empty())?;
+            let actual = std::slice::from_raw_parts(ptr.cast::<u32>(),BYTES/4);
+            let mismatch = actual.iter().enumerate().position(|(i,&v)| v != fill_value(i/(CHUNK/4),epoch));
+            d.unmap_memory(self.resources.readback.memory);
+            if let Some(i) = mismatch { return Err(format!("async mismatch at word {i}, epoch {epoch}").into()); }
+        }
+        self.pending = None;
+        Ok(())
+    }
+
+    fn submit(&mut self, queue: vk::Queue, timeline: vk::Semaphore, epoch: u64) -> crate::Result<()> {
+        if self.pending.is_some() { return Err("attempt to reuse an in-flight slot".into()); }
+        let r = &self.resources;
+        let d = r.d;
+        let tail = self.commands[WORKERS];
+        unsafe {
+            d.reset_command_pool(r.pools[WORKERS],vk::CommandPoolResetFlags::empty())?;
+            d.begin_command_buffer(tail,&vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            let ready = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)];
+            d.cmd_pipeline_barrier2(tail,&vk::DependencyInfo::default().memory_barriers(&ready));
+            d.cmd_copy_buffer(tail,r.local.buffer,r.readback.buffer,&[vk::BufferCopy::default().size(BYTES as u64)]);
+            let host = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY).src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::HOST).dst_access_mask(vk::AccessFlags2::HOST_READ)];
+            d.cmd_pipeline_barrier2(tail,&vk::DependencyInfo::default().memory_barriers(&host));
+            d.end_command_buffer(tail)?;
+            let commands: Vec<_> = self.commands.iter().map(|&cmd|
+                vk::CommandBufferSubmitInfo::default().command_buffer(cmd)).collect();
+            // Keep GPU submissions ordered; CPU recording of other slots
+            // can nevertheless proceed without waiting for this epoch.
+            let wait = [vk::SemaphoreSubmitInfo::default().semaphore(timeline).value(epoch-1)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+            let signal = [vk::SemaphoreSubmitInfo::default().semaphore(timeline).value(epoch)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+            let submit = [vk::SubmitInfo2::default().command_buffer_infos(&commands)
+                .wait_semaphore_infos(&wait).signal_semaphore_infos(&signal)];
+            d.queue_submit2(queue,&submit,vk::Fence::null())?;
+        }
+        self.pending = Some(epoch);
+        Ok(())
+    }
+}
+
+/// Measure a bounded pipeline with identical workloads at depth one and three.
+/// Times include recording, submission, synchronization and full CPU verification.
+pub fn run_async(instance: &ash::Instance, physical: vk::PhysicalDevice,
+                 d: &ash::Device, family: u32) -> crate::Result<()> {
+    let mem = unsafe { instance.get_physical_device_memory_properties(physical) };
+    let mut slots = Vec::with_capacity(ASYNC_SLOTS);
+    for _ in 0..ASYNC_SLOTS { slots.push(AsyncSlot::new(d,&mem,family)?); }
+    let queue = unsafe { d.get_device_queue(family,0) };
+    let mut ty = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+    let timeline = unsafe { d.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut ty),None)? };
+    // One existing RAII owner destroys the shared timeline only after idle.
+    slots[0].resources.timeline = timeline;
+    type Job = (vk::CommandPool,vk::CommandBuffer,vk::Buffer,u64);
+    std::thread::scope(|scope| -> crate::Result<()> {
+        let mut workers = Vec::with_capacity(WORKERS);
+        for worker in 0..WORKERS {
+            let (send,receive) = std::sync::mpsc::channel::<Job>();
+            let (reply,done) = std::sync::mpsc::channel::<Result<(),vk::Result>>();
+            scope.spawn(move || {
+                while let Ok((pool,cmd,buffer,epoch)) = receive.recv() {
+                    if reply.send(record_worker(d,pool,cmd,buffer,worker,epoch)).is_err() { break; }
+                }
+            });
+            workers.push((send,done));
+        }
+        let mut epoch = 0u64;
+        let mut measurements: [Vec<f64>;2] = std::array::from_fn(|_| Vec::new());
+        // Alternate modes, exclude the first pass of each as warm-up.
+        for pass in 0..8 {
+            let depth = if pass % 2 == 0 { 1 } else { ASYNC_SLOTS };
+            let mut max_outstanding = 0usize;
+            let mut record_ms = 0.;
+            let start = Instant::now();
+            for n in 0..ASYNC_ROUNDS {
+                let index = n as usize % depth;
+                // Never reset a pool or read a slot before its timeline value.
+                slots[index].retire(timeline)?;
+                epoch += 1;
+                let slot = &mut slots[index];
+                let record_start = Instant::now();
+                for (worker,(send,_)) in workers.iter().enumerate() {
+                    send.send((slot.resources.pools[worker],slot.commands[worker],
+                        slot.resources.local.buffer,epoch)).map_err(|_| "async worker disconnected")?;
+                }
+                for (_,done) in &workers {
+                    done.recv().map_err(|_| "async worker reply disconnected")??;
+                }
+                record_ms += record_start.elapsed().as_secs_f64()*1000.;
+                slot.submit(queue,timeline,epoch)?;
+                let completed = unsafe { d.get_semaphore_counter_value(timeline)? };
+                max_outstanding = max_outstanding.max((epoch.saturating_sub(completed)) as usize);
+            }
+            for slot in &mut slots { slot.retire(timeline)?; }
+            let elapsed = start.elapsed().as_secs_f64()*1000.;
+            let per_round = elapsed / ASYNC_ROUNDS as f64;
+            println!("depth {depth}, pass {}: {ASYNC_ROUNDS} verified rounds, max outstanding {max_outstanding}, record mean {:.3} ms, total mean {per_round:.3} ms",
+                pass+1,record_ms/ASYNC_ROUNDS as f64);
+            if pass >= 2 { measurements[pass%2].push(per_round); }
+        }
+        for values in &mut measurements { values.sort_by(f64::total_cmp); }
+        println!("median batch mean: depth 1 {:.3} ms; depth 3 {:.3} ms",measurements[0][1],measurements[1][1]);
+        drop(workers);
+        println!("PASS: bounded asynchronous Vulkan submission and slot retirement verified");
+        Ok(())
+    })
+}
