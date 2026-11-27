@@ -107,6 +107,12 @@ enum Command {
     /// Verify direct GFX10 diagnostic shader compilation and Vulkan dispatch.
     #[cfg(feature = "vulkan")]
     VulkanNative,
+    /// Emit or run native vertex and fragment stage regression.
+    #[cfg(feature = "vulkan")]
+    VulkanNativeGraphics {
+        #[arg(long)]
+        emit_only: Option<PathBuf>,
+    },
     /// Emit or execute advanced native CFG compute regressions.
     #[cfg(feature = "vulkan")]
     VulkanAdvanced {
@@ -223,6 +229,17 @@ fn main() -> Result<()> {
                 let mut host = vortex_vulkan::Context::new()
                     .map_err(|e| anyhow::anyhow!("Vulkan initialization: {e}"))?;
                 host.verify_advanced().map_err(|e| anyhow::anyhow!("Advanced native shader executor: {e}"))
+            }
+        }
+        #[cfg(feature = "vulkan")]
+        Command::VulkanNativeGraphics { emit_only } => {
+            if let Some(dir)=emit_only {
+                vortex_vulkan::Context::emit_native_graphics(&dir)
+                    .map_err(|e|anyhow::anyhow!("Native graphics emission: {e}"))
+            } else {
+                let mut host=vortex_vulkan::Context::new()
+                    .map_err(|e|anyhow::anyhow!("Vulkan initialization: {e}"))?;
+                host.verify_native_graphics().map_err(|e|anyhow::anyhow!("Native graphics executor: {e}"))
             }
         }
         #[cfg(feature = "vulkan")]
