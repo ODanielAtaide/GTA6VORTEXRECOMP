@@ -53,6 +53,11 @@ impl Context {
         descriptors::run(&self.instance, self.physical, &self.device, self.family, path)
     }
 
+    /// Verify bounded asynchronous Vulkan submission and safe slot reuse.
+    pub fn verify_async(&mut self) -> Result<()> {
+        transfer::run_async(&self.instance, self.physical, &self.device, self.family)
+    }
+
     /// Compare serial and parallel Vulkan command recording with full readback.
     pub fn verify_parallel(&mut self) -> Result<()> {
         transfer::run_parallel(&self.instance, self.physical, &self.device, self.family)
