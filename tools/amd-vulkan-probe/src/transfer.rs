@@ -249,13 +249,38 @@ pub fn run_parallel(instance: &ash::Instance, physical: vk::PhysicalDevice,
         r.timeline = d.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut ty),None)?;
         d.get_device_queue(family,0)
     };
-    let mut serial = Vec::new();
-    let mut parallel = Vec::new();
-    for epoch in 1u64..=8 {
-        let is_parallel = epoch % 2 == 0;
+    // Keep one worker per independent command pool alive across rounds.
+    // Dedicated reply channels also report a disconnected worker instead
+    // of waiting forever on a shared reply queue.
+    std::thread::scope(|scope| -> crate::Result<()> {
+    let buffer = r.local.buffer;
+    let mut workers = Vec::with_capacity(WORKERS);
+    for worker in 0..WORKERS {
+        let pool = r.pools[worker];
+        let cmd = commands[worker];
+        let (send, receive) = std::sync::mpsc::channel::<u64>();
+        let (reply, done) = std::sync::mpsc::channel::<Result<(),vk::Result>>();
+        scope.spawn(move || {
+            while let Ok(epoch) = receive.recv() {
+                let result = record_worker(d,pool,cmd,buffer,worker,epoch);
+                if reply.send(result).is_err() { break; }
+            }
+        });
+        workers.push((send,done));
+    }
+    let mut timings: [Vec<f64>;3] = std::array::from_fn(|_| Vec::new());
+    // Six rounds per mode, first round of each mode is warm-up.
+    for epoch in 1u64..=18 {
+        let mode = ((epoch-1) % 3) as usize;
         let start = Instant::now();
-        let buffer = r.local.buffer;
-        if is_parallel {
+        if mode == 2 {
+            for (send,_) in &workers {
+                send.send(epoch).map_err(|_| "persistent worker disconnected")?;
+            }
+            for (_,done) in &workers {
+                done.recv().map_err(|_| "persistent worker reply disconnected")??;
+            }
+        } else if mode == 1 {
             std::thread::scope(|scope| -> crate::Result<()> {
                 let mut jobs = Vec::new();
                 for worker in 0..WORKERS {
@@ -316,18 +341,19 @@ pub fn run_parallel(instance: &ash::Instance, physical: vk::PhysicalDevice,
             let mismatch = actual.iter().enumerate().position(|(i,&v)| v != fill_value(i/(CHUNK/4),epoch));
             d.unmap_memory(r.readback.memory);
             if let Some(i) = mismatch { return Err(format!("parallel regression mismatch at word {i}, epoch {epoch}").into()); }
-            let mode = if is_parallel { "parallel" } else { "serial" };
-            println!("{mode} round {epoch}: {FILLS} fills, {WORKERS} command buffers; record {record_ms:.3} ms; submit+readback+wait {submit_ms:.3} ms");
+            let label = ["serial","transient","persistent"][mode];
+            println!("{label} round {epoch}: {FILLS} fills, {WORKERS} command buffers; record {record_ms:.3} ms; submit+readback+wait {submit_ms:.3} ms");
             println!("PASS: verified all {BYTES} bytes");
         }
-        // First round of each mode is a warm-up, not included in the median.
-        if epoch > 2 {
-            if is_parallel { parallel.push(record_ms); } else { serial.push(record_ms); }
-        }
+        if epoch > 3 { timings[mode].push(record_ms); }
     }
-    serial.sort_by(f64::total_cmp);
-    parallel.sort_by(f64::total_cmp);
-    println!("median serial recording: {:.3} ms; parallel recording: {:.3} ms",serial[1],parallel[1]);
-    println!("PASS: parallel Vulkan recording and ordered submission verified");
+    for values in &mut timings { values.sort_by(f64::total_cmp); }
+    println!("median serial recording: {:.3} ms; transient recording: {:.3} ms; persistent recording: {:.3} ms",
+        timings[0][2],timings[1][2],timings[2][2]);
+    // Dropping job senders stops all persistent workers; scope joins them
+    // before Vulkan pools or the logical device can be destroyed.
+    drop(workers);
+    println!("PASS: serial, transient and persistent Vulkan recording verified");
     Ok(())
+    })
 }
