@@ -2267,9 +2267,11 @@ extern "system" fn live_barrier_groups(this:This,count:u32,groups:*const u8){
     if count==0{return;}
     if groups.is_null()||count>65536{crate::vulkan_live::stop("invalid enhanced barrier groups");}
     // Xbox groups have the same 16-byte header as the older Vortex path.
-    // Buffer/global dependencies can be conservatively widened to a full
-    // Vulkan memory dependency; texture layouts still need explicit mapping.
+    // Buffer/global dependencies and texture dependencies can be widened:
+    // live Vulkan images always use GENERAL and all submissions complete
+    // in order. Check the texture barrier records before accepting them.
     let mut any=false;
+    let mut textures=Vec::new();
     for i in 0..count as usize{
         let mut header=[0u8;16];
         let at=(groups as usize).checked_add(i*16).unwrap_or_else(||crate::vulkan_live::stop("barrier group address overflow"));
@@ -2278,12 +2280,37 @@ extern "system" fn live_barrier_groups(this:This,count:u32,groups:*const u8){
         let n=u32::from_le_bytes(header[4..8].try_into().unwrap());
         let address=u64::from_le_bytes(header[8..16].try_into().unwrap());
         if n==0{continue;}
-        if n>1_048_576||address==0||!matches!(kind,0|2){
+        if n>1_048_576||address==0||!matches!(kind,0|1|2){
             crate::vulkan_live::stop(format_args!("unsupported enhanced barrier kind={kind} count={n}"));
+        }
+        if kind==1{
+            // D3D12_TEXTURE_BARRIER x64: four 32-bit sync/access fields,
+            // two layouts, resource pointer, six subresource words, flags.
+            // Do not dereference unregistered guest objects.
+            for j in 0..n as usize{
+                let at=(address as usize).checked_add(j*64).unwrap_or_else(||crate::vulkan_live::stop("texture barrier address overflow"));
+                let mut raw=[0u8;64];
+                if !crate::host::read_into(at as *const u8,&mut raw){crate::vulkan_live::stop("unreadable texture barrier");}
+                let w=|i:usize|u32::from_le_bytes(raw[i..i+4].try_into().unwrap());
+                let resource=u64::from_le_bytes(raw[24..32].try_into().unwrap()) as This;
+                let flags=w(56);
+                if !crate::vulkan_live::registered(resource)||crate::resource::buffer_bytes(resource).is_some(){
+                    crate::vulkan_live::stop(format_args!("unknown texture barrier resource {resource:p}, layouts={:#x}/{:#x}",w(16),w(20)));
+                }
+                if (w(0)|w(4))&0x80000000!=0||flags&!1!=0{
+                    crate::vulkan_live::stop(format_args!("split or unsupported texture barrier flags={flags:#x}"));
+                }
+                // A discard permits undefined old contents; retaining them
+                // is legal. No fake initialization or texture upload here.
+                textures.push(crate::vulkan_live::Retained::new(resource));
+                static FIRST:std::sync::Once=std::sync::Once::new();
+                FIRST.call_once(||tracing::info!(before=w(16),after=w(20),flags,"VULKAN_GUEST_TEXTURE_BARRIER_RECORDED"));
+            }
         }
         any=true;
     }
-    if any{live_record(this).push(crate::vulkan_live::Op::Sync);}
+    if !textures.is_empty(){live_record(this).push(crate::vulkan_live::Op::TextureSync{resources:textures});}
+    else if any{live_record(this).push(crate::vulkan_live::Op::Sync);}
 }
 #[cfg(all(windows,feature = "vulkan"))]
 extern "system" fn live_sync(this:This,flags:u32,control:u32,address:u64,size:u64){
@@ -2309,6 +2336,13 @@ extern "system" fn live_wait32(this:This,address:u64,comparison:u32,reference:u3
 #[cfg(all(windows,feature = "vulkan"))]
 extern "system" fn live_wait64(this:This,address:u64,comparison:u32,reference:u64,mask_or_flags:u64){
     live_record(this).wait_marker(address,comparison,reference,mask_or_flags,8);
+}
+#[cfg(all(windows,feature = "vulkan"))]
+extern "system" fn live_wait64_retail(this:This,address:u64,comparison:u32,reference:u64,flags:u32){
+    // GTA VI retail 0x250 passed 0x1100000001 in the full register:
+    // only the low 32 bits are defined for this flags argument.
+    if flags>1{crate::vulkan_live::stop(format_args!("unsupported retail Wait64BitValueX flags {flags:#x}"));}
+    live_record(this).wait_marker(address,comparison,reference,u64::from(flags),8);
 }
 #[cfg(all(windows,feature = "vulkan"))]
 extern "system" fn live_set_pipeline(this:This,pipeline:This){live_record(this).set_pipeline(pipeline);}
@@ -2397,7 +2431,7 @@ const fn live_list_table(newer:bool)->[ *const ();160]{
     f[if newer{newer_slot(69)}else{69}]=live_write32 as *const ();
     f[if newer{newer_slot(70)}else{70}]=live_write64 as *const ();
     f[if newer{newer_slot(71)}else{71}]=live_wait32 as *const ();
-    f[if newer{newer_slot(72)}else{72}]=live_wait64 as *const ();
+    if newer{f[newer_slot(72)]=live_wait64_retail as *const ();}else{f[72]=live_wait64 as *const ();}
     f[if newer{newer_slot(129)}else{129}]=live_sync as *const ();
     f[if newer{newer_slot(130)}else{130}]=live_sync as *const ();
     f[if newer{newer_slot(137)}else{137}]=reset_x as *const ();
