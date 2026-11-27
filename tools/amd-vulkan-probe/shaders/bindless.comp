@@ -1,0 +1,10 @@
+#version 450
+#extension GL_EXT_nonuniform_qualifier : require
+layout(local_size_x = 4) in;
+layout(set = 0, binding = 0, std430) readonly buffer Input { uint value; } inputs[];
+layout(set = 0, binding = 1, std430) writeonly buffer Output { uint values[4]; } output_data;
+void main() {
+    const uint slots[4] = uint[4](1u,9u,33u,63u);
+    uint lane = gl_LocalInvocationID.x;
+    output_data.values[lane] = inputs[nonuniformEXT(slots[lane])].value;
+}
