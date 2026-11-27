@@ -66,6 +66,15 @@ impl Context {
             spirv::float_expected)
     }
 
+    /// Verify decoded CMPX filtering and mask restoration.
+    pub fn compute_cmpx_demo(&mut self, path: &Path, wave64: bool) -> Result<()> {
+        let expected: fn(u32) -> u32 = if wave64 {
+            vortex_shader::spirv_vector::cmpx_expected64
+        } else { vortex_shader::spirv_vector::cmpx_expected32 };
+        compute::run_with_wave(&self.instance, self.physical, &self.device, self.family, path,
+            expected, Some(if wave64 { 64 } else { 32 }))
+    }
+
     /// Verify decoded EXEC mask changes and restoration.
     pub fn compute_exec_demo(&mut self, path: &Path, wave64: bool) -> Result<()> {
         let expected: fn(u32) -> u32 = if wave64 {
