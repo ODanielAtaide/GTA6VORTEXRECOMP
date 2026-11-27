@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared experimental AMD Vulkan host library. Not yet a title graphics backend.
 pub mod commands;
+#[cfg(windows)] mod present;
+#[cfg(windows)] pub mod live;
 mod compute;
 mod graphics;
 mod transfer;
@@ -28,7 +30,10 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new() -> Result<Self> {
+    pub fn new() -> Result<Self> { Self::new_inner(false) }
+    #[cfg(windows)]
+    pub(crate) fn new_live() -> Result<Self> { Self::new_inner(true) }
+    fn new_inner(present:bool) -> Result<Self> {
         let entry = unsafe { Entry::load()? };
         let loader_version = unsafe { entry.try_enumerate_instance_version()? }
             .unwrap_or(vk::API_VERSION_1_0);
@@ -36,9 +41,11 @@ impl Context {
             return Err("Vulkan 1.3 loader required".into());
         }
         let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
-        let create = vk::InstanceCreateInfo::default().application_info(&app);
+        let extensions = [ash::khr::surface::NAME.as_ptr(),ash::khr::win32_surface::NAME.as_ptr()];
+        let mut create = vk::InstanceCreateInfo::default().application_info(&app);
+        if present {create=create.enabled_extension_names(&extensions);}
         let instance = unsafe { entry.create_instance(&create, None)? };
-        match select_device(&instance) {
+        match select_device(&instance,present) {
             Ok((physical, device, family)) => Ok(Self {
                 _entry: entry, instance, physical, device, family,
             }),
@@ -242,7 +249,7 @@ impl Drop for Context {
     }
 }
 
-fn select_device(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, ash::Device, u32)> {
+fn select_device(instance: &ash::Instance,present:bool) -> Result<(vk::PhysicalDevice, ash::Device, u32)> {
     let devices = unsafe { instance.enumerate_physical_devices()? };
     let mut selected = None;
     for physical in devices {
@@ -308,9 +315,11 @@ fn select_device(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, ash::D
     let core=unsafe{instance.get_physical_device_features(physical)};
     let enabled_core=vk::PhysicalDeviceFeatures::default().texture_compression_bc(core.texture_compression_bc!=0);
     println!("BC texture compression: {}",core.texture_compression_bc!=0);
-    let device_info = vk::DeviceCreateInfo::default()
+    let extensions=[ash::khr::swapchain::NAME.as_ptr()];
+    let mut device_info = vk::DeviceCreateInfo::default()
         .enabled_features(&enabled_core)
         .queue_create_infos(&queues).push_next(&mut enabled12).push_next(&mut enabled13);
+    if present {device_info=device_info.enabled_extension_names(&extensions);}
     let device = unsafe { instance.create_device(physical, &device_info, None)? };
     println!("PASS: AMD Vulkan logical device initialized");
     Ok((physical, device, family))
