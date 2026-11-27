@@ -9,6 +9,8 @@ pub enum Op {
     Index,
     /// Read this invocation's original uint in storage buffer 0:0.
     LoadSelf,
+    /// Store this invocation's word only when the mask is nonzero.
+    StoreSelf(usize, usize),
     /// Read one of the two uniform u32 push constants.
     Push(u8),
     Constant(u32),
@@ -41,7 +43,19 @@ fn instruction(out: &mut Vec<u32>, opcode: u16, args: &[u32]) {
 /// Dispatch must match the size of the output buffer, local size 64.
 /// References must name earlier SSA values.
 pub fn emit(ops: &[Op], result: usize) -> Result<Vec<u32>, ShaderError> {
-    if ops.is_empty() || ops.len() > 4096 || result >= ops.len() {
+    emit_inner(ops,Some(result))
+}
+
+/// Emit explicit memory effects, without an implicit final result store.
+pub fn emit_effects(ops:&[Op]) -> Result<Vec<u32>, ShaderError> {
+    if !ops.iter().any(|op| matches!(op,Op::StoreSelf(..))) {
+        return Err(ShaderError::Malformed("No explicit storage effects"));
+    }
+    emit_inner(ops,None)
+}
+
+fn emit_inner(ops:&[Op],result:Option<usize>) -> Result<Vec<u32>, ShaderError> {
+    if ops.is_empty() || ops.len() > 4096 || result.is_some_and(|r| r >= ops.len()) {
         return Err(ShaderError::Malformed("Invalid IR size or result"));
     }
     let has_push = ops.iter().any(|op| matches!(op, Op::Push(_)));
@@ -49,7 +63,7 @@ pub fn emit(ops: &[Op], result: usize) -> Result<Vec<u32>, ShaderError> {
         return Err(ShaderError::Malformed("Invalid push constant index"));
     }
     for (i, op) in ops.iter().enumerate() {
-        if let Op::Add(a, b) | Op::Mul(a, b) | Op::Sub(a, b) | Op::And(a, b) | Op::Or(a, b) | Op::Xor(a, b) | Op::Shl(a, b) | Op::Shr(a, b) | Op::FAdd(a,b) | Op::FSub(a,b) | Op::FMul(a,b) = *op {
+        if let Op::Add(a, b) | Op::Mul(a, b) | Op::Sub(a, b) | Op::And(a, b) | Op::Or(a, b) | Op::Xor(a, b) | Op::Shl(a, b) | Op::Shr(a, b) | Op::FAdd(a,b) | Op::FSub(a,b) | Op::FMul(a,b) | Op::StoreSelf(a,b) = *op {
             if a >= i || b >= i { return Err(ShaderError::Malformed("Invalid forward SSA reference")); }
         }
         if let Op::LoopFold(seed,count,factor) = *op {
@@ -120,6 +134,19 @@ pub fn emit(ops: &[Op], result: usize) -> Result<Vec<u32>, ShaderError> {
             Op::LoadSelf => {
                 op(&mut out, 65, &[9, id(i)+1, 11, 13, 16]);
                 op(&mut out, 61, &[3, id(i), id(i)+1]);
+            }
+            Op::StoreSelf(active,value) => {
+                let r = id(i);
+                // Structured conditional store; inactive lanes issue no write.
+                op(&mut out, 176, &[17,r+1,13,id(active)]);
+                op(&mut out, 247, &[r+3,0]);
+                op(&mut out, 250, &[r+1,r+2,r+3]);
+                op(&mut out, 248, &[r+2]);
+                op(&mut out, 65, &[9,r+4,11,13,16]);
+                op(&mut out, 62, &[r+4,id(value)]);
+                op(&mut out, 249, &[r+3]);
+                op(&mut out, 248, &[r+3]);
+                op(&mut out, 83, &[3,r,id(value)]);
             }
             Op::Push(n) => {
                 let member = if n == 0 { 13 } else { 20 };
@@ -212,8 +239,10 @@ pub fn emit(ops: &[Op], result: usize) -> Result<Vec<u32>, ShaderError> {
             }
         }
     }
-    op(&mut out, 65, &[9, ptr, 11, 13, 16]); // AccessChain
-    op(&mut out, 62, &[ptr, id(result)]); // Store
+    if let Some(result) = result {
+        op(&mut out, 65, &[9, ptr, 11, 13, 16]); // AccessChain
+        op(&mut out, 62, &[ptr, id(result)]); // Store
+    }
     op(&mut out, 253, &[]); // Return
     op(&mut out, 56, &[]); // FunctionEnd
     Ok(out)
@@ -222,6 +251,12 @@ pub fn emit(ops: &[Op], result: usize) -> Result<Vec<u32>, ShaderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_store_requires_valid_operands() {
+        assert!(emit_effects(&[Op::Constant(1),Op::LoadSelf,Op::StoreSelf(0,1)]).is_ok());
+        assert!(emit_effects(&[Op::LoadSelf]).is_err());
+        assert!(emit_effects(&[Op::StoreSelf(0,0)]).is_err());
+    }
     #[test]
     fn buffer_and_push_inputs_emit() {
         assert!(emit(&[Op::LoadSelf,Op::Push(0),Op::Add(0,1)],2).is_ok());
