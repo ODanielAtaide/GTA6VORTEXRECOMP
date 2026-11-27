@@ -95,6 +95,9 @@ enum Command {
         #[arg(long)]
         async_check: bool,
     },
+    /// Verify the reusable Vulkan buffer command executor.
+    #[cfg(feature = "vulkan")]
+    VulkanCommands,
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -195,6 +198,12 @@ fn main() -> Result<()> {
             }
             println!("PASS: shared Vulkan host library verified from vortex CLI (not title execution)");
             Ok(())
+        }
+        #[cfg(feature = "vulkan")]
+        Command::VulkanCommands => {
+            let mut host = vortex_vulkan::Context::new()
+                .map_err(|e| anyhow::anyhow!("Vulkan initialization: {e}"))?;
+            host.verify_commands().map_err(|e| anyhow::anyhow!("Vulkan command executor: {e}"))
         }
         Command::Run {
             exe,
