@@ -609,7 +609,7 @@ impl<'a> Session<'a> {
                 || size<sizes.min_subgroup_size || size>sizes.max_subgroup_size
                 || !sizes.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE)
                 || !subgroup.supported_stages.contains(vk::ShaderStageFlags::COMPUTE)
-                || !subgroup.supported_operations.contains(vk::SubgroupFeatureFlags::BASIC)
+                || !subgroup.supported_operations.contains(vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::VOTE)
                 || sizes.max_compute_workgroup_subgroups<64/size {
                 return Err(format!("Required physical compute subgroup size {size} unsupported").into());
             }
@@ -1552,9 +1552,16 @@ pub(crate) fn verify_native_records(context:&mut Context) -> Result<()> {
 }
 
 // Original native instruction fixtures for the advanced backend.
-fn advanced_fixtures() -> Vec<(&'static str,Vec<u8>,u16)> {
+fn advanced_fixtures(wave64:bool) -> Vec<(&'static str,Vec<u8>,u16)> {
     let make = |words:&[u32]| words.iter().flat_map(|w|w.to_le_bytes()).collect::<Vec<u8>>();
+    let mut exec_branch=vec![0x7e06_0289u32,0x7da8_0001,0xbf88_0001,0x7e06_028b,0xbefe_03c1];
+    let mut exec_loop=vec![0x7e06_0280u32,0x3608_0083,0xbe82_0380,0x7da2_0802,
+        0xbf88_0003,0x4a06_0681,0x8002_8102,0xbf82_fffb,0xbefe_03c1];
+    if wave64 {exec_branch.push(0xbeff_03c1);exec_loop.push(0xbeff_03c1);}
+    for words in [&mut exec_branch,&mut exec_loop] {words.extend([0xe070_2000,0x8001_0300,0xbf81_0000]);}
     vec![
+        ("exec_branch",make(&exec_branch),4),
+        ("exec_loop",make(&exec_loop),5),
         ("cfg_branch",make(&[0xbf06_8000,0xbf85_0002,0xbe82_0387,0xbf82_0001,
             0xbe82_0389,0x7e06_0202,0xe070_2000,0x8001_0300,0xbf81_0000]),4),
         ("cfg_loop",make(&[0xbe82_0380,0xbe83_0380,0xbf09_0003,0xbf85_0003,
@@ -1585,7 +1592,7 @@ fn advanced_fixtures() -> Vec<(&'static str,Vec<u8>,u16)> {
 pub(crate) fn emit_advanced(dir:&std::path::Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     for wave64 in [false,true] {
-        for (label,code,vgprs) in advanced_fixtures() {
+        for (label,code,vgprs) in advanced_fixtures(wave64) {
             let p=vortex_shader::ir::build(&code,wave64,vgprs)?;
             let words=vortex_shader::spirv_cfg::emit_cfg(&p)?;
             let path=dir.join(format!("{label}_wave{}.spv",if wave64{64}else{32}));
@@ -1606,13 +1613,15 @@ pub(crate) fn verify_advanced(context:&mut Context) -> Result<()> {
     let upload=s.create_buffer(BYTES,MemoryKind::HostVisible)?;
     for wave64 in [false,true] {
         let wave=if wave64{64}else{32};
-        for (label,code,vgprs) in advanced_fixtures() {
+        for (label,code,vgprs) in advanced_fixtures(wave64) {
             let p=s.create_native_cfg_pipeline(&code,wave64,vgprs)?;
             let b=s.create_compute_binding(p,local,0,BYTES)?;
             let mut initial=vec![17u32;N];
             let groups=if label=="dynamic_address"{1}else{2};
             let mut expected=initial.clone();
             match label {
+                "exec_branch"=>{for (i,v) in expected.iter_mut().enumerate(){*v=if i<7{11}else{9};}},
+                "exec_loop"=>{for (i,v) in expected.iter_mut().enumerate(){*v=(i as u32)&3;}},
                 "cfg_loop"=>expected.fill(91),
                 "cfg_branch"=>expected.fill(7),
                 "dynamic_address"=>{
@@ -1651,16 +1660,16 @@ pub(crate) fn verify_advanced(context:&mut Context) -> Result<()> {
         }
     }
     // Reject a potentially racing ordinary store to a dynamic index and a
-    // branch on EXEC (not part of the uniform CFG ABI).
+    // barrier in a wave-dependent program (not safe across workgroup waves).
     for invalid in [
         vec![0x3608_0081u32,0x7e06_0281,0xe070_2000,0x8001_0304,0xbf81_0000],
-        vec![0xbf88_0001u32,0xbe82_0380,0xbf81_0000],
+        vec![0xbefe_0380u32,0xbf8a_0000,0xbf81_0000],
     ] {
         let code:Vec<u8>=invalid.into_iter().flat_map(u32::to_le_bytes).collect();
         if s.create_native_cfg_pipeline(&code,false,5).is_ok(){return Err("accepted unsupported advanced native operation".into());}
     }
-    println!("PASS: unsafe dynamic store and unsupported EXEC branch rejected");
-    println!("PASS: bounded uniform native CFG, dynamic addresses, five atomic operations, LDS/barrier and physical wave32/64 verified");
+    println!("PASS: unsafe dynamic store and wave-dependent barrier rejected");
+    println!("PASS: bounded native scalar and EXEC control flow, dynamic addresses, five atomic operations, LDS/barrier and physical wave32/64 verified");
     Ok(())
 }
 
