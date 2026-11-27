@@ -13,6 +13,12 @@ pub struct BufferId(u64);
 #[derive(Debug,Clone,Copy,PartialEq,Eq,PartialOrd,Ord)]
 pub struct ImageId(u64);
 
+#[derive(Debug,Clone,Copy,PartialEq,Eq,PartialOrd,Ord)]
+pub struct PipelineId(u64);
+
+/// Fixed initial graphics ABI: position xyz and color rgba, seven f32s.
+const VERTEX_BYTES: u64 = 28;
+
 /// Tightly packed RGBA8 texels, mip 0, layer 0.
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
 pub struct ImageRegion {
@@ -53,6 +59,8 @@ pub enum Command {
     ClearDepth { dst: ImageId, depth: f32 },
     /// Clear and store color and depth attachments over a render rectangle.
     ClearAttachments { color: ImageId, depth: ImageId, region: ImageRegion, rgba: [f32;4], z: f32 },
+    Draw { pipeline: PipelineId, color: ImageId, depth: ImageId, region: ImageRegion,
+        vertices: BufferId, offset: u64, count: u32 },
     UploadImage { src: BufferId, offset: u64, dst: ImageId, region: ImageRegion },
     ReadImage { src: ImageId, region: ImageRegion, dst: BufferId, offset: u64 },
     CopyImage { src: ImageId, region: ImageRegion, dst: ImageId, x: u32, y: u32 },
@@ -92,7 +100,7 @@ impl<'a> Buffer<'a> {
         unsafe {
             b.handle = d.create_buffer(&vk::BufferCreateInfo::default().size(bytes)
                 .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST
-                    | vk::BufferUsageFlags::STORAGE_BUFFER)
+                    | vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::VERTEX_BUFFER)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE),None)?;
             let req = d.get_buffer_memory_requirements(b.handle);
             use vk::MemoryPropertyFlags as F;
@@ -219,6 +227,83 @@ fn initialize_layout(d:&ash::Device,cmd:vk::CommandBuffer,image:&Image<'_>) {
     unsafe { d.cmd_pipeline_barrier2(cmd,&vk::DependencyInfo::default().image_memory_barriers(&barriers)); }
 }
 
+struct GraphicsPipeline<'a> {
+    d: &'a ash::Device,
+    vert: vk::ShaderModule,
+    frag: vk::ShaderModule,
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+}
+impl Drop for GraphicsPipeline<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            self.d.destroy_pipeline(self.pipeline,None);
+            self.d.destroy_pipeline_layout(self.layout,None);
+            self.d.destroy_shader_module(self.vert,None);
+            self.d.destroy_shader_module(self.frag,None);
+        }
+    }
+}
+impl<'a> GraphicsPipeline<'a> {
+    fn new(d:&'a ash::Device,vert:&[u32],frag:&[u32]) -> Result<Self> {
+        let mut p = Self { d,vert:vk::ShaderModule::null(),frag:vk::ShaderModule::null(),
+            layout:vk::PipelineLayout::null(),pipeline:vk::Pipeline::null() };
+        unsafe {
+            p.vert = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(vert),None)?;
+            p.frag = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(frag),None)?;
+            p.layout = d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(),None)?;
+            let entry = c"main";
+            let stages = [
+                vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::VERTEX)
+                    .module(p.vert).name(entry),
+                vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::FRAGMENT)
+                    .module(p.frag).name(entry),
+            ];
+            let bindings = [vk::VertexInputBindingDescription::default().binding(0)
+                .stride(VERTEX_BYTES as u32).input_rate(vk::VertexInputRate::VERTEX)];
+            let attributes = [
+                vk::VertexInputAttributeDescription::default().location(0).binding(0)
+                    .format(vk::Format::R32G32B32_SFLOAT).offset(0),
+                vk::VertexInputAttributeDescription::default().location(1).binding(0)
+                    .format(vk::Format::R32G32B32A32_SFLOAT).offset(12),
+            ];
+            let vertex = vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(&bindings).vertex_attribute_descriptions(&attributes);
+            let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+            let viewport = vk::PipelineViewportStateCreateInfo::default().viewport_count(1).scissor_count(1);
+            let raster = vk::PipelineRasterizationStateCreateInfo::default()
+                .polygon_mode(vk::PolygonMode::FILL).cull_mode(vk::CullModeFlags::NONE)
+                .front_face(vk::FrontFace::COUNTER_CLOCKWISE).line_width(1.);
+            let samples = vk::PipelineMultisampleStateCreateInfo::default()
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            let depth = vk::PipelineDepthStencilStateCreateInfo::default()
+                .depth_test_enable(true).depth_write_enable(true).depth_compare_op(vk::CompareOp::LESS);
+            let blends = [vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA)];
+            let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blends);
+            let dynamic_states = [vk::DynamicState::VIEWPORT,vk::DynamicState::SCISSOR];
+            let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+            let formats = [ImageKind::Rgba8.format()];
+            let mut rendering = vk::PipelineRenderingCreateInfo::default()
+                .color_attachment_formats(&formats).depth_attachment_format(ImageKind::Depth32.format());
+            let info = vk::GraphicsPipelineCreateInfo::default().stages(&stages)
+                .vertex_input_state(&vertex).input_assembly_state(&assembly).viewport_state(&viewport)
+                .rasterization_state(&raster).multisample_state(&samples).depth_stencil_state(&depth)
+                .color_blend_state(&blend).dynamic_state(&dynamic).layout(p.layout)
+                .push_next(&mut rendering);
+            p.pipeline = match d.create_graphics_pipelines(vk::PipelineCache::null(),&[info],None) {
+                Ok(pipelines) => pipelines[0],
+                Err((pipelines,e)) => {
+                    for pipeline in pipelines { d.destroy_pipeline(pipeline,None); }
+                    return Err(e.into());
+                }
+            };
+        }
+        Ok(p)
+    }
+}
+
 /// Owns resources and a command queue while exclusively borrowing Context.
 /// IDs are valid only in the session that created them. Failed submissions
 /// poison the session; no resource is reused before completion is known.
@@ -236,6 +321,7 @@ pub struct Session<'a> {
     poisoned: bool,
     buffers: BTreeMap<BufferId,Buffer<'a>>,
     images: BTreeMap<ImageId,Image<'a>>,
+    pipelines: BTreeMap<PipelineId,GraphicsPipeline<'a>>,
 }
 
 impl Drop for Session<'_> {
@@ -257,7 +343,7 @@ impl<'a> Session<'a> {
             memory:unsafe { context.instance.get_physical_device_memory_properties(context.physical) },
             queue:unsafe { d.get_device_queue(context.family,0) },
             pool:vk::CommandPool::null(),command:vk::CommandBuffer::null(),
-            timeline:vk::Semaphore::null(),completed:0,next_id:1,poisoned:false,buffers:BTreeMap::new(),images:BTreeMap::new(),
+            timeline:vk::Semaphore::null(),completed:0,next_id:1,poisoned:false,buffers:BTreeMap::new(),images:BTreeMap::new(),pipelines:BTreeMap::new(),
         };
         unsafe {
             session.pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default()
@@ -337,6 +423,27 @@ impl<'a> Session<'a> {
         Ok(id)
     }
 
+    fn pipeline(&self,id:PipelineId) -> Result<&GraphicsPipeline<'a>> {
+        self.pipelines.get(&id).ok_or_else(|| "unknown or retired graphics pipeline".into())
+    }
+
+    /// Create a pipeline using trusted, validated SPIR-V with the fixed vertex ABI,
+    /// no descriptors or push constants, and a single RGBA8 output.
+    pub fn create_graphics_pipeline(&mut self,vert:&[u32],frag:&[u32]) -> Result<PipelineId> {
+        self.ready()?;
+        let id = PipelineId(self.next_id);
+        self.next_id = self.next_id.checked_add(1).ok_or("pipeline ID exhausted")?;
+        let p = GraphicsPipeline::new(self.d,vert,frag)?;
+        self.pipelines.insert(id,p);
+        Ok(id)
+    }
+
+    pub fn destroy_graphics_pipeline(&mut self,id:PipelineId) -> Result<()> {
+        self.ready()?;
+        self.pipelines.remove(&id).ok_or("unknown or retired graphics pipeline")?;
+        Ok(())
+    }
+
     pub fn destroy_image(&mut self,id:ImageId) -> Result<()> {
         self.ready()?;
         self.images.remove(&id).ok_or("unknown or retired image ID")?;
@@ -403,6 +510,19 @@ impl<'a> Session<'a> {
                     }
                     c.check(region)?;
                     d.check(region)?;
+                }
+                Command::Draw { pipeline,color,depth,region,vertices,offset,count } => {
+                    self.pipeline(pipeline)?;
+                    let c = self.image(color)?;
+                    let d = self.image(depth)?;
+                    if c.kind != ImageKind::Rgba8 || d.kind != ImageKind::Depth32
+                        || (c.width,c.height) != (d.width,d.height)
+                        || count == 0 || count % 3 != 0 {
+                        return Err("invalid draw attachments or triangle count".into());
+                    }
+                    c.check(region)?;
+                    d.check(region)?;
+                    check_range(self.buffer(vertices)?.bytes,offset,u64::from(count)*VERTEX_BYTES)?;
                 }
                 Command::UploadImage { src,offset,dst,region } => {
                     let image = self.image(dst)?;
@@ -488,6 +608,31 @@ impl<'a> Session<'a> {
                         };
                         d.cmd_begin_rendering(cmd,&vk::RenderingInfo::default().render_area(area)
                             .layer_count(1).color_attachments(&colors).depth_attachment(&depth_attachment));
+                        d.cmd_end_rendering(cmd);
+                    }
+                    Command::Draw { pipeline,color,depth,region,vertices,offset,count } => {
+                        let p = self.pipeline(pipeline)?;
+                        let c = self.image(color)?;
+                        let z = self.image(depth)?;
+                        let colors = [vk::RenderingAttachmentInfo::default().image_view(c.view)
+                            .image_layout(vk::ImageLayout::GENERAL)
+                            .load_op(vk::AttachmentLoadOp::LOAD).store_op(vk::AttachmentStoreOp::STORE)];
+                        let depth_attachment = vk::RenderingAttachmentInfo::default().image_view(z.view)
+                            .image_layout(vk::ImageLayout::GENERAL)
+                            .load_op(vk::AttachmentLoadOp::LOAD).store_op(vk::AttachmentStoreOp::STORE);
+                        let area = vk::Rect2D {
+                            offset:vk::Offset2D { x:region.x as i32,y:region.y as i32 },
+                            extent:vk::Extent2D { width:region.width,height:region.height },
+                        };
+                        let viewport = [vk::Viewport { x:region.x as f32,y:region.y as f32,
+                            width:region.width as f32,height:region.height as f32,min_depth:0.,max_depth:1. }];
+                        d.cmd_begin_rendering(cmd,&vk::RenderingInfo::default().render_area(area)
+                            .layer_count(1).color_attachments(&colors).depth_attachment(&depth_attachment));
+                        d.cmd_bind_pipeline(cmd,vk::PipelineBindPoint::GRAPHICS,p.pipeline);
+                        d.cmd_set_viewport(cmd,0,&viewport);
+                        d.cmd_set_scissor(cmd,0,&[area]);
+                        d.cmd_bind_vertex_buffers(cmd,0,&[self.buffer(vertices)?.handle],&[offset]);
+                        d.cmd_draw(cmd,count,1,0,0);
                         d.cmd_end_rendering(cmd);
                     }
                     Command::UploadImage { src,offset,dst,region } => {
@@ -655,6 +800,61 @@ pub(crate) fn verify_attachments(context:&mut Context) -> Result<()> {
     if s.read_words(output,0,128)? != expected { return Err("invalid render list changed attachments".into()); }
     println!("PASS: mismatched attachments and invalid depth values rejected");
     println!("PASS: reusable Vulkan color and depth attachment executor verified");
+    Ok(())
+}
+
+pub(crate) fn verify_draws(context:&mut Context,vert:&std::path::Path,frag:&std::path::Path) -> Result<()> {
+    let load = |path:&std::path::Path| -> Result<Vec<u32>> {
+        Ok(ash::util::read_spv(&mut std::io::Cursor::new(std::fs::read(path)?))?)
+    };
+    let vert = load(vert)?;
+    let frag = load(frag)?;
+    let mut s = Session::new(context)?;
+    let p = s.create_graphics_pipeline(&vert,&frag)?;
+    let color = s.create_image(8,8)?;
+    let depth = s.create_depth_image(8,8)?;
+    let full = ImageRegion { x:0,y:0,width:8,height:8 };
+    let partial = ImageRegion { x:2,y:2,width:4,height:4 };
+    let mut data = Vec::new();
+    for (z,rgba) in [(0.5f32,[1.,0.,0.,1.]),(0.75,[0.,1.,0.,1.]),(0.25,[0.,0.,1.,1.])] {
+        for (x,y) in [(-1f32,-1f32),(3.,-1.),(-1.,3.)] {
+            data.extend([x,y,z,rgba[0],rgba[1],rgba[2],rgba[3]].map(f32::to_bits));
+        }
+    }
+    let upload = s.create_buffer(data.len() as u64*4,MemoryKind::HostVisible)?;
+    let vertices = s.create_buffer(data.len() as u64*4,MemoryKind::DeviceLocal)?;
+    let output = s.create_buffer(512,MemoryKind::HostVisible)?;
+    s.write_words(upload,0,&data)?;
+    let draw = |offset,region| Command::Draw { pipeline:p,color,depth,region,vertices,offset,count:3 };
+    let epoch = s.submit(&[
+        Command::Copy { src:upload,src_offset:0,dst:vertices,dst_offset:0,bytes:data.len() as u64*4 },
+        Command::ClearAttachments { color,depth,region:full,rgba:[0.;4],z:1. },
+        draw(0,full),
+        draw(3*VERTEX_BYTES,full),
+        draw(6*VERTEX_BYTES,partial),
+        Command::ReadImage { src:color,region:full,dst:output,offset:0 },
+        Command::ReadImage { src:depth,region:full,dst:output,offset:256 },
+    ])?;
+    let mut expected = Vec::new();
+    for y in 0..8 { for x in 0..8 {
+        let inside = (2..6).contains(&x) && (2..6).contains(&y);
+        expected.push(u32::from_le_bytes(if inside { [0,0,255,255] } else { [255,0,0,255] }));
+    }}
+    for y in 0..8 { for x in 0..8 {
+        let inside = (2..6).contains(&x) && (2..6).contains(&y);
+        expected.push(if inside { 0.25f32.to_bits() } else { 0.5f32.to_bits() });
+    }}
+    if s.read_words(output,0,128)? != expected { return Err("draw color/depth mismatch".into()); }
+    println!("PASS: three draws on one reusable pipeline; farther triangle rejected; nearer rectangle verified at timeline {epoch}");
+    if s.submit(&[Command::ClearImage { dst:color,rgba:[0.;4] },draw(7*VERTEX_BYTES,full)]).is_ok() {
+        return Err("accepted invalid vertex range".into());
+    }
+    s.submit(&[Command::ReadImage { src:color,region:full,dst:output,offset:0 }])?;
+    if s.read_words(output,0,64)? != expected[..64] { return Err("invalid draw list modified color".into()); }
+    s.destroy_graphics_pipeline(p)?;
+    if s.submit(&[draw(0,full)]).is_ok() { return Err("accepted retired pipeline".into()); }
+    println!("PASS: invalid vertex ranges and retired graphics pipeline rejected");
+    println!("PASS: reusable Vulkan graphics pipeline and depth-tested draw executor verified");
     Ok(())
 }
 
