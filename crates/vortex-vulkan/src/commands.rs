@@ -356,7 +356,7 @@ impl Drop for ComputePipeline<'_> {
     }
 }
 impl<'a> ComputePipeline<'a> {
-    fn new(d:&'a ash::Device,words:&[u32]) -> Result<Self> {
+    fn new(d:&'a ash::Device,words:&[u32],wave:Option<u32>) -> Result<Self> {
         let mut p = Self { d,stride_words:1,shader:vk::ShaderModule::null(),descriptors:vk::DescriptorSetLayout::null(),
             layout:vk::PipelineLayout::null(),pipeline:vk::Pipeline::null() };
         unsafe {
@@ -371,8 +371,14 @@ impl<'a> ComputePipeline<'a> {
                 .offset(0).size(8)];
             p.layout = d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default()
                 .set_layouts(&sets).push_constant_ranges(&push),None)?;
-            let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE)
+            let mut required = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+                .required_subgroup_size(wave.unwrap_or(32));
+            let mut stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE)
                 .module(p.shader).name(c"main");
+            if wave.is_some() {
+                stage = stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
+                    .push_next(&mut required);
+            }
             let info = vk::ComputePipelineCreateInfo::default().stage(stage).layout(p.layout);
             p.pipeline = match d.create_compute_pipelines(vk::PipelineCache::null(),&[info],None) {
                 Ok(pipelines) => pipelines[0],
@@ -586,7 +592,28 @@ impl<'a> Session<'a> {
     /// Trusted, validated SPIR-V matching the initial compute ABI. The shader
     /// must restrict storage accesses to its own global invocation index.
     pub fn create_compute_pipeline(&mut self,words:&[u32]) -> Result<ComputeId> {
+        self.create_compute_pipeline_wave(words,None)
+    }
+
+    fn create_compute_pipeline_wave(&mut self,words:&[u32],wave:Option<u32>) -> Result<ComputeId> {
         self.ready()?;
+        if let Some(size) = wave {
+            let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
+            let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut f13);
+            unsafe { self.instance.get_physical_device_features2(self.physical,&mut features); }
+            let mut sizes = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+            let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
+            let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut sizes).push_next(&mut subgroup);
+            unsafe { self.instance.get_physical_device_properties2(self.physical,&mut props); }
+            if !matches!(size,32|64) || f13.subgroup_size_control==0 || f13.compute_full_subgroups==0
+                || size<sizes.min_subgroup_size || size>sizes.max_subgroup_size
+                || !sizes.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE)
+                || !subgroup.supported_stages.contains(vk::ShaderStageFlags::COMPUTE)
+                || !subgroup.supported_operations.contains(vk::SubgroupFeatureFlags::BASIC)
+                || sizes.max_compute_workgroup_subgroups<64/size {
+                return Err(format!("Required physical compute subgroup size {size} unsupported").into());
+            }
+        }
         let limits = unsafe { self.instance.get_physical_device_properties(self.physical) }.limits;
         if limits.max_compute_work_group_invocations < COMPUTE_LANES
             || limits.max_compute_work_group_size[0] < COMPUTE_LANES {
@@ -594,7 +621,7 @@ impl<'a> Session<'a> {
         }
         let id = ComputeId(self.next_id);
         self.next_id = self.next_id.checked_add(1).ok_or("compute ID exhausted")?;
-        let p = ComputePipeline::new(self.d,words)?;
+        let p = ComputePipeline::new(self.d,words,wave)?;
         self.compute_pipelines.insert(id,p);
         Ok(id)
     }
@@ -645,6 +672,14 @@ impl<'a> Session<'a> {
         let id = self.create_compute_pipeline(&words)?;
         self.compute_pipelines.get_mut(&id).ok_or("missing compute pipeline")?.stride_words = stride;
         Ok(id)
+    }
+
+    /// Compile the uniform native CFG backend and require actual AMD wave size.
+    pub fn create_native_cfg_pipeline(&mut self,code:&[u8],wave64:bool,vgprs:u16) -> Result<ComputeId> {
+        self.ready()?;
+        let program = vortex_shader::ir::build(code,wave64,vgprs)?;
+        let words = vortex_shader::spirv_cfg::emit_cfg(&program)?;
+        self.create_compute_pipeline_wave(&words,Some(if wave64 {64}else{32}))
     }
 
     pub fn create_compute_binding(&mut self,pipeline:ComputeId,buffer:BufferId,offset:u64,bytes:u64) -> Result<ComputeBindingId> {
@@ -1513,6 +1548,102 @@ pub(crate) fn verify_native_records(context:&mut Context) -> Result<()> {
     }
     println!("PASS: record boundary and dispatch descriptor bounds enforced");
     println!("PASS: native multi-dword memory instructions executed in Vulkan");
+    Ok(())
+}
+
+// Original native instruction fixtures for the advanced backend.
+fn advanced_fixtures() -> Vec<(&'static str,Vec<u8>,u16)> {
+    let make = |words:&[u32]| words.iter().flat_map(|w|w.to_le_bytes()).collect::<Vec<u8>>();
+    vec![
+        ("cfg_loop",make(&[0xbe82_0380,0xbe83_0380,0xbf09_0003,0xbf85_0003,
+            0x8002_0102,0x8003_8103,0xbf82_fffb,0x7e06_0202,
+            0xe070_2000,0x8001_0300,0xbf81_0000]),4),
+        // Read the disjoint upper half, plus an out-of-bounds read, write lower half.
+        ("dynamic_address",make(&[0x4a08_00c0,0xe030_2000,0x8001_0304,0xbf8c_0000,
+            0xe030_2100,0x8001_0504,0xbf8c_0000,0x4a06_0705,
+            0xe070_2000,0x8001_0300,0xbf81_0000]),6),
+        // Shared-address atomic add: two counters selected by invocation parity.
+        ("atomic_add",make(&[0x3608_0081,0x7e06_0281,0xe0c8_2000,0x8001_0304,0xbf81_0000]),5),
+        ("atomic_min",make(&[0x3608_0081,0x7e06_0300,0xe0d8_2000,0x8001_0304,0xbf81_0000]),5),
+        ("atomic_max",make(&[0x3608_0081,0x7e06_0300,0xe0e0_2000,0x8001_0304,0xbf81_0000]),5),
+        // Unique addresses, no races. Swap to 9 and compare-swap 17 -> 9.
+        ("atomic_swap",make(&[0x7e06_0289,0xe0c0_2000,0x8001_0300,0xbf81_0000]),4),
+        ("atomic_cas",make(&[0x7e06_0289,0x7e08_0291,0xe0c4_2000,0x8001_0300,0xbf81_0000]),5),
+        // Each workgroup writes local LDS, barriers, reads its adjacent lane.
+        // The physical SubgroupSize builtin is added to the result.
+        ("lds_wave",make(&[0x3406_0282,0xd834_0000,0x0000_0003,0xbf8c_0000,
+            0xbf8a_0000,0x3a08_0281,0x3408_0882,0xd8d8_0000,0x0500_0004,0xbf8c_0000,
+            0x4a0a_0b02,0xe070_2000,0x8001_0500,0xbf81_0000]),6),
+    ]
+}
+
+/// Emit all advanced modules before GPU execution for external spirv-val.
+pub(crate) fn emit_advanced(dir:&std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    for wave64 in [false,true] {
+        for (label,code,vgprs) in advanced_fixtures() {
+            let p=vortex_shader::ir::build(&code,wave64,vgprs)?;
+            let words=vortex_shader::spirv_cfg::emit_cfg(&p)?;
+            let path=dir.join(format!("{label}_wave{}.spv",if wave64{64}else{32}));
+            let bytes:Vec<u8>=words.into_iter().flat_map(u32::to_le_bytes).collect();
+            std::fs::write(&path,bytes)?;
+            println!("PASS: emitted {}",path.display());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_advanced(context:&mut Context) -> Result<()> {
+    const N:usize=128;
+    const BYTES:u64=N as u64*4;
+    let mut s=Session::new(context)?;
+    let local=s.create_buffer(BYTES,MemoryKind::DeviceLocal)?;
+    let out=s.create_buffer(BYTES,MemoryKind::HostVisible)?;
+    let upload=s.create_buffer(BYTES,MemoryKind::HostVisible)?;
+    for wave64 in [false,true] {
+        let wave=if wave64{64}else{32};
+        for (label,code,vgprs) in advanced_fixtures() {
+            let p=s.create_native_cfg_pipeline(&code,wave64,vgprs)?;
+            let b=s.create_compute_binding(p,local,0,BYTES)?;
+            let mut initial=vec![17u32;N];
+            let groups=if label=="dynamic_address"{1}else{2};
+            let mut expected=initial.clone();
+            match label {
+                "cfg_loop"=>expected.fill(91),
+                "dynamic_address"=>{
+                    for (i,v) in initial.iter_mut().enumerate(){*v=(i as u32).wrapping_mul(13);}
+                    expected.clone_from(&initial);
+                    for i in 0..64{expected[i]=initial[i+64];}
+                }
+                "atomic_add"=>{expected[0]+=64;expected[1]+=64;},
+                "atomic_min"=>{expected[0]=0;expected[1]=1;},
+                "atomic_max"=>{expected[0]=126;expected[1]=127;},
+                "atomic_swap"|"atomic_cas"=>expected.fill(9),
+                "lds_wave"=>{for (i,v) in expected.iter_mut().enumerate(){*v=(i as u32^1)+wave;}},
+                _=>return Err("unknown advanced fixture".into()),
+            }
+            s.write_words(upload,0,&initial)?;
+            let epoch=s.submit(&[
+                Command::Copy{src:upload,src_offset:0,dst:local,dst_offset:0,bytes:BYTES},
+                Command::Dispatch{binding:b,groups,constants:[13,7]},
+                Command::Copy{src:local,src_offset:0,dst:out,dst_offset:0,bytes:BYTES},
+            ])?;
+            let actual=s.read_words(out,0,N)?;
+            if actual!=expected{
+                let i=actual.iter().zip(&expected).position(|(a,b)|a!=b).unwrap_or(0);
+                return Err(format!("{label} wave{wave} mismatch at {i}: {} != {}",actual[i],expected[i]).into());
+            }
+            if label=="cfg_loop" {
+                s.submit(&[Command::Dispatch{binding:b,groups:2,constants:[0,7]},
+                    Command::Copy{src:local,src_offset:0,dst:out,dst_offset:0,bytes:BYTES}])?;
+                if s.read_words(out,0,N)?!=vec![0;N]{return Err("zero iteration loop mismatch".into());}
+            }
+            println!("PASS: native {label}, physical wave{wave}, timeline {epoch}");
+            s.destroy_compute_binding(b)?;
+            s.destroy_compute_pipeline(p)?;
+        }
+    }
+    println!("PASS: bounded uniform native CFG, dynamic addresses, five atomic operations, LDS/barrier and physical wave32/64 verified");
     Ok(())
 }
 
