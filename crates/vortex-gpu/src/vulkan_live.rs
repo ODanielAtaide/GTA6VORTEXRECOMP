@@ -144,9 +144,11 @@ pub(crate) enum MarkerTarget{
     Buffer{resource:Retained,offset:u64},
     Host(HostMarker),
 }
+#[derive(Clone,Copy)]
+pub(crate) enum MarkerValue{Immediate(u64),GpuTimestamp}
 pub(crate) enum Op{
     Sync,
-    WriteMarker{target:MarkerTarget,value:u64,bytes:usize},
+    WriteMarker{target:MarkerTarget,value:MarkerValue,bytes:usize},
     Copy{dst:Retained,src:Retained,dst_offset:u64,src_offset:u64,len:u64},
     ClearColor{resource:Retained,spec:ImageSpec,rgba:[f32;4]},
     ClearDepth{resource:Retained,spec:ImageSpec,z:f32},
@@ -169,7 +171,7 @@ impl Recording{
     pub(crate) fn push(&mut self,op:Op){if self.closed{stop("recording into closed guest list");}self.ops.push(op);}
     pub(crate) fn write_marker(&mut self,address:u64,value:u64,bytes:usize,flush:u32,flags:u32){
         if self.closed{stop("recording write into closed guest list");}
-        if flags!=0||!matches!(bytes,4|8)||address==0||address%(bytes as u64)!=0{
+        if !(flags==0||(flags==1&&bytes==8))||!matches!(bytes,4|8)||address==0||address%(bytes as u64)!=0{
             stop(format_args!("unsupported marker flags or alignment: address={address:#x} flush={flush:#x} flags={flags:#x} bytes={bytes}"));
         }
         let location={
@@ -187,7 +189,9 @@ impl Recording{
             }
             _=>stop(format_args!("ambiguous or null marker address {address:#x}: {location:?}")),
         };
-        self.push(Op::WriteMarker{target,value,bytes});
+        let marker=if flags==1{MarkerValue::GpuTimestamp}else{MarkerValue::Immediate(value)};
+        self.push(Op::WriteMarker{target,value:marker,bytes});
+        if flags==1{static FIRST_TIMESTAMP:std::sync::Once=std::sync::Once::new();FIRST_TIMESTAMP.call_once(||tracing::info!(address,"VULKAN_GUEST_GPU_TIMESTAMP_RECORDED"));}
         static FIRST:std::sync::Once=std::sync::Once::new();
         FIRST.call_once(||tracing::info!(address,value,bytes,flush,flags,"VULKAN_GUEST_WRITE_RECORDED"));
     }
@@ -266,7 +270,13 @@ impl Recording{
                 }
                 Op::WriteMarker{target,value,bytes}=>{
                     // Never publish a progress value if Vulkan submission failed.
-                    let _=call(Task::Sync);
+                    let data=match value{
+                        MarkerValue::Immediate(v)=>{let _=call(Task::Sync);*v}
+                        MarkerValue::GpuTimestamp=>{
+                            let Reply::Timestamp(ticks)=call(Task::Timestamp)else{stop("invalid Vulkan timestamp response");};
+                            ticks
+                        }
+                    };
                     let address=match target{
                         MarkerTarget::Buffer{resource,offset}=>range(resource.get(),*offset,*bytes as u64),
                         MarkerTarget::Host(mapping)=>{
@@ -274,7 +284,8 @@ impl Recording{
                             mapping.address
                         }
                     };
-                    if !write_marker_bytes(address,*value,*bytes){stop("guest marker destination is not writable");}
+                    if !write_marker_bytes(address,data,*bytes){stop("guest marker destination is not writable");}
+                    if matches!(value,MarkerValue::GpuTimestamp){static FIRST_GPU:std::sync::Once=std::sync::Once::new();FIRST_GPU.call_once(||println!("VULKAN_GUEST_GPU_TIMESTAMP_OK: {data} ticks at 100 MHz"));}
                     static FIRST:std::sync::Once=std::sync::Once::new();
                     FIRST.call_once(||println!("VULKAN_GUEST_WRITE_OK: ordered {bytes}-byte marker after Vulkan completion"));
                 }
