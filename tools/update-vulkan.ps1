@@ -24,6 +24,11 @@ function Save-Repository {
 # Save even if the remote is inaccessible. Bundles contain committed refs,
 # not uncommitted working-tree files, ignored files, or external LFS objects.
 Save-Repository "pre"
+$branch = git branch --show-current
+Check-Git "Falha ao identificar branch"
+if ($branch -ne "experimental/amd-vulkan-spirv") { throw "Branch incorreta; backup anterior preservado" }
+git fetch origin --tags '+refs/heads/*:refs/remotes/origin/*'
+Check-Git "Falha no fetch; backup anterior preservado"
 git pull --ff-only origin experimental/amd-vulkan-spirv
 Check-Git "Falha no Git; backup anterior preservado"
 Save-Repository "post"
@@ -37,8 +42,9 @@ cargo build --release --locked -p vortex --features vulkan
 Check-Git "Falha na compilacao"
 
 $exe = ".\target\release\vortex.exe"
-$compute = ".\target\vulkan-compute-v4"
-$graphics = ".\target\vulkan-graphics-v4"
+$stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
+$compute = ".\target\vulkan-compute-$stamp"
+$graphics = ".\target\vulkan-graphics-$stamp"
 & $exe vulkan-advanced --emit-only $compute
 Check-Git "Falha na traducao Compute"
 & $exe vulkan-native-graphics --emit-only $graphics
@@ -52,8 +58,18 @@ foreach ($dir in @($compute,$graphics)) {
 }
 New-Item -ItemType Directory -Force -Path ".\target\vulkan-cache" | Out-Null
 $env:AMD_VK_PIPELINE_CACHE = Join-Path (Get-Location).Path "target\vulkan-cache\session.bin"
-foreach ($test in @("vulkan-native","vulkan-advanced","vulkan-native-graphics")) {
+foreach ($test in @("vulkan-native","vulkan-advanced")) {
     & $exe $test
     Check-Git "Falha em $test"
+}
+try {
+    foreach ($mode in @("0","1")) {
+        $env:VORTEX_VK_BATCH_DRAWS = $mode
+        Write-Host "Draw batching: $mode" -ForegroundColor Cyan
+        & $exe vulkan-native-graphics
+        Check-Git "Falha no teste grafico (batching=$mode)"
+    }
+} finally {
+    Remove-Item Env:VORTEX_VK_BATCH_DRAWS -ErrorAction SilentlyContinue
 }
 Write-Host "TODOS OS TESTES APROVADOS" -ForegroundColor Green
