@@ -61,11 +61,18 @@ pub(crate) enum Op{
     CopyImage{src:Retained,dst:Retained,from:ImageSpec,to:ImageSpec},
 }
 #[derive(Default)]
-pub(crate) struct Recording{closed:bool,ops:Vec<Op>}
+pub(crate) struct Recording{closed:bool,ops:Vec<Op>,pipeline:Option<std::sync::Arc<crate::pipeline::native_live::Description>>}
 impl Recording{
     pub(crate) fn push(&mut self,op:Op){if self.closed{stop("recording into closed guest list");}self.ops.push(op);}
     pub(crate) fn close(&mut self){if self.closed{stop("guest list already closed");}self.closed=true;}
-    pub(crate) fn reset(&mut self){self.ops.clear();self.closed=false;}
+    pub(crate) fn reset(&mut self){self.ops.clear();self.closed=false;self.pipeline=None;}
+    pub(crate) fn set_pipeline(&mut self,pipeline:This){
+        if self.closed{stop("binding into closed guest list");}
+        self.pipeline=if pipeline.is_null(){None}else{Some(crate::pipeline::native_live::get(pipeline).unwrap_or_else(||stop("invalid native pipeline object")))};
+    }
+    pub(crate) fn require_pipeline(&self,kind:&str)->!{
+        self.pipeline.as_ref().unwrap_or_else(||stop(format_args!("{kind}: no bound native pipeline"))).require_execution(kind)
+    }
     pub(crate) fn execute(&self){
         if !self.closed{stop("submitting open guest list");}
         for op in &self.ops{

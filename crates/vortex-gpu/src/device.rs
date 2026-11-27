@@ -474,6 +474,10 @@ static LIVE_FUNCTIONS:Table<160>={
     let mut f=object::d3d12_object(object::missing_table::<{object::DEVICE},160>());
     f[0]=query_interface as *const ();f[7]=node_count as *const ();
     f[8]=queue::create as *const ();f[9]=list::create_allocator as *const ();
+    f[10]=pipeline::native_live::create_graphics as *const ();
+    f[11]=pipeline::native_live::create_compute as *const ();
+    f[62]=pipeline::native_live::create_compute_x as *const ();
+    f[86]=pipeline::native_live::create_stream as *const ();
     f[12]=list::create_list as *const ();f[13]=check_feature_support as *const ();
     f[14]=descriptor::create_heap as *const ();f[15]=descriptor::increment_size as *const ();
     f[16]=root::create as *const ();f[17]=descriptor::create_cbv as *const ();

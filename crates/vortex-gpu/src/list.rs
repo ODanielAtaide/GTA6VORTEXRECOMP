@@ -565,8 +565,7 @@ fn new_list(
     let live=crate::vulkan_live::enabled();
     #[cfg(all(windows,not(feature = "vulkan")))]
     let live=false;
-    #[cfg(all(windows,feature = "vulkan"))]
-    if live&&!pipeline.is_null(){crate::vulkan_live::stop("initial guest pipeline is not translated");}
+
     let table=if crate::device::newer(){&NEWER_LIST_FUNCTIONS}else{&LIST_FUNCTIONS};
     #[cfg(all(windows,feature = "vulkan"))]
     let table=if live{
@@ -584,7 +583,11 @@ fn new_list(
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(all(windows,feature = "vulkan"))]
-        live:Default::default(),
+        live:{
+            let mut recording=crate::vulkan_live::Recording::default();
+            if live{recording.set_pipeline(pipeline);}
+            std::sync::Mutex::new(recording)
+        },
         #[cfg(windows)]
         host: if live{None}else{crate::host::host().and_then(|h| match h.new_list() {
 
@@ -647,8 +650,10 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     }
     #[cfg(all(windows,feature = "vulkan"))]
     if crate::vulkan_live::enabled(){
-        if !pipeline.is_null(){crate::vulkan_live::stop("reset with untranslated guest pipeline");}
-        live_record(this).reset();
+        {
+            let mut recording=live_record(this);
+            recording.reset();recording.set_pipeline(pipeline);
+        }
         // SAFETY: guest owns the list and may reset only after submission.
         unsafe{&(*this.cast::<List>()).uploads}.lock().unwrap_or_else(|e|e.into_inner()).clear();
         return S_OK;
@@ -2263,11 +2268,39 @@ extern "system" fn live_sync(this:This,flags:u32,control:u32,address:u64,size:u6
     live_record(this).push(crate::vulkan_live::Op::Sync);
 }
 #[cfg(all(windows,feature = "vulkan"))]
+extern "system" fn live_set_pipeline(this:This,pipeline:This){live_record(this).set_pipeline(pipeline);}
+#[cfg(all(windows,feature = "vulkan"))]
+extern "system" fn live_dispatch(this:This,x:u32,y:u32,z:u32){
+    if x==0||y==0||z==0{return;}
+    tracing::info!(x,y,z,"VULKAN_GUEST_DISPATCH_REQUEST");
+    live_record(this).require_pipeline("dispatch");
+}
+#[cfg(all(windows,feature = "vulkan"))]
+extern "system" fn live_dispatch_x(this:This,x:u32,y:u32,z:u32,flags:u32){
+    tracing::debug!(flags,"native dispatch extension flags");
+    live_dispatch(this,x,y,z);
+}
+#[cfg(all(windows,feature = "vulkan"))]
+extern "system" fn live_draw(this:This,vertices:u32,instances:u32,first:u32,first_instance:u32){
+    if vertices==0||instances==0{return;}
+    tracing::info!(vertices,instances,first,first_instance,"VULKAN_GUEST_DRAW_REQUEST");
+    live_record(this).require_pipeline("draw");
+}
+#[cfg(all(windows,feature = "vulkan"))]
+extern "system" fn live_draw_indexed(this:This,indices:u32,instances:u32,first:u32,base:i32,first_instance:u32){
+    if indices==0||instances==0{return;}
+    tracing::info!(indices,instances,first,base,first_instance,"VULKAN_GUEST_DRAW_INDEXED_REQUEST");
+    live_record(this).require_pipeline("draw indexed");
+}
+#[cfg(all(windows,feature = "vulkan"))]
 const fn live_list_table(newer:bool)->[ *const ();160]{
     let mut f=object::d3d12_object(object::missing_table::<LIST,160>());
     f[0]=list_query as *const ();f[2]=list_release as *const ();
     f[7]=object::parent_device as *const ();f[8]=list_type as *const ();
     f[9]=close as *const ();f[10]=reset as *const ();
+    f[12]=live_draw as *const ();f[13]=live_draw_indexed as *const ();f[14]=live_dispatch as *const ();
+    f[25]=live_set_pipeline as *const ();
+    f[if newer{newer_slot(78)}else{78}]=live_dispatch_x as *const ();
     f[15]=live_copy_buffer as *const ();f[17]=live_copy_resource as *const ();
     f[26]=live_barrier as *const ();f[51]=live_clear_dsv as *const ();f[52]=live_clear_rtv as *const ();
     f[if newer{newer_slot(129)}else{129}]=live_sync as *const ();

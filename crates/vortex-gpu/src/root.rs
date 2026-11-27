@@ -208,7 +208,28 @@ pub(crate) extern "system" fn create(
         object: Object::new(&FUNCTIONS),
         blob,
     });
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){
+        LIVE_ROOTS.lock().unwrap_or_else(|e|e.into_inner()).insert(
+            std::ptr::from_ref(root.as_ref()) as usize, std::sync::Arc::from(root.blob.as_slice()));
+    }
     object::hand_out(ROOT_SIGNATURE, root, iid, &ROOT_SIGNATURE_IIDS, out)
+}
+
+#[cfg(all(windows,feature = "vulkan"))]
+static LIVE_ROOTS:std::sync::Mutex<std::collections::BTreeMap<usize,std::sync::Arc<[u8]>>>=
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(all(windows,feature = "vulkan"))]
+pub(crate) fn live_snapshot(this:This)->Option<std::sync::Arc<[u8]>>{
+    LIVE_ROOTS.lock().unwrap_or_else(|e|e.into_inner()).get(&(this as usize)).cloned()
+}
+
+#[cfg(all(windows,feature = "vulkan"))]
+impl Drop for RootSignature{
+    fn drop(&mut self){
+        LIVE_ROOTS.lock().unwrap_or_else(|e|e.into_inner()).remove(&(std::ptr::from_ref(self) as usize));
+    }
 }
 
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {

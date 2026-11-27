@@ -22,6 +22,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
+#[cfg(all(windows,feature = "vulkan"))]
+#[path = "pipeline_native.rs"]
+pub(crate) mod native_live;
 
 const PIPELINE_IIDS: [Iid; 4] = [
     guid(
