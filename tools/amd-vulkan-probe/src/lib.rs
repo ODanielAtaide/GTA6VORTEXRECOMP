@@ -2,6 +2,10 @@
 //! Independent AMD Vulkan context for synthetic workloads.
 mod compute;
 mod graphics;
+mod transfer;
+// Share the exact tested planner without linking the legacy D3D12 runtime.
+#[path = "../../../crates/vortex-gpu/src/vulkan_upload.rs"]
+mod dirty_upload;
 mod pipeline_cache;
 pub mod spirv;
 use ash::{vk, Entry};
@@ -39,6 +43,11 @@ impl Context {
                 Err(error)
             }
         }
+    }
+
+    /// Exercise real Vulkan transfers with the shared dirty upload planner.
+    pub fn verify_transfers(&mut self) -> Result<()> {
+        transfer::run(&self.instance, self.physical, &self.device, self.family)
     }
 
     /// Execute and verify the original synthetic compute shader.
