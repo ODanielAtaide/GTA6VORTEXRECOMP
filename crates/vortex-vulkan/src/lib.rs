@@ -75,7 +75,8 @@ impl Context {
     /// Verify direct native diagnostic shader compilation and dispatch.
     pub fn verify_native_dispatch(&mut self) -> Result<()> {
         commands::verify_native_dispatch(self)?;
-        commands::verify_native_buffers(self)
+        commands::verify_native_buffers(self)?;
+        commands::verify_native_memory(self)
     }
 
     /// Verify sparse non-uniform runtime descriptor arrays on supported hardware.
