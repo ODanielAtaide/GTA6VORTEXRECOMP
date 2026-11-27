@@ -72,7 +72,7 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
         out,
     )
 }
-extern "system" fn release(this: This) -> u32 {
+pub(crate) extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
 pub(crate) extern "system" fn completed(this: This) -> u64 {
@@ -89,7 +89,15 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     }
     if event.is_null() {
         #[cfg(all(windows,feature = "vulkan"))]
-        if crate::vulkan_live::enabled(){crate::vulkan_live::stop("pending blocking guest fence wait not ported");}
+        if crate::vulkan_live::enabled(){
+            drop(waiters);
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(30);
+            while completed(this)<value{
+                if std::time::Instant::now()>=deadline{crate::vulkan_live::stop("blocking guest fence wait timed out");}
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            return S_OK;
+        }
         // With submissions sent to the card and not waited for
         // (`crate::host::late`) the signal may be behind them: they are
         // settled, which sets it.
