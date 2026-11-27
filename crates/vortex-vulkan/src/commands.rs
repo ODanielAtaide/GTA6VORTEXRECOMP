@@ -621,6 +621,15 @@ impl<'a> Session<'a> {
         self.create_compute_pipeline(&words)
     }
 
+    /// Native indexed dword memory kernel, binding s[4:7] to the session's
+    /// storage buffer descriptor, with no guest addresses or implicit store.
+    pub fn create_native_memory_pipeline(&mut self,code:&[u8],wave64:bool,vgprs:u16) -> Result<ComputeId> {
+        self.ready()?;
+        let program = vortex_shader::ir::build(code,wave64,vgprs)?;
+        let words = vortex_shader::spirv_vector::emit_memory_kernel(&program)?;
+        self.create_compute_pipeline(&words)
+    }
+
     pub fn create_compute_binding(&mut self,pipeline:ComputeId,buffer:BufferId,offset:u64,bytes:u64) -> Result<ComputeBindingId> {
         self.ready()?;
         let p = self.compute_pipeline(pipeline)?;
@@ -1356,6 +1365,66 @@ pub(crate) fn verify_native_buffers(context:&mut Context) -> Result<()> {
     }
     println!("PASS: undeclared native register input rejected");
     println!("PASS: buffer-backed native GFX10 kernel and dynamic parameters verified");
+    Ok(())
+}
+
+pub(crate) fn verify_native_memory(context:&mut Context) -> Result<()> {
+    const N:usize = 4096;
+    const BYTES:u64 = N as u64*4;
+    let mut s = Session::new(context)?;
+    let staging = s.create_buffer(BYTES,MemoryKind::HostVisible)?;
+    let local = s.create_buffer(BYTES,MemoryKind::DeviceLocal)?;
+    let readback = s.create_buffer(BYTES,MemoryKind::HostVisible)?;
+    let encode = |words:&[u32]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
+    // buffer_load_dword v1,v0,s[4:7],0 idxen
+    // v1 += s0; buffer_store_dword v1,...
+    // v2 = buffer_load_dword ...; v2 ^= s0
+    // mask: v0 < s1; buffer_store_dword v2,...
+    let code = encode(&[
+        0xe030_2000,0x8001_0100,0xbf8c_0000,
+        0x4a02_0200,
+        0xe070_2000,0x8001_0100,0xbf8c_0000,
+        0xe030_2000,0x8001_0200,0xbf8c_0000,
+        0x3a04_0400,0x7da8_0001,
+        0xe070_2000,0x8001_0200,0xbf81_0000,
+    ]);
+    let initial:Vec<u32> = (0..N as u32)
+        .map(|i| i.wrapping_mul(0x9e3779b9)^0xdeadbeef).collect();
+    s.write_words(staging,0,&initial)?;
+    for wave64 in [false,true] {
+        let p = s.create_native_memory_pipeline(&code,wave64,3)?;
+        let b = s.create_compute_binding(p,local,0,BYTES)?;
+        let epoch = s.submit(&[
+            Command::Copy { src:staging,src_offset:0,dst:local,dst_offset:0,bytes:BYTES },
+            Command::Dispatch { binding:b,groups:64,constants:[0xfffffff0,2049] },
+            Command::Dispatch { binding:b,groups:32,constants:[33,1001] },
+            Command::Copy { src:local,src_offset:0,dst:readback,dst_offset:0,bytes:BYTES },
+        ])?;
+        let actual = s.read_words(readback,0,N)?;
+        for (i,&value) in actual.iter().enumerate() {
+            let mut expected = initial[i].wrapping_add(0xfffffff0);
+            if i<2049 { expected ^= 0xfffffff0; }
+            if i<N/2 {
+                expected = expected.wrapping_add(33);
+                if i<1001 { expected ^= 33; }
+            }
+            if value != expected { return Err(format!("native memory mismatch wave64={wave64} at {i}: {value:#x} != {expected:#x}").into()); }
+        }
+        println!("PASS: native MUBUF load/store/reload and EXEC-masked store; logical wave{}; {N} words; timeline {epoch}",if wave64 {64} else {32});
+        s.destroy_compute_binding(b)?;
+        s.destroy_compute_pipeline(p)?;
+    }
+    for invalid in [
+        encode(&[0xe030_2004,0x8001_0100,0xe070_2000,0x8001_0100,0xbf81_0000]),
+        encode(&[0xe030_2000,0x8002_0100,0xe070_2000,0x8002_0100,0xbf81_0000]),
+        encode(&[0x7e00_0280,0xe070_2000,0x8001_0100,0xbf81_0000]),
+    ] {
+        if s.create_native_memory_pipeline(&invalid,false,3).is_ok() {
+            return Err("accepted unsupported native memory addressing".into());
+        }
+    }
+    println!("PASS: unsupported offsets, descriptor and address modification rejected");
+    println!("PASS: native GFX10 indexed dword memory instructions executed in Vulkan");
     Ok(())
 }
 
