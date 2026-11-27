@@ -80,6 +80,16 @@ impl Context {
         commands::verify_native_records(self)
     }
 
+    /// Emit advanced native shader fixtures without initializing a device.
+    pub fn emit_advanced(dir:&Path) -> Result<()> {
+        commands::emit_advanced(dir)
+    }
+
+    /// Verify the bounded native CFG and advanced compute operations.
+    pub fn verify_advanced(&mut self) -> Result<()> {
+        commands::verify_advanced(self)
+    }
+
     /// Verify sparse non-uniform runtime descriptor arrays on supported hardware.
     pub fn verify_bindless(&mut self, path: &Path) -> Result<()> {
         descriptors::run_bindless(&self.instance, self.physical, &self.device, self.family, path)
