@@ -80,6 +80,16 @@ impl Emit {
         let f = self.value(code, FLOAT, &[a, b]);
         self.value(124, UINT, &[f])
     }
+    // Signed addition/subtraction set SCC on overflow, not unsigned carry.
+    fn signed_arithmetic(&mut self,a:u32,b:u32,sub:bool)->(u32,u32){
+        let v=self.u(if sub{130}else{128},a,b);
+        let first=self.u(198,a,if sub{b}else{v});
+        let second=self.u(198,if sub{a}else{b},v);
+        let changed=self.u(199,first,second);
+        let sign=self.c(0x80000000);let overflow=self.u(199,changed,sign);
+        let zero=self.c(0);let condition=self.test(171,overflow,zero);
+        (v,self.flag(condition))
+    }
     fn select(&mut self,condition:u32,a:u32,b:u32)->u32 { self.value(169,UINT,&[condition,a,b]) }
     fn flag(&mut self,condition:u32)->u32 { let a=self.c(1);let b=self.c(0);self.select(condition,a,b) }
     fn load(&mut self,p:u32)->u32 { self.value(61,UINT,&[p]) }
@@ -181,6 +191,23 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
             }
             _=>Err(err()),
         },
+        Fields::Sop{dst,src,imm:Some(imm)} if i.machine.encoding==Encoding::Sopk=>{
+            let Some(Operand::Scalar{code,dwords:1})=*dst else{return Err(err());};
+            if !scalar(code)||!src.is_empty(){return Err(err());}
+            let dest=Reg::S(code);
+            let k=e.c(i32::from(*imm as i16) as u32);
+            match name{
+                "s_movk_i32" if writes(i,&[dest])=>e.put(dest,k),
+                "s_mulk_i32" if writes(i,&[dest])=>{
+                    let a=e.reg(dest)?;let v=e.u(132,a,k);e.put(dest,v)
+                }
+                "s_addk_i32" if writes(i,&[dest,Reg::Scc])=>{
+                    let a=e.reg(dest)?;let(v,flag)=e.signed_arithmetic(a,k,false);
+                    e.put(dest,v)?;e.put(Reg::Scc,flag)
+                }
+                _=>Err(err()),
+            }
+        },
         Fields::Sop{dst,src,imm:None}=>{
             let width=if e.wave64{2}else{1};
             let save=name.ends_with("saveexec_b32")||name.ends_with("saveexec_b64");
@@ -240,9 +267,11 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
             if dst.is_none() {
                 let &[a,b]=args.as_slice() else {return Err(err());};
                 let opcode=match name {
-                    "s_cmp_eq_u32"=>170,"s_cmp_lg_u32"=>171,
+                    "s_cmp_eq_u32"|"s_cmp_eq_i32"=>170,"s_cmp_lg_u32"|"s_cmp_lg_i32"=>171,
                     "s_cmp_gt_u32"=>172,"s_cmp_ge_u32"=>174,
-                    "s_cmp_lt_u32"=>176,"s_cmp_le_u32"=>178,_=>return Err(err()),
+                    "s_cmp_lt_u32"=>176,"s_cmp_le_u32"=>178,
+                    "s_cmp_gt_i32"=>173,"s_cmp_ge_i32"=>175,
+                    "s_cmp_lt_i32"=>177,"s_cmp_le_i32"=>179,_=>return Err(err()),
                 };
                 if !writes(i,&[Reg::Scc]) {return Err(err());}
                 let cond=e.test(opcode,a,b);let v=e.flag(cond);return e.put(Reg::Scc,v);
@@ -254,6 +283,21 @@ fn lower(e:&mut Emit,i:&ir::Inst)->Result<(),ShaderError> {
                 ("s_mov_b32",&[a])=>(a,None),
                 ("s_add_u32",&[a,b])=>{let v=e.u(128,a,b);let c=e.test(176,v,a);(v,Some(e.flag(c)))},
                 ("s_sub_u32",&[a,b])=>{let v=e.u(130,a,b);let c=e.test(176,a,b);(v,Some(e.flag(c)))},
+                ("s_add_i32"|"s_sub_i32",&[a,b])=>{
+                    let(v,f)=e.signed_arithmetic(a,b,name=="s_sub_i32");(v,Some(f))
+                },
+                ("s_addc_u32",&[a,b])=>{
+                    let c=e.reg(Reg::Scc)?;let one=e.c(1);let c=e.u(199,c,one);
+                    let sum=e.u(128,a,b);let v=e.u(128,sum,c);
+                    let first=e.test(176,sum,a);let second=e.test(176,v,sum);
+                    let overflow=e.value(166,BOOL,&[first,second]);(v,Some(e.flag(overflow)))
+                },
+                ("s_subb_u32",&[a,b])=>{
+                    let c=e.reg(Reg::Scc)?;let one=e.c(1);let c=e.u(199,c,one);
+                    let diff=e.u(130,a,b);let v=e.u(130,diff,c);
+                    let first=e.test(176,a,b);let second=e.test(176,diff,c);
+                    let borrow=e.value(166,BOOL,&[first,second]);(v,Some(e.flag(borrow)))
+                },
                 ("s_mul_i32",&[a,b])=>(e.u(132,a,b),None),
                 ("s_cselect_b32",&[a,b])=>{let c=e.reg(Reg::Scc)?;let z=e.c(0);let t=e.test(171,c,z);(e.select(t,a,b),None)},
                 ("s_and_b32"|"s_or_b32"|"s_xor_b32"|"s_lshl_b32"|"s_lshr_b32",&[a,b])=>{
@@ -732,6 +776,18 @@ mod tests {
         let constant = build(0x7e04_0280);
         assert!(check_private_stores(&constant).is_err());
         assert!(emit_cfg(&constant).is_err());
+    }
+    #[test]
+    fn scalar_signed_immediates_and_carry_emit(){
+        // s_movk_i32 s2,-1; s_addk_i32 s2,1; s_add_i32 s3,s2,1;
+        // s_addc_u32 s3,s3,0; s_cmp_lt_i32 s3,0; s_endpgm
+        let code:Vec<u8>=[0xb002_ffffu32,0xb782_0001,0x8103_8102,0x8203_8003,
+            0xbf04_8003,0xbf81_0000].into_iter().flat_map(u32::to_le_bytes).collect();
+        let p=ir::build(&code,false,1).unwrap();
+        assert!(diagnose_instructions(&p).is_empty(),"{:?}",diagnose_instructions(&p));
+        let words=emit_cfg(&p).unwrap();
+        assert!(has_opcode(&words,166));
+        assert!(has_opcode(&words,177));
     }
     #[test]
     fn native_loop_and_branch_emit() {
