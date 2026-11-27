@@ -48,6 +48,11 @@ impl Context {
         }
     }
 
+    /// Verify sparse non-uniform runtime descriptor arrays on supported hardware.
+    pub fn verify_bindless(&mut self, path: &Path) -> Result<()> {
+        descriptors::run_bindless(&self.instance, self.physical, &self.device, self.family, path)
+    }
+
     /// Verify selective Vulkan storage buffer descriptor publications.
     pub fn verify_descriptors(&mut self, path: &Path) -> Result<()> {
         descriptors::run(&self.instance, self.physical, &self.device, self.family, path)
@@ -231,7 +236,15 @@ fn select_device(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, ash::D
 
     let priority = [1.0];
     let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priority)];
-    let mut enabled12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
+    let bindless = f12.descriptor_indexing != 0 && f12.runtime_descriptor_array != 0
+        && f12.shader_storage_buffer_array_non_uniform_indexing != 0
+        && f12.descriptor_binding_partially_bound != 0;
+    println!("bindless storage buffer runtime arrays: {bindless}");
+    let mut enabled12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true)
+        .descriptor_indexing(bindless)
+        .runtime_descriptor_array(bindless)
+        .shader_storage_buffer_array_non_uniform_indexing(bindless)
+        .descriptor_binding_partially_bound(bindless);
     let mut enabled13 = vk::PhysicalDeviceVulkan13Features::default().synchronization2(true).dynamic_rendering(true)
         .subgroup_size_control(f13.subgroup_size_control != 0)
         .compute_full_subgroups(f13.compute_full_subgroups != 0);
