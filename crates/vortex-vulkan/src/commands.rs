@@ -262,6 +262,7 @@ struct GraphicsPipeline<'a> {
     vert: vk::ShaderModule,
     frag: vk::ShaderModule,
     texture: Option<ImageId>,
+    linear_filter: bool,
     sampler: vk::Sampler,
     descriptor_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
@@ -285,7 +286,7 @@ impl Drop for GraphicsPipeline<'_> {
 impl<'a> GraphicsPipeline<'a> {
     fn new(d:&'a ash::Device,vert:&[u32],frag:&[u32],texture:Option<(ImageId,vk::ImageView)>,state:GraphicsState) -> Result<Self> {
         let mut p = Self { d,vert:vk::ShaderModule::null(),frag:vk::ShaderModule::null(),
-            texture:texture.map(|(id,_)|id),sampler:vk::Sampler::null(),
+            texture:texture.map(|(id,_)|id),linear_filter:state.linear_filter,sampler:vk::Sampler::null(),
             descriptor_layout:vk::DescriptorSetLayout::null(),descriptor_pool:vk::DescriptorPool::null(),
             descriptor_set:vk::DescriptorSet::null(),layout:vk::PipelineLayout::null(),pipeline:vk::Pipeline::null() };
         unsafe {
@@ -653,6 +654,27 @@ impl<'a> Session<'a> {
         let p=GraphicsPipeline::new(self.d,&v,&f,Some((texture,image.view)),state)?;
         let id=PipelineId(self.next_id);self.next_id=self.next_id.checked_add(1).ok_or("pipeline ID exhausted")?;
         self.pipelines.insert(id,p);Ok(id)
+    }
+
+    /// Rebind the sampled image without rebuilding the shaders or pipeline.
+    /// Session submissions finish synchronously, so the descriptor is not
+    /// in use. This must not be used for an asynchronous session.
+    pub fn rebind_graphics_texture(&mut self,id:PipelineId,texture:ImageId)->Result<()> {
+        self.ready()?;
+        let p=self.pipeline(id)?;
+        if p.texture.is_none(){return Err("pipeline has no texture descriptor".into());}
+        let image=self.image(texture)?;
+        if image.kind!=ImageKind::Rgba8{return Err("texture must be RGBA8".into());}
+        let props=unsafe{self.instance.get_physical_device_format_properties(self.physical,image.kind.format())};
+        if p.linear_filter&&!props.optimal_tiling_features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR){
+            return Err("linear texture filtering unsupported".into());
+        }
+        if p.texture==Some(texture){return Ok(());}
+        let images=[vk::DescriptorImageInfo::default().sampler(p.sampler).image_view(image.view).image_layout(vk::ImageLayout::GENERAL)];
+        unsafe{self.d.update_descriptor_sets(&[vk::WriteDescriptorSet::default().dst_set(p.descriptor_set).dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&images)],&[]);}
+        self.pipelines.get_mut(&id).ok_or("missing graphics pipeline")?.texture=Some(texture);
+        Ok(())
     }
 
     pub fn destroy_graphics_pipeline(&mut self,id:PipelineId) -> Result<()> {
@@ -1972,7 +1994,25 @@ pub(crate) fn verify_native_textures(context:&mut Context)->Result<()> {
         s.destroy_graphics_pipeline(p)?;
         println!("PASS: native texture explicit_lod={explicit}, depth_export={depth_export}, linear={linear}, repeat={repeat}, blend={blend}; timeline {epoch}");
     }
+    // Reuse the same pipeline with a second independently allocated image.
+    let replacement=s.create_image(8,8)?;
+    s.submit(&[Command::ClearImage{dst:replacement,rgba:[0.,1.,0.,1.]}])?;
+    let (v,f)=vortex_shader::spirv_graphics::texture_fixtures(false,false);
+    let p=s.create_native_textured_pipeline(&v,&f,[8,13],texture,GraphicsState::default())?;
+    s.rebind_graphics_texture(p,replacement)?;
+    if s.rebind_graphics_texture(p,depth).is_ok(){return Err("accepted depth texture in RGBA8 ABI".into());}
     s.destroy_image(texture)?;
+    if s.destroy_image(replacement).is_ok(){return Err("retired rebound texture".into());}
+    let draw=Command::DrawIndexed{pipeline:p,color,depth,region:full,vertices,offset:0,indices,first:0,count:6,base_vertex:0};
+    let feedback=Command::DrawIndexed{pipeline:p,color:replacement,depth,region:full,vertices,offset:0,indices,first:0,count:6,base_vertex:0};
+    if s.submit(&[feedback]).is_ok(){return Err("accepted sampled attachment feedback".into());}
+    s.submit(&[Command::ClearAttachments{color,depth,region:full,rgba:[0.;4],z:1.},
+        draw,Command::ReadImage{src:color,region:full,dst:output,offset:0}])?;
+    if s.read_words(output,0,64)?!=vec![u32::from_le_bytes([0,255,0,255]);64]{
+        return Err("rebound texture output mismatch".into());
+    }
+    s.destroy_graphics_pipeline(p)?;s.destroy_image(replacement)?;
+    println!("PASS: texture rebound without pipeline recreation, retained resources and feedback rejection");
     println!("PASS: native VINTRP, MIMG sampling, fragment depth, samplers and alpha blending verified");
     Ok(())
 }
