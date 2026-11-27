@@ -97,7 +97,8 @@ impl Context {
 
     /// Verify native graphics stage lowering and indexed rasterization.
     pub fn verify_native_graphics(&mut self) -> Result<()> {
-        commands::verify_native_graphics(self)
+        commands::verify_native_graphics(self)?;
+        commands::verify_native_textures(self)
     }
 
     /// Verify sparse non-uniform runtime descriptor arrays on supported hardware.
