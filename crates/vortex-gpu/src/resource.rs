@@ -1777,7 +1777,10 @@ fn hand_out_resource(
     });
     #[cfg(all(windows,feature = "vulkan"))]
     if crate::vulkan_live::enabled(){
-        crate::vulkan_live::register(std::ptr::from_ref::<Resource>(&resource) as usize);
+        // Only buffer spans enter the guest address registry. Textures and
+        // unknown aliases must not be treated as raw linear buffers.
+        let span=(desc.dimension==BUFFER).then(||(resource.data() as u64,desc.width));
+        crate::vulkan_live::register(std::ptr::from_ref::<Resource>(&resource) as usize,span);
         return object::hand_out(RESOURCE,resource,iid,&RESOURCE_IIDS,out);
     }
     // The host copy waits for the texture's first use ([`Hosted`]).

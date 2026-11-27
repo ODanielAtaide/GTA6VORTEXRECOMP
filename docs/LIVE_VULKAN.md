@@ -1,5 +1,8 @@
 # Initial live Vulkan runtime
 
+## Guest buffer address provenance foundation
+Live resource registration now retains checked linear-buffer spans, removing them at destruction. Root-view diagnostics distinguish null, unmapped, ambiguous/aliased and uniquely registered addresses with remaining byte extent. The registry never dereferences shader-provided addresses and does not fabricate device addresses. The new range regression checks overflow, end boundaries and overlaps. This is CPU-side provenance for a future Vulkan storage-address ABI, not shader pointer translation, buffer residency or completed GPU dispatch. Unknown/aliased addresses remain unsupported. Windows compilation and tests remain pending.
+
 ## Follow-up survey: instruction-local and module-level coverage
 The compute emitter permits ordinary VGPR0 destinations (including bounded LDS loads), while ordinary global stores still require the original input SSA value and zero-offset v0 address. A separate symbolic instruction probe collects every locally failing compute instruction, including those hidden behind earlier CFG failures; it generates no executable shader and does not imply full-program support. The offline scanner now reports these counts and writes modules.txt, distinguishing source modules and stage coverage. Guest pointers and real pipeline ABI are still unresolved. Build and validation of this revision are pending.
 

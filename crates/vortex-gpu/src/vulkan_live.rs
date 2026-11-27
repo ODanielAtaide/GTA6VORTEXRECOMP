@@ -7,7 +7,63 @@ use vortex_vulkan::live::{ImageSpec,Live,Reply,Task};
 static ENABLED:AtomicBool=AtomicBool::new(false);
 static WORKER:OnceLock<Result<Live,String>>=OnceLock::new();
 static SUBMIT:Mutex<()>=Mutex::new(());
-static RESOURCES:Mutex<std::collections::BTreeSet<usize>>=Mutex::new(std::collections::BTreeSet::new());
+// CPU-side provenance only. Registered resource spans are not Vulkan GPU
+// virtual addresses. Never dereference a shader-provided address here.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+struct Span{start:u64,end:u64}
+impl Span{
+    fn new(start:u64,size:u64)->Option<Self>{
+        if start==0||size==0{return None;}
+        Some(Self{start,end:start.checked_add(size)?})
+    }
+    fn contains(self,address:u64,len:u64)->bool{
+        len!=0&&address>=self.start&&address.checked_add(len).is_some_and(|end|end<=self.end)
+    }
+}
+type ResourceMap=std::collections::BTreeMap<usize,Option<Span>>;
+static RESOURCES:Mutex<ResourceMap>=Mutex::new(std::collections::BTreeMap::new());
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+enum AddressClass{Null,Unmapped,Ambiguous,Unique{key:usize,offset:u64,remaining:u64}}
+fn classify_address(resources:&ResourceMap,address:u64,len:u64)->AddressClass{
+    if address==0{return AddressClass::Null;}
+    let mut found=AddressClass::Unmapped;
+    for (&key,span) in resources{
+        let Some(span)=span else{continue;};
+        if span.contains(address,len){
+            if found!=AddressClass::Unmapped{return AddressClass::Ambiguous;}
+            found=AddressClass::Unique{key,offset:address-span.start,remaining:span.end-address};
+        }
+    }
+    found
+}
+fn root_address_status(address:u64)->(&'static str,u64){
+    let resources=RESOURCES.lock().unwrap_or_else(|e|e.into_inner());
+    match classify_address(&resources,address,1){
+        AddressClass::Null=>("null",0),
+        AddressClass::Unmapped=>("unmapped",0),
+        AddressClass::Ambiguous=>("aliased",0),
+        AddressClass::Unique{remaining,..}=>("registered-buffer",remaining),
+    }
+}
+#[cfg(test)]
+mod address_tests{
+    use super::*;
+    #[test]fn ranges_check_overflow_boundaries_and_aliasing(){
+        let mut map=ResourceMap::new();
+        map.insert(1,Span::new(0x1000,0x100));
+        assert_eq!(classify_address(&map,0,4),AddressClass::Null);
+        assert_eq!(classify_address(&map,0x10fc,4),AddressClass::Unique{key:1,offset:0xfc,remaining:4});
+        assert_eq!(classify_address(&map,0x10fc,8),AddressClass::Unmapped);
+        assert_eq!(classify_address(&map,0x1100,1),AddressClass::Unmapped);
+        assert_eq!(Span::new(u64::MAX,2),None);
+        map.insert(2,Span::new(0x1080,0x80));
+        assert_eq!(classify_address(&map,0x1080,4),AddressClass::Ambiguous);
+        map.remove(&2);
+        assert!(matches!(classify_address(&map,0x1080,4),AddressClass::Unique{key:1,..}));
+        assert_eq!(classify_address(&map,0x1080,0),AddressClass::Unmapped);
+    }
+}
 
 pub fn enable(){ENABLED.store(true,Ordering::Release);}
 pub fn enabled()->bool{ENABLED.load(Ordering::Acquire)}
@@ -30,11 +86,12 @@ fn call(task:Task)->Reply{
         Err(e)=>stop(e),
     }
 }
-pub(crate) fn register(key:usize){
-    RESOURCES.lock().unwrap_or_else(|e|e.into_inner()).insert(key);
+pub(crate) fn register(key:usize,buffer:Option<(u64,u64)>){
+    let span=buffer.and_then(|(start,size)|Span::new(start,size));
+    RESOURCES.lock().unwrap_or_else(|e|e.into_inner()).insert(key,span);
 }
 pub(crate) fn registered(resource:This)->bool{
-    !resource.is_null()&&RESOURCES.lock().unwrap_or_else(|e|e.into_inner()).contains(&(resource as usize))
+    !resource.is_null()&&RESOURCES.lock().unwrap_or_else(|e|e.into_inner()).contains_key(&(resource as usize))
 }
 pub(crate) fn forget(key:usize){
     RESOURCES.lock().unwrap_or_else(|e|e.into_inner()).remove(&key);
@@ -132,7 +189,7 @@ impl Recording{
         let root=&self.roots[usize::from(kind=="dispatch")];
         tracing::info!(kind,heaps=?self.heaps,table_handles_valid=root.tables.values().all(|&h|self.heaps.iter().any(|heap|heap.contains(h))),root_bytes=root.signature.as_ref().map_or(0,|v|v.len()),
             table_slots=?root.tables.keys().collect::<Vec<_>>(),
-            view_slots=?root.views.iter().map(|(k,v)|(*k,v.0)).collect::<Vec<_>>(),
+            view_slots=?root.views.iter().map(|(k,v)|(*k,v.0,root_address_status(v.1))).collect::<Vec<_>>(),
             constant_dwords=root.constants.len(),"VULKAN_GUEST_ROOT_BINDINGS");
         self.pipeline.as_ref().unwrap_or_else(||stop(format_args!("{kind}: no bound native pipeline"))).require_execution(kind)
     }
