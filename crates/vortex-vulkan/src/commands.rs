@@ -76,6 +76,8 @@ impl ImageKind {
 
 #[derive(Debug,Clone,Copy)]
 pub enum Command {
+    /// Full device-memory dependency between recorded guest operations.
+    Sync,
     Fill { dst: BufferId, offset: u64, bytes: u64, value: u32 },
     Copy { src: BufferId, src_offset: u64, dst: BufferId, dst_offset: u64, bytes: u64 },
     ClearImage { dst: ImageId, rgba: [f32;4] },
@@ -1108,6 +1110,7 @@ impl<'a> Session<'a> {
     fn validate(&self,commands:&[Command]) -> Result<()> {
         for &command in commands {
             match command {
+                Command::Sync => {},
                 Command::Fill { dst,offset,bytes,.. } => check_range(self.buffer(dst)?.bytes,offset,bytes)?,
                 Command::Copy { src,src_offset,dst,dst_offset,bytes } => {
                     if src == dst { return Err("same-buffer copy is not implemented".into()); }
@@ -1287,6 +1290,15 @@ impl<'a> Session<'a> {
                     d.cmd_pipeline_barrier2(cmd,&vk::DependencyInfo::default().memory_barriers(&barrier));
                 }
                 match command {
+                    Command::Sync => {
+                        let barrier=[vk::MemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                            .src_access_mask(vk::AccessFlags2::MEMORY_READ|vk::AccessFlags2::MEMORY_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                            .dst_access_mask(vk::AccessFlags2::MEMORY_READ|vk::AccessFlags2::MEMORY_WRITE)];
+                        d.cmd_pipeline_barrier2(cmd,&vk::DependencyInfo::default().memory_barriers(&barrier));
+                        stats.inter_command_barriers+=1;
+                    }
                     Command::Fill { dst,offset,bytes,value } => {
                         d.cmd_fill_buffer(cmd,self.buffer(dst)?.handle,offset,bytes,value);
                     }

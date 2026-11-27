@@ -8,6 +8,7 @@ use crate::{Context,commands::{self,BufferId,Command,ImageId,ImageRegion,MemoryK
 pub struct ImageSpec { pub key:usize,pub width:u32,pub height:u32,pub depth:bool }
 #[derive(Debug)]
 pub enum Task {
+    Sync,
     CopyBytes(Vec<u8>),
     ClearColor{image:ImageSpec,rgba:[f32;4]},
     ClearDepth{image:ImageSpec,z:f32},
@@ -59,6 +60,7 @@ fn image(s:&mut commands::Session<'_>,map:&mut BTreeMap<usize,(ImageSpec,ImageId
 fn run<'a>(context:&'a Context,s:&mut commands::Session<'_>,presenter:&mut Option<Presenter<'a>>,
     map:&mut BTreeMap<usize,(ImageSpec,ImageId)>,scratch:&mut Option<[BufferId;3]>,task:Task)->crate::Result<Reply>{
     match task{
+        Task::Sync=>{s.submit(&[Command::Sync])?;}
         Task::CopyBytes(bytes)=>{
             if bytes.is_empty()||bytes.len()>CHUNK{return Err("invalid live copy size".into());}
             if scratch.is_none(){

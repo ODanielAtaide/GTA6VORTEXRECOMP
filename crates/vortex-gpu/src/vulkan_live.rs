@@ -54,6 +54,7 @@ impl Drop for Retained{
 }
 
 pub(crate) enum Op{
+    Sync,
     Copy{dst:Retained,src:Retained,dst_offset:u64,src_offset:u64,len:u64},
     ClearColor{resource:Retained,spec:ImageSpec,rgba:[f32;4]},
     ClearDepth{resource:Retained,spec:ImageSpec,z:f32},
@@ -69,6 +70,11 @@ impl Recording{
         if !self.closed{stop("submitting open guest list");}
         for op in &self.ops{
             match op{
+                Op::Sync=>{
+                    let _=call(Task::Sync);
+                    static FIRST:std::sync::Once=std::sync::Once::new();
+                    FIRST.call_once(||println!("VULKAN_GUEST_SYNC_OK: native synchronization2 barrier submitted and completed"));
+                }
                 Op::Copy{dst,src,dst_offset,src_offset,len}=>copy(dst.get(),src.get(),*dst_offset,*src_offset,*len),
                 Op::ClearColor{resource,spec,rgba}=>{
                     if resource.0!=spec.key{stop("color resource identity mismatch");}

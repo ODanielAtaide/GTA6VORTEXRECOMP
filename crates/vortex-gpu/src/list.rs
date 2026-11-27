@@ -2250,7 +2250,17 @@ extern "system" fn live_barrier(_this:This,count:u32,barriers:*const Barrier)->u
     if barriers.iter().any(|b|b.flags!=0||!matches!(b.kind,0|2)){
         crate::vulkan_live::stop("split/aliasing guest barrier not ported");
     }
+    live_record(_this).push(crate::vulkan_live::Op::Sync);
     0
+}
+#[cfg(all(windows,feature = "vulkan"))]
+extern "system" fn live_sync(this:This,flags:u32,control:u32,address:u64,size:u64){
+    // Both guest pipe syncs are conservatively widened to a full Vulkan
+    // memory dependency. All currently supported operations are synchronous.
+    // No guest address is dereferenced for this cache/synchronization call.
+    static FIRST:std::sync::Once=std::sync::Once::new();
+    FIRST.call_once(||tracing::info!(flags,control,address,size,"VULKAN_GUEST_SYNC_RECORDED"));
+    live_record(this).push(crate::vulkan_live::Op::Sync);
 }
 #[cfg(all(windows,feature = "vulkan"))]
 const fn live_list_table(newer:bool)->[ *const ();160]{
@@ -2260,6 +2270,8 @@ const fn live_list_table(newer:bool)->[ *const ();160]{
     f[9]=close as *const ();f[10]=reset as *const ();
     f[15]=live_copy_buffer as *const ();f[17]=live_copy_resource as *const ();
     f[26]=live_barrier as *const ();f[51]=live_clear_dsv as *const ();f[52]=live_clear_rtv as *const ();
+    f[if newer{newer_slot(129)}else{129}]=live_sync as *const ();
+    f[if newer{newer_slot(130)}else{130}]=live_sync as *const ();
     f[if newer{newer_slot(137)}else{137}]=reset_x as *const ();
     if newer{f[148]=allocate_upload as *const ();}
     f
