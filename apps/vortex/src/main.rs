@@ -107,6 +107,12 @@ enum Command {
     /// Verify direct GFX10 diagnostic shader compilation and Vulkan dispatch.
     #[cfg(feature = "vulkan")]
     VulkanNative,
+    /// Emit or execute advanced native CFG compute regressions.
+    #[cfg(feature = "vulkan")]
+    VulkanAdvanced {
+        #[arg(long)]
+        emit_only: Option<PathBuf>,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -207,6 +213,17 @@ fn main() -> Result<()> {
             }
             println!("PASS: shared Vulkan host library verified from vortex CLI (not title execution)");
             Ok(())
+        }
+        #[cfg(feature = "vulkan")]
+        Command::VulkanAdvanced { emit_only } => {
+            if let Some(dir) = emit_only {
+                vortex_vulkan::Context::emit_advanced(&dir)
+                    .map_err(|e| anyhow::anyhow!("Advanced native emission: {e}"))
+            } else {
+                let mut host = vortex_vulkan::Context::new()
+                    .map_err(|e| anyhow::anyhow!("Vulkan initialization: {e}"))?;
+                host.verify_advanced().map_err(|e| anyhow::anyhow!("Advanced native shader executor: {e}"))
+            }
         }
         #[cfg(feature = "vulkan")]
         Command::VulkanNative => {
