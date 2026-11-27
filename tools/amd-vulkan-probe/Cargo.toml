@@ -9,5 +9,5 @@ license = "GPL-3.0-or-later"
 [workspace]
 
 [dependencies]
-ash = "=0.38.0"
+vortex-vulkan = { path = "../../crates/vortex-vulkan" }
 vortex-shader = { path = "../../crates/vortex-shader", default-features = false }

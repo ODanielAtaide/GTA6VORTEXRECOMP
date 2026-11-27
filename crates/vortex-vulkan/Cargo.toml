@@ -1,0 +1,12 @@
+[package]
+name = "vortex-vulkan"
+description = "Experimental native AMD Vulkan device and GPU infrastructure."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ash = "=0.38.0"
+vortex-shader = { workspace = true, default-features = false }

@@ -14,6 +14,7 @@ vortex-loader.workspace = true
 vortex-hle.workspace = true
 vortex-shader = { workspace = true, features = ["host"] }
 vortex-game.workspace = true
+vortex-vulkan = { path = "../../crates/vortex-vulkan", optional = true }
 anyhow.workspace = true
 blake3.workspace = true
 memchr.workspace = true
@@ -21,6 +22,8 @@ clap.workspace = true
 walkdir.workspace = true
 
 [features]
+# Experimental Vulkan host library, separate from the legacy title renderer.
+vulkan = ["dep:vortex-vulkan"]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.
 diagnostics = [

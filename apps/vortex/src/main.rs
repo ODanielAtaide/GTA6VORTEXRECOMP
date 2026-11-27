@@ -85,9 +85,22 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Verify the shared Vulkan host library from the main executable.
+    #[cfg(feature = "vulkan")]
+    VulkanCheck {
+        /// Optional compiled, validated bindless.comp SPIR-V fixture.
+        #[arg(long)]
+        bindless_shader: Option<PathBuf>,
+        /// Also run the bounded asynchronous submission regression.
+        #[arg(long)]
+        async_check: bool,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
+        /// Graphics backend. Vulkan title execution remains unavailable.
+        #[arg(long, value_enum, default_value_t = Backend::D3d12)]
+        backend: Backend,
         /// What unimplemented imports do when called.
         #[arg(long, value_enum, default_value_t = Unimplemented::Trap)]
         unimplemented: Unimplemented,
@@ -107,6 +120,12 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Backend {
+    D3d12,
+    Vulkan,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -163,14 +182,34 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        #[cfg(feature = "vulkan")]
+        Command::VulkanCheck { bindless_shader, async_check } => {
+            let mut host = vortex_vulkan::Context::new()
+                .map_err(|e| anyhow::anyhow!("Vulkan initialization: {e}"))?;
+            host.verify_transfers().map_err(|e| anyhow::anyhow!("Vulkan transfers: {e}"))?;
+            if let Some(path) = bindless_shader {
+                host.verify_bindless(&path).map_err(|e| anyhow::anyhow!("Vulkan descriptors: {e}"))?;
+            }
+            if async_check {
+                host.verify_async().map_err(|e| anyhow::anyhow!("Vulkan submission: {e}"))?;
+            }
+            println!("PASS: shared Vulkan host library verified from vortex CLI (not title execution)");
+            Ok(())
+        }
         Command::Run {
             exe,
+            backend,
             unimplemented,
             strict,
             execute,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => {
+            if matches!(backend, Backend::Vulkan) {
+                anyhow::bail!("Vulkan title execution is not implemented. Build with --features vulkan and use vulkan-check; no D3D12 fallback is performed.");
+            }
+            run::run(&exe, unimplemented, strict, execute, console)
+        }
         Command::Config => show_config(),
     }
 }
