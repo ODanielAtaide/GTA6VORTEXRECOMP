@@ -2268,6 +2268,10 @@ extern "system" fn live_sync(this:This,flags:u32,control:u32,address:u64,size:u6
     live_record(this).push(crate::vulkan_live::Op::Sync);
 }
 #[cfg(all(windows,feature = "vulkan"))]
+extern "system" fn live_write32(this:This,address:u64,value:u32,flush:u32,flags:u32){
+    live_record(this).write32(address,value,flush,flags);
+}
+#[cfg(all(windows,feature = "vulkan"))]
 extern "system" fn live_set_pipeline(this:This,pipeline:This){live_record(this).set_pipeline(pipeline);}
 #[cfg(all(windows,feature = "vulkan"))]
 extern "system" fn live_dispatch(this:This,x:u32,y:u32,z:u32){
@@ -2350,6 +2354,7 @@ const fn live_list_table(newer:bool)->[ *const ();160]{
     f[if newer{newer_slot(78)}else{78}]=live_dispatch_x as *const ();
     f[15]=live_copy_buffer as *const ();f[17]=live_copy_resource as *const ();
     f[26]=live_barrier as *const ();f[51]=live_clear_dsv as *const ();f[52]=live_clear_rtv as *const ();
+    f[if newer{newer_slot(69)}else{69}]=live_write32 as *const ();
     f[if newer{newer_slot(129)}else{129}]=live_sync as *const ();
     f[if newer{newer_slot(130)}else{130}]=live_sync as *const ();
     f[if newer{newer_slot(137)}else{137}]=reset_x as *const ();
