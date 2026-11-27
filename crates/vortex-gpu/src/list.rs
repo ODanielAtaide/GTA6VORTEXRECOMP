@@ -2259,6 +2259,33 @@ extern "system" fn live_barrier(_this:This,count:u32,barriers:*const Barrier)->u
     0
 }
 #[cfg(all(windows,feature = "vulkan"))]
+extern "system" fn live_copy_memory(this:This,dst:u64,src:u64,len:u64,flags:u32){
+    live_record(this).copy_memory(dst,src,len,flags);
+}
+#[cfg(all(windows,feature = "vulkan"))]
+extern "system" fn live_barrier_groups(this:This,count:u32,groups:*const u8){
+    if count==0{return;}
+    if groups.is_null()||count>65536{crate::vulkan_live::stop("invalid enhanced barrier groups");}
+    // Xbox groups have the same 16-byte header as the older Vortex path.
+    // Buffer/global dependencies can be conservatively widened to a full
+    // Vulkan memory dependency; texture layouts still need explicit mapping.
+    let mut any=false;
+    for i in 0..count as usize{
+        let mut header=[0u8;16];
+        let at=(groups as usize).checked_add(i*16).unwrap_or_else(||crate::vulkan_live::stop("barrier group address overflow"));
+        if !crate::host::read_into(at as *const u8,&mut header){crate::vulkan_live::stop("unreadable enhanced barrier header");}
+        let kind=u32::from_le_bytes(header[..4].try_into().unwrap());
+        let n=u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let address=u64::from_le_bytes(header[8..16].try_into().unwrap());
+        if n==0{continue;}
+        if n>1_048_576||address==0||!matches!(kind,0|2){
+            crate::vulkan_live::stop(format_args!("unsupported enhanced barrier kind={kind} count={n}"));
+        }
+        any=true;
+    }
+    if any{live_record(this).push(crate::vulkan_live::Op::Sync);}
+}
+#[cfg(all(windows,feature = "vulkan"))]
 extern "system" fn live_sync(this:This,flags:u32,control:u32,address:u64,size:u64){
     // Both guest pipe syncs are conservatively widened to a full Vulkan
     // memory dependency. All currently supported operations are synchronous.
@@ -2366,6 +2393,7 @@ const fn live_list_table(newer:bool)->[ *const ();160]{
     f[if newer{newer_slot(78)}else{78}]=live_dispatch_x as *const ();
     f[15]=live_copy_buffer as *const ();f[17]=live_copy_resource as *const ();
     f[26]=live_barrier as *const ();f[51]=live_clear_dsv as *const ();f[52]=live_clear_rtv as *const ();
+    f[if newer{newer_slot(60)}else{60}]=live_copy_memory as *const ();
     f[if newer{newer_slot(69)}else{69}]=live_write32 as *const ();
     f[if newer{newer_slot(70)}else{70}]=live_write64 as *const ();
     f[if newer{newer_slot(71)}else{71}]=live_wait32 as *const ();
@@ -2373,7 +2401,7 @@ const fn live_list_table(newer:bool)->[ *const ();160]{
     f[if newer{newer_slot(129)}else{129}]=live_sync as *const ();
     f[if newer{newer_slot(130)}else{130}]=live_sync as *const ();
     f[if newer{newer_slot(137)}else{137}]=reset_x as *const ();
-    if newer{f[148]=allocate_upload as *const ();}
+    if newer{f[146]=live_barrier_groups as *const ();f[148]=allocate_upload as *const ();}
     f
 }
 #[cfg(all(windows,feature = "vulkan"))]
