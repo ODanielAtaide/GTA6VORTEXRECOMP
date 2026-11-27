@@ -579,6 +579,16 @@ impl<'a> Session<'a> {
         Ok(id)
     }
 
+    /// Compile original native stage instructions using the explicit vertex/color
+    /// ABI. This does not consume the title's fetch or interpolation signatures.
+    pub fn create_native_graphics_pipeline(&mut self,vertex:&[u8],fragment:&[u8],vgprs:[u16;2]) -> Result<PipelineId> {
+        use vortex_shader::{ir,spirv_graphics::{self,Stage}};
+        self.ready()?;
+        let v=spirv_graphics::emit_graphics(&ir::build(vertex,false,vgprs[0])?,Stage::Vertex)?;
+        let f=spirv_graphics::emit_graphics(&ir::build(fragment,false,vgprs[1])?,Stage::Fragment)?;
+        self.create_graphics_pipeline(&v,&f)
+    }
+
     pub fn destroy_graphics_pipeline(&mut self,id:PipelineId) -> Result<()> {
         self.ready()?;
         self.pipelines.remove(&id).ok_or("unknown or retired graphics pipeline")?;
@@ -1735,6 +1745,70 @@ pub(crate) fn verify_advanced(context:&mut Context) -> Result<()> {
     }
     s.destroy_buffer(src)?;
     println!("PASS: VCC/SAVEEXEC and two native resource descriptors verified");
+    Ok(())
+}
+
+/// Write native stage modules for independent spirv-val checking.
+pub(crate) fn emit_native_graphics(dir:&std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let (v,f)=vortex_shader::spirv_graphics::fixture_modules()?;
+    for (name,words) in [("native.vert.spv",v),("native.frag.spv",f)] {
+        let path=dir.join(name);
+        std::fs::write(&path,words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>())?;
+        println!("PASS: emitted {}",path.display());
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_native_graphics(context:&mut Context) -> Result<()> {
+    let (v,f)=vortex_shader::spirv_graphics::fixtures();
+    let mut s=Session::new(context)?;
+    let p=s.create_native_graphics_pipeline(&v,&f,[8,4])?;
+    let color=s.create_image(8,8)?;
+    let depth=s.create_depth_image(8,8)?;
+    let full=ImageRegion{x:0,y:0,width:8,height:8};
+    let partial=ImageRegion{x:2,y:2,width:4,height:4};
+    let mut data=Vec::new();
+    // Three indexed quads, four shared vertices each. The middle draw is
+    // farther and must fail the depth test. The last is nearer and scissored.
+    for (z,rgba) in [(0.5f32,[1.,0.,0.,1.]),(0.75,[0.,1.,0.,1.]),(0.25,[0.,0.,1.,1.])] {
+        for (x,y) in [(-1f32,-1f32),(1.,-1.),(1.,1.),(-1.,1.)] {
+            data.extend([x,y,z,rgba[0],rgba[1],rgba[2],rgba[3]].map(f32::to_bits));
+        }
+    }
+    let upload=s.create_buffer(data.len() as u64*4,MemoryKind::HostVisible)?;
+    let vertices=s.create_buffer(data.len() as u64*4,MemoryKind::DeviceLocal)?;
+    let output=s.create_buffer(512,MemoryKind::HostVisible)?;
+    s.write_words(upload,0,&data)?;
+    let indices=s.create_index_buffer(&[0,1,2,0,2,3])?;
+    let draw=|base_vertex,region|Command::DrawIndexed{pipeline:p,color,depth,region,
+        vertices,offset:0,indices,first:0,count:6,base_vertex};
+    let epoch=s.submit(&[
+        Command::Copy{src:upload,src_offset:0,dst:vertices,dst_offset:0,bytes:data.len() as u64*4},
+        Command::ClearAttachments{color,depth,region:full,rgba:[0.;4],z:1.},
+        draw(0,full),draw(4,full),draw(8,partial),
+        Command::ReadImage{src:color,region:full,dst:output,offset:0},
+        Command::ReadImage{src:depth,region:full,dst:output,offset:256},
+    ])?;
+    let words=s.read_words(output,0,128)?;
+    for y in 0..8 {for x in 0..8 {
+        let i=y*8+x;let inside=(2..6).contains(&x)&&(2..6).contains(&y);
+        // Native VS: 0.5 * RGB; native PS: RGB + 0.25.
+        let expected=if inside{[64,64,191,255]}else{[191,64,64,255]};
+        let actual=words[i].to_le_bytes();
+        if actual.iter().zip(expected).any(|(&a,b)|i32::from(a).abs_diff(b)>1) {
+            return Err(format!("native graphics color mismatch {x},{y}: {actual:?} != {expected:?}").into());
+        }
+        let z=if inside{0.25f32}else{0.5f32};
+        if words[64+i]!=z.to_bits(){return Err(format!("native graphics depth mismatch {x},{y}").into());}
+    }}
+    println!("PASS: native GFX10 vertex + pixel -> SSA -> SPIR-V -> indexed rasterization; 64 RGBA8 pixels and D32 depths verified at timeline {epoch}");
+    println!("PASS: native floating point ALU, POS0/PARAM0/MRT0 exports and depth rejection verified");
+    // Swapping stages or omitting an export must fail before Vulkan creation.
+    if s.create_native_graphics_pipeline(&f,&v,[4,8]).is_ok(){
+        return Err("accepted incompatible native stages".into());
+    }
+    println!("PASS: incompatible native stage rejected");
     Ok(())
 }
 
