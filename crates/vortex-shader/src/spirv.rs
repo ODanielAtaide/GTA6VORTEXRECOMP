@@ -9,6 +9,10 @@ pub enum Op {
     Index,
     /// Read this invocation's original uint in storage buffer 0:0.
     LoadSelf,
+    /// Read a component of a private fixed-stride record (word offset).
+    LoadRecord { stride: u8, component: u8 },
+    /// Predicated store into the same private record.
+    StoreRecord { stride: u8, component: u8, active: usize, value: usize },
     /// Store this invocation's word only when the mask is nonzero.
     StoreSelf(usize, usize),
     /// Read one of the two uniform u32 push constants.
@@ -48,7 +52,7 @@ pub fn emit(ops: &[Op], result: usize) -> Result<Vec<u32>, ShaderError> {
 
 /// Emit explicit memory effects, without an implicit final result store.
 pub fn emit_effects(ops:&[Op]) -> Result<Vec<u32>, ShaderError> {
-    if !ops.iter().any(|op| matches!(op,Op::StoreSelf(..))) {
+    if !ops.iter().any(|op| matches!(op,Op::StoreSelf(..)|Op::StoreRecord{..})) {
         return Err(ShaderError::Malformed("No explicit storage effects"));
     }
     emit_inner(ops,None)
@@ -63,6 +67,14 @@ fn emit_inner(ops:&[Op],result:Option<usize>) -> Result<Vec<u32>, ShaderError> {
         return Err(ShaderError::Malformed("Invalid push constant index"));
     }
     for (i, op) in ops.iter().enumerate() {
+        match *op {
+            Op::LoadRecord { stride,component } | Op::StoreRecord { stride,component,.. }
+                if !(1..=16).contains(&stride) || component>=stride =>
+                    return Err(ShaderError::Malformed("Invalid record component")),
+            Op::StoreRecord { active,value,.. } if active>=i || value>=i =>
+                return Err(ShaderError::Malformed("Invalid record store operand")),
+            _ => {}
+        }
         if let Op::Add(a, b) | Op::Mul(a, b) | Op::Sub(a, b) | Op::And(a, b) | Op::Or(a, b) | Op::Xor(a, b) | Op::Shl(a, b) | Op::Shr(a, b) | Op::FAdd(a,b) | Op::FSub(a,b) | Op::FMul(a,b) | Op::StoreSelf(a,b) = *op {
             if a >= i || b >= i { return Err(ShaderError::Malformed("Invalid forward SSA reference")); }
         }
@@ -78,8 +90,9 @@ fn emit_inner(ops:&[Op],result:Option<usize>) -> Result<Vec<u32>, ShaderError> {
     }
     // IDs 17..20 are bool type, shift mask, f32 type and constant one.
     // IDs 21..24 are push block type, block pointer, uint pointer, global.
+    // IDs 25..41 hold u32 constants 0..16 for record indexing.
     // Each node reserves a result plus twelve temporary/label IDs.
-    let id = |i: usize| 25 + 13 * i as u32;
+    let id = |i: usize| 42 + 13 * i as u32;
     let ptr = id(ops.len());
     let mut out = vec![0x07230203, 0x00010300, 0, ptr + 1, 0];
     let op = |out: &mut Vec<u32>, code, args: &[u32]| instruction(out, code, args);
@@ -121,6 +134,9 @@ fn emit_inner(ops:&[Op],result:Option<usize>) -> Result<Vec<u32>, ShaderError> {
     op(&mut out, 43, &[3, 13, 0]); // member index zero
     op(&mut out, 43, &[3, 18, 31]); // defined modulo-32 shift count
     op(&mut out, 43, &[3, 20, 1]); // loop increment
+    if ops.iter().any(|o| matches!(o,Op::LoadRecord{..}|Op::StoreRecord{..})) {
+        for n in 0..=16 { op(&mut out,43,&[3,25+n,n]); }
+    }
     for (i, node) in ops.iter().enumerate() {
         if let Op::Constant(v) = *node { op(&mut out, 43, &[3, id(i), v]); }
     }
@@ -134,6 +150,27 @@ fn emit_inner(ops:&[Op],result:Option<usize>) -> Result<Vec<u32>, ShaderError> {
             Op::LoadSelf => {
                 op(&mut out, 65, &[9, id(i)+1, 11, 13, 16]);
                 op(&mut out, 61, &[3, id(i), id(i)+1]);
+            }
+            Op::LoadRecord { stride,component } => {
+                let r = id(i);
+                op(&mut out,132,&[3,r+1,16,25+u32::from(stride)]);
+                op(&mut out,128,&[3,r+2,r+1,25+u32::from(component)]);
+                op(&mut out,65,&[9,r+3,11,13,r+2]);
+                op(&mut out,61,&[3,r,r+3]);
+            }
+            Op::StoreRecord { stride,component,active,value } => {
+                let r = id(i);
+                op(&mut out,176,&[17,r+1,13,id(active)]);
+                op(&mut out,247,&[r+3,0]);
+                op(&mut out,250,&[r+1,r+2,r+3]);
+                op(&mut out,248,&[r+2]);
+                op(&mut out,132,&[3,r+4,16,25+u32::from(stride)]);
+                op(&mut out,128,&[3,r+5,r+4,25+u32::from(component)]);
+                op(&mut out,65,&[9,r+6,11,13,r+5]);
+                op(&mut out,62,&[r+6,id(value)]);
+                op(&mut out,249,&[r+3]);
+                op(&mut out,248,&[r+3]);
+                op(&mut out,83,&[3,r,id(value)]);
             }
             Op::StoreSelf(active,value) => {
                 let r = id(i);
@@ -251,6 +288,13 @@ fn emit_inner(ops:&[Op],result:Option<usize>) -> Result<Vec<u32>, ShaderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn record_effects_validate() {
+        assert!(emit_effects(&[Op::Constant(1),Op::LoadRecord{stride:4,component:3},
+            Op::StoreRecord{stride:4,component:3,active:0,value:1}]).is_ok());
+        assert!(emit(&[Op::LoadRecord{stride:4,component:4}],0).is_err());
+    }
+
     #[test]
     fn explicit_store_requires_valid_operands() {
         assert!(emit_effects(&[Op::Constant(1),Op::LoadSelf,Op::StoreSelf(0,1)]).is_ok());
