@@ -27,6 +27,10 @@ const ROOT_SIGNATURE_IIDS: [Iid; 3] = [
 
 const CONSOLE_FLAGS: u32 = 0xff00_0000;
 
+#[cfg(all(windows,feature = "vulkan"))]
+#[path = "root_native.rs"]
+mod native;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Desc {
@@ -104,6 +108,8 @@ pub extern "system" fn serialize(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){return native::serialize(desc,version,blob,error);}
     static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
     let Some(address) = host_export(&FUNCTION, c"D3D12SerializeRootSignature") else {
         tracing::warn!("no host d3d12.dll to serialize root signatures");
@@ -130,6 +136,8 @@ pub extern "system" fn serialize_versioned(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){return native::serialize(desc.desc,desc.version,blob,error);}
     static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
     let Some(address) = host_export(&FUNCTION, c"D3D12SerializeVersionedRootSignature") else {
         tracing::warn!("no host d3d12.dll to serialize root signatures");
@@ -159,6 +167,8 @@ pub extern "system" fn create_deserializer(
     if blob.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){return native::deserialize(blob,size,iid,out);}
     static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
     let Some(address) = host_export(&FUNCTION, c"D3D12CreateRootSignatureDeserializer") else {
         tracing::warn!("no host d3d12.dll to deserialize root signatures");
@@ -189,6 +199,10 @@ pub(crate) extern "system" fn create(
     }
     // SAFETY: the title passes `size` bytes.
     let blob = unsafe { std::slice::from_raw_parts(blob, size) }.to_vec();
+    #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled(){
+        if let Err(e)=native::inspect(&blob){crate::vulkan_live::stop(format_args!("root signature: {e}"));}
+    }
     tracing::debug!(size, "root signature");
     let root = Box::new(RootSignature {
         object: Object::new(&FUNCTIONS),
