@@ -634,7 +634,11 @@ impl<'a> Session<'a> {
         use vortex_shader::{ir,spirv_graphics::{self,Stage}};
         self.ready()?;
         let v=spirv_graphics::emit_graphics(&ir::build(vertex,false,vgprs[0])?,Stage::Vertex)?;
-        let f=spirv_graphics::emit_graphics(&ir::build(fragment,false,vgprs[1])?,Stage::Fragment)?;
+        let fragment=ir::build(fragment,false,vgprs[1])?;
+        if fragment.blocks.iter().flat_map(|b|&b.insts).any(|i|matches!(i.fields,vortex_shader::gfx10::Fields::Image{..})){
+            return Err("native sampled fragment requires texture descriptor".into());
+        }
+        let f=spirv_graphics::emit_graphics(&fragment,Stage::Fragment)?;
         self.create_graphics_pipeline(&v,&f)
     }
 
@@ -644,7 +648,11 @@ impl<'a> Session<'a> {
         use vortex_shader::{ir,spirv_graphics::{self,Stage}};
         self.ready()?;
         let v=spirv_graphics::emit_graphics(&ir::build(vertex,false,vgprs[0])?,Stage::Vertex)?;
-        let f=spirv_graphics::emit_graphics(&ir::build(fragment,false,vgprs[1])?,Stage::Fragment)?;
+        let fragment=ir::build(fragment,false,vgprs[1])?;
+        if !fragment.blocks.iter().flat_map(|b|&b.insts).any(|i|matches!(i.fields,vortex_shader::gfx10::Fields::Image{..})){
+            return Err("textured pipeline requires native image operation".into());
+        }
+        let f=spirv_graphics::emit_graphics(&fragment,Stage::Fragment)?;
         let image=self.image(texture)?;
         if image.kind!=ImageKind::Rgba8{return Err("texture must be RGBA8".into());}
         let props=unsafe{self.instance.get_physical_device_format_properties(self.physical,image.kind.format())};
@@ -1959,6 +1967,7 @@ pub(crate) fn verify_native_textures(context:&mut Context)->Result<()> {
     ]{
         let (v,f)=vortex_shader::spirv_graphics::texture_fixtures(explicit,depth_export);
         let state=GraphicsState{linear_filter:linear,repeat,alpha_blend:blend,depth_write:!blend,..GraphicsState::default()};
+        if s.create_native_graphics_pipeline(&v,&f,[8,13]).is_ok(){return Err("accepted missing texture binding".into());}
         let p=s.create_native_textured_pipeline(&v,&f,[8,13],texture,state)?;
         let mut data=Vec::new();
         for (x,y) in [(-1f32,-1f32),(1.,-1.),(1.,1.),(-1.,1.)]{
