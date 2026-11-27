@@ -144,10 +144,55 @@ pub(crate) enum MarkerTarget{
     Buffer{resource:Retained,offset:u64},
     Host(HostMarker),
 }
+impl MarkerTarget {
+    fn resolve(address:u64,bytes:usize)->Self{
+        let location={
+            let resources=RESOURCES.lock().unwrap_or_else(|e|e.into_inner());
+            classify_address(&resources,address,bytes as u64)
+        };
+        match location{
+            AddressClass::Unique{key,offset,..}=>Self::Buffer{resource:Retained::new(key as This),offset},
+            AddressClass::Unmapped=>Self::Host(HostMarker::query(address,bytes).unwrap_or_else(||stop(format_args!(
+                "marker address {address:#x} is neither a registered buffer nor committed writable data memory")))),
+            _=>stop(format_args!("ambiguous or null marker address {address:#x}: {location:?}")),
+        }
+    }
+    fn address(&self,bytes:usize)->usize{
+        match self{
+            Self::Buffer{resource,offset}=>range(resource.get(),*offset,bytes as u64),
+            Self::Host(mapping)=>{
+                if !mapping.still_valid(bytes){stop("guest marker mapping changed before completion");}
+                mapping.address
+            }
+        }
+    }
+}
+fn wait_comparison(op:u32,value:u64,reference:u64,mask:u64)->bool{
+    let value=value&mask;
+    match op{0|8=>true,1=>false,2=>value<reference,3=>value==reference,
+        4=>value<=reference,5=>value>reference,6=>value!=reference,7=>value>=reference,
+        _=>stop(format_args!("unknown guest wait comparison {op}"))}
+}
+fn wait_read(target:&MarkerTarget,bytes:usize,comparison:u32,reference:u64,mask:u64)->bool{
+    if matches!(comparison,0|8){return true;}
+    let address=match target{
+        MarkerTarget::Buffer{resource,offset}=>range(resource.get(),*offset,bytes as u64),
+        MarkerTarget::Host(mapping)=>mapping.address,
+    };
+    let mut raw=[0u8;8];
+    if !crate::host::read_into(address as *const u8,&mut raw[..bytes]){
+        stop(format_args!("guest wait address {address:#x} is unreadable"));
+    }
+    let ready=wait_comparison(comparison,u64::from_le_bytes(raw),reference,mask);
+    // Avoid expensive VirtualQuery on every poll; revalidate before consuming.
+    if ready {let _=target.address(bytes);}
+    ready
+}
 #[derive(Clone,Copy)]
 pub(crate) enum MarkerValue{Immediate(u64),GpuTimestamp}
 pub(crate) enum Op{
     Sync,
+    WaitMarker{target:MarkerTarget,bytes:usize,comparison:u32,reference:u64,mask:u64},
     WriteMarker{target:MarkerTarget,value:MarkerValue,bytes:usize},
     Copy{dst:Retained,src:Retained,dst_offset:u64,src_offset:u64,len:u64},
     ClearColor{resource:Retained,spec:ImageSpec,rgba:[f32;4]},
@@ -162,13 +207,13 @@ struct RootState{
     constants:std::collections::BTreeMap<(u32,u32),u32>,
 }
 #[derive(Default)]
-pub(crate) struct Recording{closed:bool,ops:Vec<Op>,
+pub(crate) struct Recording{closed:bool,ops:Vec<std::sync::Arc<Op>>,
     pipeline:Option<std::sync::Arc<crate::pipeline::native_live::Description>>,
     roots:[RootState;2],
     heaps:Vec<crate::descriptor::LiveHeap>}
 
 impl Recording{
-    pub(crate) fn push(&mut self,op:Op){if self.closed{stop("recording into closed guest list");}self.ops.push(op);}
+    pub(crate) fn push(&mut self,op:Op){if self.closed{stop("recording into closed guest list");}self.ops.push(std::sync::Arc::new(op));}
     pub(crate) fn write_marker(&mut self,address:u64,value:u64,bytes:usize,flush:u32,flags:u32){
         if self.closed{stop("recording write into closed guest list");}
         if !(flags==0||(flags==1&&bytes==8))||!matches!(bytes,4|8)||address==0||address%(bytes as u64)!=0{
@@ -197,6 +242,19 @@ impl Recording{
     }
     pub(crate) fn write32(&mut self,address:u64,value:u32,flush:u32,flags:u32){
         self.write_marker(address,u64::from(value),4,flush,flags);
+    }
+    pub(crate) fn wait_marker(&mut self,address:u64,comparison:u32,reference:u64,mask_or_flags:u64,bytes:usize){
+        if comparison>8||!matches!(bytes,4|8)||address==0||address%(bytes as u64)!=0{
+            stop(format_args!("unsupported guest wait address={address:#x} comparison={comparison} bytes={bytes}"));
+        }
+        // Retail 0x248/0x250 call shape documented by OpenScarlett's
+        // d3d12_xs_shim.cpp (48a98fcd); 0/1 in the mask slot are flags.
+        let width_mask=if bytes==4{u64::from(u32::MAX)}else{u64::MAX};
+        let mask=if mask_or_flags<=1{width_mask}else{mask_or_flags&width_mask};
+        let target=MarkerTarget::resolve(address,bytes);
+        self.push(Op::WaitMarker{target,bytes,comparison,reference:reference&width_mask,mask});
+        static FIRST:std::sync::Once=std::sync::Once::new();
+        FIRST.call_once(||tracing::info!(address,comparison,reference,mask,bytes,"VULKAN_GUEST_WAIT_RECORDED"));
     }
     pub(crate) fn close(&mut self){if self.closed{stop("guest list already closed");}self.closed=true;}
     pub(crate) fn reset(&mut self){self.ops.clear();self.closed=false;self.pipeline=None;self.roots=Default::default();self.heaps.clear();}
@@ -259,10 +317,22 @@ impl Recording{
             constant_dwords=root.constants.len(),"VULKAN_GUEST_ROOT_BINDINGS");
         self.pipeline.as_ref().unwrap_or_else(||stop(format_args!("{kind}: no bound native pipeline"))).require_execution(kind)
     }
-    pub(crate) fn execute(&self){
+    pub(crate) fn snapshot(&self)->Vec<std::sync::Arc<Op>>{
         if !self.closed{stop("submitting open guest list");}
-        for op in &self.ops{
-            match op{
+        self.ops.clone()
+    }
+}
+impl Op{
+    fn ready(&self)->bool{
+        match self{
+            Self::WaitMarker{target,bytes,comparison,reference,mask}=>wait_read(target,*bytes,*comparison,*reference,*mask),
+            _=>true,
+        }
+    }
+    fn execute(&self){
+            match self{
+                Op::WaitMarker{..}=>{},
+
                 Op::Sync=>{
                     let _=call(Task::Sync);
                     static FIRST:std::sync::Once=std::sync::Once::new();
@@ -303,9 +373,93 @@ impl Recording{
                     let _=call(Task::CopyImage{src:*from,dst:*to});
                 }
             }
+    }
+}
+// Queue work is owned independently of reset/release of guest command lists.
+// Similar to the old Vortex Held queue and shadPS4 cooperative command streams,
+// a blocked queue yields without preventing producer queues from running.
+struct FenceRef(usize);
+impl FenceRef{
+    fn new(fence:This)->Self{object::add_ref(fence);Self(fence as usize)}
+    fn get(&self)->This{self.0 as This}
+}
+impl Drop for FenceRef{
+    fn drop(&mut self){crate::fence::release(self.get());}
+}
+enum QueueWork{
+    Command(std::sync::Arc<Op>),
+    Wait(FenceRef,u64),
+    Signal(FenceRef,u64),
+    Present(Retained),
+}
+impl QueueWork{
+    fn ready(&self)->bool{
+        match self{
+            Self::Command(op)=>op.ready(),
+            Self::Wait(f,v)=>crate::fence::completed(f.get())>=*v,
+            _=>true,
+        }
+    }
+    fn execute(self){
+        match self{
+            Self::Command(op)=>op.execute(),
+            Self::Wait(..)=>{},
+            Self::Signal(f,v)=>crate::fence::set(f.get(),v),
+            Self::Present(r)=>present(r.get()),
         }
     }
 }
+type QueueBatch=(u64,Vec<QueueWork>);
+fn enqueue(queue:u64,work:Vec<QueueWork>){
+    use std::{collections::{BTreeMap,VecDeque},sync::mpsc,time::{Duration,Instant}};
+    static SCHEDULER:OnceLock<mpsc::Sender<QueueBatch>>=OnceLock::new();
+    let tx=SCHEDULER.get_or_init(||{
+        let(tx,rx)=mpsc::channel::<QueueBatch>();
+        std::thread::Builder::new().name("vortex-guest-queues".into()).spawn(move||{
+            let mut pending:BTreeMap<u64,VecDeque<QueueWork>>=BTreeMap::new();
+            let mut last_progress=Instant::now();
+            loop{
+                if pending.is_empty(){
+                    let Ok((id,work))=rx.recv()else{return;};
+                    pending.entry(id).or_default().extend(work);
+                    last_progress=Instant::now();
+                }
+                for _ in 0..256{
+                    let Ok((id,work))=rx.try_recv()else{break;};
+                    pending.entry(id).or_default().extend(work);
+                }
+                let mut progressed=false;
+                // At most one command per queue per round; no lock while
+                // waiting on memory/fences, and Vulkan worker owns its device.
+                for work in pending.values_mut(){
+                    if work.front().is_some_and(QueueWork::ready){
+                        if let Some(item)=work.pop_front(){item.execute();progressed=true;}
+                    }
+                }
+                pending.retain(|_,work|!work.is_empty());
+                if progressed{last_progress=Instant::now();}
+                else if !pending.is_empty(){
+                    if last_progress.elapsed()>=Duration::from_secs(30){
+                        stop(format_args!("guest queue dependency stalled: {} queues; no false completion",pending.len()));
+                    }
+                    match rx.recv_timeout(Duration::from_millis(1)){
+                        Ok((id,work))=>pending.entry(id).or_default().extend(work),
+                        Err(mpsc::RecvTimeoutError::Timeout)=>{},
+                        Err(mpsc::RecvTimeoutError::Disconnected)=>return,
+                    }
+                }
+            }
+        }).unwrap_or_else(|e|stop(e));
+        tx
+    });
+    if tx.send((queue,work)).is_err(){stop("guest queue scheduler stopped");}
+}
+pub(crate) fn submit(queue:u64,ops:Vec<std::sync::Arc<Op>>){
+    enqueue(queue,ops.into_iter().map(QueueWork::Command).collect());
+}
+pub(crate) fn queue_wait(queue:u64,fence:This,value:u64){enqueue(queue,vec![QueueWork::Wait(FenceRef::new(fence),value)]);}
+pub(crate) fn queue_signal(queue:u64,fence:This,value:u64){enqueue(queue,vec![QueueWork::Signal(FenceRef::new(fence),value)]);}
+pub(crate) fn queue_present(queue:u64,resource:This){enqueue(queue,vec![QueueWork::Present(Retained::new(resource))]);}
 fn write_marker_bytes(address:usize,value:u64,bytes:usize)->bool{
     use windows_sys::Win32::System::{Diagnostics::Debug::WriteProcessMemory,Threading::GetCurrentProcess};
     if !matches!(bytes,4|8)||address==0||address%bytes!=0{return false;}
@@ -320,6 +474,14 @@ mod marker_tests{
     use windows_sys::Win32::System::Memory::{
         VirtualAlloc,VirtualFree,MEM_COMMIT,MEM_RESERVE,MEM_RELEASE,PAGE_READWRITE,PAGE_READONLY,
     };
+    #[test]
+    fn retail_wait_comparisons_and_mask(){
+        assert!(wait_comparison(3,0x1f,0xf,0xf));
+        assert!(!wait_comparison(3,0x1f,0xf,u64::MAX));
+        assert!(!wait_comparison(1,7,7,u64::MAX));
+        assert!(wait_comparison(7,8,7,u64::MAX));
+        assert!(wait_comparison(0,0,99,u64::MAX));
+    }
     #[test]
     fn host_marker_requires_writable_mapping_and_preserves_adjacent_word(){
         unsafe{
