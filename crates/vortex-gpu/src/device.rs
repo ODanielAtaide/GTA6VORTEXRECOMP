@@ -405,6 +405,10 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         );
     }
     #[cfg(all(windows,feature = "vulkan"))]
+    if crate::vulkan_live::enabled()&&(calls<=4||std::env::var_os("VORTEX_BATCH_DIAGNOSTICS").is_some_and(|v|v=="1")){
+        pipeline::native_live::inspect_serialized(desc as usize,SLOT==0x218);
+    }
+    #[cfg(all(windows,feature = "vulkan"))]
     if crate::vulkan_live::enabled()&&(calls<=4||calls.is_power_of_two()){
         tracing::warn!(slot=format_args!("{SLOT:#x}"),calls,"VULKAN_OPTIONAL_PSO_UNSUPPORTED: E_NOTIMPL, no pipeline created");
     }
