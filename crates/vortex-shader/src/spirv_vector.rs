@@ -21,7 +21,7 @@ fn push(ops: &mut Vec<Op>, op: Op) -> usize {
 /// EXEC starts with an alternating mask. Immediate writes and CMPX may change it.
 /// All other live inputs are rejected.
 pub fn emit_vector(program: &ir::Program, output: Reg) -> Result<Vec<u32>, ShaderError> {
-    emit_with_inputs(program, output, false)
+    emit_with_inputs(program, Some(output), false)
 }
 
 /// Explicit in-place kernel ABI: v0 = global invocation index, v1 and v2
@@ -29,12 +29,21 @@ pub fn emit_vector(program: &ir::Program, output: Reg) -> Result<Vec<u32>, Shade
 /// EXEC initially enables all logical lanes. Only the selected result register
 /// is written back, not arbitrary guest addresses. No native memory opcodes.
 pub fn emit_buffer_kernel(program: &ir::Program, output: Reg) -> Result<Vec<u32>, ShaderError> {
-    emit_with_inputs(program, output, true)
+    emit_with_inputs(program, Some(output), true)
 }
 
-fn emit_with_inputs(program: &ir::Program, output: Reg, buffer_inputs: bool) -> Result<Vec<u32>, ShaderError> {
+/// Restricted native memory kernel: s[4:7] is a host-provided logical
+/// descriptor for binding 0:0 (stride 4); v0 is the immutable invocation
+/// index. Only indexed dword accesses with zero offsets are supported.
+/// Native stores are the only observable output. No cross-invocation access.
+pub fn emit_memory_kernel(program: &ir::Program) -> Result<Vec<u32>, ShaderError> {
+    emit_with_inputs(program, None, true)
+}
+
+fn emit_with_inputs(program: &ir::Program, output: Option<Reg>, buffer_inputs: bool) -> Result<Vec<u32>, ShaderError> {
+    let memory = output.is_none();
     let unsupported = |offset, what| ShaderError::Unsupported { offset, what };
-    if program.blocks.len() != 1 || !matches!(output, Reg::V(0..=2)) {
+    if program.blocks.len() != 1 || output.is_some_and(|r| !matches!(r, Reg::V(0..=2))) {
         return Err(unsupported(0, "vector diagnostic requires one block and v0-v2 output"));
     }
     let block = &program.blocks[0];
@@ -60,11 +69,16 @@ fn emit_with_inputs(program: &ir::Program, output: Reg, buffer_inputs: bool) -> 
     let mut values = BTreeMap::<Value,usize>::new();
     let mut regs = BTreeMap::<Reg,usize>::new();
     let mut exec_values = BTreeMap::<Reg,Value>::new();
+    let mut resource_values = BTreeMap::<Reg,Value>::new();
     for &(reg, value) in &program.inputs {
+        if memory && matches!(reg,Reg::S(4..=7)) {
+            resource_values.insert(reg,value);
+            continue;
+        }
         let id = match reg {
             Reg::V(0) => idx,
-            Reg::V(1) => push(&mut ops, if buffer_inputs { Op::LoadSelf } else { Op::Constant(OLD_V1) }),
-            Reg::V(2) => push(&mut ops, if buffer_inputs { Op::LoadSelf } else { Op::Constant(OLD_V2) }),
+            Reg::V(1) => push(&mut ops, if memory { Op::Constant(0) } else if buffer_inputs { Op::LoadSelf } else { Op::Constant(OLD_V1) }),
+            Reg::V(2) => push(&mut ops, if memory { Op::Constant(0) } else if buffer_inputs { Op::LoadSelf } else { Op::Constant(OLD_V2) }),
             Reg::S(r @ 0..=1) if buffer_inputs => push(&mut ops, Op::Push(r)),
             Reg::S(EXEC) => { exec_values.insert(reg,value); lo_bit }
             Reg::S(r) if program.wave64 && r == EXEC+1 => { exec_values.insert(reg,value); hi_bit }
@@ -95,22 +109,68 @@ fn emit_with_inputs(program: &ir::Program, output: Reg, buffer_inputs: bool) -> 
             if ops.len() > 4096 { return Err(reject()); }
             continue;
         }
+        for r in [Reg::S(EXEC), Reg::S(EXEC+1)].into_iter().take(if program.wave64 {2} else {1}) {
+            if exec_values.get(&r).copied().is_none() || inst.read(r) != exec_values.get(&r).copied() { return Err(reject()); }
+        }
+        let lo_value = *values.get(&inst.read(Reg::S(EXEC)).ok_or_else(reject)?).ok_or_else(reject)?;
+        let active = if let Some(half) = half {
+            let hi_value = *values.get(&inst.read(Reg::S(EXEC+1)).ok_or_else(reject)?).ok_or_else(reject)?;
+            push(&mut ops, Op::SelectUlt(zero,half,hi_value,lo_value))
+        } else { lo_value };
+        if let Fields::Buffer { data,addr,rsrc,soffset,offset,offen,idxen,format,lds,tfe,cache } = &inst.fields {
+            if !memory || inst.machine.encoding != Encoding::Mubuf
+                || *offen || !*idxen || *offset != 0 || format.is_some() || *lds || *tfe
+                || cache.glc || cache.slc || cache.dlc
+                || *addr != (Operand::Vector { reg:0,dwords:1 })
+                || *rsrc != (Operand::Scalar { code:4,dwords:4 })
+                || *soffset != Operand::Const(128) {
+                return Err(reject());
+            }
+            for r in 4..=7 {
+                if resource_values.get(&Reg::S(r)).copied().is_none()
+                    || inst.read(Reg::S(r)) != resource_values.get(&Reg::S(r)).copied() {
+                    return Err(reject());
+                }
+            }
+            let Some(Operand::Vector { reg: r @ 1..=2,dwords:1 }) = *data else { return Err(reject()); };
+            let dest = Reg::V(r);
+            if inst.reads.iter().any(|(r,_)| *r != dest && *r != Reg::V(0)
+                && !resource_values.contains_key(r) && !exec_values.contains_key(r)) {
+                return Err(reject());
+            }
+            if inst.read(Reg::V(0)).and_then(|v| values.get(&v).copied()) != Some(idx) {
+                return Err(reject());
+            }
+            let old = *values.get(&inst.read(dest).ok_or_else(reject)?).ok_or_else(reject)?;
+            match inst.name() {
+                "buffer_load_dword" => {
+                    if inst.writes.len() != 1 { return Err(reject()); }
+                    let value = inst.write(dest).ok_or_else(reject)?;
+                    // The address is always valid and private to this invocation.
+                    // A speculative read of this ordinary buffer is unobservable;
+                    // EXEC still gates the architectural VGPR write.
+                    let loaded = push(&mut ops,Op::LoadSelf);
+                    let merged = push(&mut ops,Op::SelectUlt(zero,active,loaded,old));
+                    if values.insert(value,merged).is_some() { return Err(reject()); }
+                    regs.insert(dest,merged);
+                }
+                "buffer_store_dword" => {
+                    if !inst.writes.is_empty() { return Err(reject()); }
+                    push(&mut ops,Op::StoreSelf(active,old));
+                }
+                _ => return Err(reject()),
+            }
+            if ops.len() > 4096 { return Err(reject()); }
+            continue;
+        }
         let Fields::Valu(v) = &inst.fields else { return Err(reject()); };
         if !matches!(inst.machine.encoding, Encoding::Vop1 | Encoding::Vop2 | Encoding::Vopc)
             || v.carry.is_some() || v.neg != 0 || v.abs != 0 || v.neg_hi != 0
             || v.opsel != 0 || v.opsel_hi != 0 || v.clamp || v.omod != 0
             || v.sdwa.is_some() || v.dpp.is_some()
         { return Err(reject()); }
-        for r in [Reg::S(EXEC), Reg::S(EXEC+1)].into_iter().take(if program.wave64 {2} else {1}) {
-            if exec_values.get(&r).copied().is_none() || inst.read(r) != exec_values.get(&r).copied() { return Err(reject()); }
-        }
         if inst.reads.iter().any(|(r,_)| !matches!(r, Reg::V(0..=2))
             && !exec_values.contains_key(r) && !(buffer_inputs && matches!(r, Reg::S(0..=1)))) { return Err(reject()); }
-        let lo_value = *values.get(&inst.read(Reg::S(EXEC)).ok_or_else(reject)?).ok_or_else(reject)?;
-        let active = if let Some(half) = half {
-            let hi_value = *values.get(&inst.read(Reg::S(EXEC+1)).ok_or_else(reject)?).ok_or_else(reject)?;
-            push(&mut ops, Op::SelectUlt(zero,half,hi_value,lo_value))
-        } else { lo_value };
         let mut args = Vec::new();
         for source in &v.src {
             args.push(match *source {
@@ -145,6 +205,7 @@ fn emit_with_inputs(program: &ir::Program, output: Reg, buffer_inputs: bool) -> 
             continue;
         }
         let Some(Operand::Vector { reg: dst @ 0..=2, dwords: 1 }) = v.dst else { return Err(reject()); };
+        if memory && dst == 0 { return Err(reject()); }
         let dest = Reg::V(dst);
         let old = *values.get(&inst.read(dest).ok_or_else(reject)?).ok_or_else(reject)?;
         let computed = match (inst.name(), args.as_slice()) {
@@ -165,7 +226,11 @@ fn emit_with_inputs(program: &ir::Program, output: Reg, buffer_inputs: bool) -> 
         regs.insert(dest,merged);
         if ops.len() > 4096 { return Err(reject()); }
     }
-    spirv::emit(&ops,*regs.get(&output).ok_or_else(|| unsupported(0,"undefined vector diagnostic output"))?)
+    if let Some(output) = output {
+        spirv::emit(&ops,*regs.get(&output).ok_or_else(|| unsupported(0,"undefined vector diagnostic output"))?)
+    } else {
+        spirv::emit_effects(&ops)
+    }
 }
 
 pub fn demo(wave64: bool) -> Result<Vec<u32>, ShaderError> {
@@ -236,6 +301,17 @@ pub fn cmpx_expected64(index: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_native_memory_effects_emit() {
+        let words = [0xe030_2000u32,0x8001_0100,0x4a02_0200,
+            0xe070_2000,0x8001_0100,0xbf81_0000];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        for wave64 in [false,true] {
+            let p = ir::build(&code,wave64,3).unwrap();
+            assert!(emit_memory_kernel(&p).is_ok());
+            assert!(emit_buffer_kernel(&p,Reg::V(1)).is_err());
+        }
+    }
     #[test]
     fn explicit_buffer_inputs_emit() {
         // v1 = s0 + v1; v2 = s1 XOR v1.
