@@ -51,6 +51,8 @@ mod memory;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+/// Experimental Vulkan transfer planning; independent of the legacy backend.
+pub mod vulkan_upload;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
