@@ -262,6 +262,7 @@ struct GraphicsPipeline<'a> {
     vert: vk::ShaderModule,
     frag: vk::ShaderModule,
     texture: Option<ImageId>,
+    batchable: bool,
     linear_filter: bool,
     sampler: vk::Sampler,
     descriptor_layout: vk::DescriptorSetLayout,
@@ -286,7 +287,7 @@ impl Drop for GraphicsPipeline<'_> {
 impl<'a> GraphicsPipeline<'a> {
     fn new(d:&'a ash::Device,vert:&[u32],frag:&[u32],texture:Option<(ImageId,vk::ImageView)>,state:GraphicsState,cache:vk::PipelineCache) -> Result<Self> {
         let mut p = Self { d,vert:vk::ShaderModule::null(),frag:vk::ShaderModule::null(),
-            texture:texture.map(|(id,_)|id),linear_filter:state.linear_filter,sampler:vk::Sampler::null(),
+            texture:texture.map(|(id,_)|id),batchable:false,linear_filter:state.linear_filter,sampler:vk::Sampler::null(),
             descriptor_layout:vk::DescriptorSetLayout::null(),descriptor_pool:vk::DescriptorPool::null(),
             descriptor_set:vk::DescriptorSet::null(),layout:vk::PipelineLayout::null(),pipeline:vk::Pipeline::null() };
         unsafe {
@@ -491,6 +492,14 @@ fn dispatch_record_bytes(groups:u32,limit:u32,bytes:u64,stride:u8) -> Result<()>
 /// Owns resources and a command queue while exclusively borrowing Context.
 /// IDs are valid only in the session that created them. Failed submissions
 /// poison the session; no resource is reused before completion is known.
+#[derive(Debug,Default,Clone,Copy)]
+pub struct RecordingStats {
+    pub draws:u64,
+    pub draw_render_scopes:u64,
+    pub inter_command_barriers:u64,
+    pub graphics_pipeline_binds:u64,
+}
+
 pub struct Session<'a> {
     d: &'a ash::Device,
     instance: &'a ash::Instance,
@@ -504,6 +513,8 @@ pub struct Session<'a> {
     next_id: u64,
     poisoned: bool,
     cache: Cache<'a>,
+    batch_draws: bool,
+    last_recording: RecordingStats,
     compute_bindings: BTreeMap<ComputeBindingId,ComputeBinding<'a>>,
     compute_pipelines: BTreeMap<ComputeId,ComputePipeline<'a>>,
     buffers: BTreeMap<BufferId,Buffer<'a>>,
@@ -530,6 +541,8 @@ impl<'a> Session<'a> {
         let mut session = Self {
             d, instance:&context.instance, physical:context.physical,
             cache:Cache::open(d,&unsafe{context.instance.get_physical_device_properties(context.physical)}),
+            batch_draws:std::env::var_os("VORTEX_VK_BATCH_DRAWS").is_none_or(|v|v!="0"),
+            last_recording:RecordingStats::default(),
             memory:unsafe { context.instance.get_physical_device_memory_properties(context.physical) },
             queue:unsafe { d.get_device_queue(context.family,0) },
             pool:vk::CommandPool::null(),command:vk::CommandBuffer::null(),
@@ -642,7 +655,9 @@ impl<'a> Session<'a> {
             return Err("native sampled fragment requires texture descriptor".into());
         }
         let f=spirv_graphics::emit_graphics(&fragment,Stage::Fragment)?;
-        self.create_graphics_pipeline(&v,&f)
+        let id=self.create_graphics_pipeline(&v,&f)?;
+        self.pipelines.get_mut(&id).ok_or("missing graphics pipeline")?.batchable=true;
+        Ok(id)
     }
 
     /// Compile a native textured graphics pair and bind a retained RGBA8 image.
@@ -662,7 +677,8 @@ impl<'a> Session<'a> {
         if state.linear_filter&&!props.optimal_tiling_features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR){
             return Err("linear texture filtering unsupported".into());
         }
-        let p=GraphicsPipeline::new(self.d,&v,&f,Some((texture,image.view)),state,self.cache.handle())?;
+        let mut p=GraphicsPipeline::new(self.d,&v,&f,Some((texture,image.view)),state,self.cache.handle())?;
+        p.batchable=true;
         let id=PipelineId(self.next_id);self.next_id=self.next_id.checked_add(1).ok_or("pipeline ID exhausted")?;
         self.pipelines.insert(id,p);Ok(id)
     }
@@ -1025,10 +1041,25 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
+    pub fn last_recording_stats(&self)->RecordingStats {self.last_recording}
+
+    /// Only the known native graphics ABI is eligible: shaders access no
+    /// writable storage or attachment feedback. Attachment order and draw order
+    /// are retained; transfers, clears and state changes end the batch.
+    fn draw_key(&self,c:&Command)->Option<(PipelineId,ImageId,ImageId,ImageRegion)>{
+        if !self.batch_draws{return None;}
+        let (pipeline,color,depth,region)=match *c{
+            Command::Draw{pipeline,color,depth,region,..}|Command::DrawIndexed{pipeline,color,depth,region,..}=>(pipeline,color,depth,region),
+            _=>return None,
+        };
+        self.pipelines.get(&pipeline).filter(|p|p.batchable).map(|_|(pipeline,color,depth,region))
+    }
+
     pub fn submit(&mut self,commands:&[Command]) -> Result<u64> {
         self.ready()?;
         self.validate(commands)?;
-        if commands.is_empty() { return Ok(self.completed); }
+        if commands.is_empty() { self.last_recording=RecordingStats::default();return Ok(self.completed); }
+        let mut stats=RecordingStats::default();
         let epoch = self.completed.checked_add(1).ok_or("timeline exhausted")?;
         // Any error after beginning recording blocks subsequent reuse.
         self.poisoned = true;
@@ -1039,7 +1070,11 @@ impl<'a> Session<'a> {
             d.begin_command_buffer(cmd,&vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
             for (index,&command) in commands.iter().enumerate() {
-                if index != 0 {
+                let key=self.draw_key(&command);
+                let continues=key.is_some()&&index>0&&key==self.draw_key(&commands[index-1]);
+                let extends=key.is_some()&&commands.get(index+1).is_some_and(|next|self.draw_key(next)==key);
+                if index != 0 && !continues {
+                    stats.inter_command_barriers+=1;
                     // Conservative cross-command dependency covers transfers
                     // and dynamic rendering attachment operations.
                     let barrier = [vk::MemoryBarrier2::default()
@@ -1105,12 +1140,16 @@ impl<'a> Session<'a> {
                         };
                         let viewport = [vk::Viewport { x:region.x as f32,y:region.y as f32,
                             width:region.width as f32,height:region.height as f32,min_depth:0.,max_depth:1. }];
-                        d.cmd_begin_rendering(cmd,&vk::RenderingInfo::default().render_area(area)
-                            .layer_count(1).color_attachments(&colors).depth_attachment(&depth_attachment));
-                        d.cmd_bind_pipeline(cmd,vk::PipelineBindPoint::GRAPHICS,p.pipeline);
-                        if p.texture.is_some(){d.cmd_bind_descriptor_sets(cmd,vk::PipelineBindPoint::GRAPHICS,p.layout,0,&[p.descriptor_set],&[]);}
-                        d.cmd_set_viewport(cmd,0,&viewport);
-                        d.cmd_set_scissor(cmd,0,&[area]);
+                        stats.draws+=1;
+                        if !continues{
+                            stats.draw_render_scopes+=1;stats.graphics_pipeline_binds+=1;
+                            d.cmd_begin_rendering(cmd,&vk::RenderingInfo::default().render_area(area)
+                                .layer_count(1).color_attachments(&colors).depth_attachment(&depth_attachment));
+                            d.cmd_bind_pipeline(cmd,vk::PipelineBindPoint::GRAPHICS,p.pipeline);
+                            if p.texture.is_some(){d.cmd_bind_descriptor_sets(cmd,vk::PipelineBindPoint::GRAPHICS,p.layout,0,&[p.descriptor_set],&[]);}
+                            d.cmd_set_viewport(cmd,0,&viewport);
+                            d.cmd_set_scissor(cmd,0,&[area]);
+                        }
                         d.cmd_bind_vertex_buffers(cmd,0,&[self.buffer(vertices)?.handle],&[offset]);
                         match command {
                             Command::DrawIndexed { indices,first,base_vertex,.. } => {
@@ -1119,7 +1158,7 @@ impl<'a> Session<'a> {
                             }
                             _ => d.cmd_draw(cmd,count,1,0,0),
                         }
-                        d.cmd_end_rendering(cmd);
+                        if !extends{d.cmd_end_rendering(cmd);}
                     }
                     Command::Dispatch { binding,groups,constants } => {
                         let b = self.compute_binding(binding)?;
@@ -1166,6 +1205,7 @@ impl<'a> Session<'a> {
             d.wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&[self.timeline]).values(&[epoch]),u64::MAX)?;
         }
         self.completed = epoch;
+        self.last_recording=stats;
         self.poisoned = false;
         Ok(epoch)
     }
@@ -1901,6 +1941,12 @@ pub(crate) fn verify_native_graphics(context:&mut Context) -> Result<()> {
         Command::ReadImage{src:color,region:full,dst:output,offset:0},
         Command::ReadImage{src:depth,region:full,dst:output,offset:256},
     ])?;
+    let stats=s.last_recording_stats();
+    if stats.draws!=3||stats.draw_render_scopes!=if s.batch_draws{2}else{3}
+        ||stats.graphics_pipeline_binds!=stats.draw_render_scopes{
+        return Err(format!("unexpected draw batch statistics: {stats:?}").into());
+    }
+    println!("PASS: native draw recording: {stats:?}");
     let words=s.read_words(output,0,128)?;
     for y in 0..8 {for x in 0..8 {
         let i=y*8+x;let inside=(2..6).contains(&x)&&(2..6).contains(&y);
