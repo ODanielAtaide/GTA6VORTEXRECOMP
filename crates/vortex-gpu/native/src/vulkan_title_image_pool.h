@@ -69,7 +69,7 @@ public:
     std::unique_ptr<PooledTitleImage> bind(VkDevice device, VkImage image, const VkMemoryRequirements& req,
                                            PFN_vkBindImageMemory bind_image, PFN_vkDestroyImage destroy_image,
                                            PFN_vkFreeMemory free_memory, Allocate allocate) {
-        constexpr VkDeviceSize largest_slot = VkDeviceSize{2} << 20;
+        constexpr VkDeviceSize largest_slot = VkDeviceSize{4} << 20;
         const VkDeviceSize needed = std::max(req.size, req.alignment);
         if (!needed || needed > largest_slot || !req.memoryTypeBits) return {};
         // Eight size classes per power of two keep padding below one eighth (besides required alignment).

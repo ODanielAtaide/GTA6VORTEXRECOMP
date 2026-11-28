@@ -38,7 +38,11 @@ def main() -> None:
         if (work / "shaders").exists():
             parser.error("choose a fresh work directory for this package")
         stamp.write_text(fingerprint + "\n", encoding="ascii")
-    shaders(str(game), str(work), args.jobs, emulate=args.wave64_emulate)
+    # Aligned title texture descriptors can cluster in the low FNV-1a bits.
+    # Every library must use the same hash. shader_build keys each cache stage
+    # on these translation flags and records the chosen mode in the modules.
+    shaders(str(game), str(work), args.jobs, emulate=args.wave64_emulate,
+            fallbacks=("--descriptor-hash", "fnv1a_fmix32"))
     print(work / "shaders" / "spirv", flush=True)
 
 

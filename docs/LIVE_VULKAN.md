@@ -27,7 +27,9 @@ Keep the title, shader outputs, caches and captures outside the repository. The 
 user's package, extracts RDNA2 from console shader containers, uses the AMDGPU disassembler and emits SPIR-V.
 The application does not emit DXIL in this path. The driver cache is stored under
 `<VORTEX_CACHE_DIR>/vulkan-pipelines`. The work directory binds its cache to the package shader archive's
-SHA-256 fingerprint and checks the translator fingerprint before reusing translated files.
+SHA-256 fingerprint and checks the translator fingerprint and settings before reusing translated files.
+New packs mix the full descriptor hash before indexing the Vulkan table. The mode is recorded in each
+module and applied consistently across the title, compute libraries and executable shaders.
 
 ## Validate the Vulkan output
 
@@ -92,7 +94,12 @@ violation while following a noncanonical pointer. Another run reached the story
 artwork with the revised GPU mappings and write-back ordering. The AMD driver
 returned VK_ERROR_OUT_OF_DEVICE_MEMORY for streamed textures before the title
 faulted while writing to a null address. The captures and game files remain
-local. Gameplay, the in-game performance overlay and 30 FPS
+local. A follow-up with a 1024 MiB arena confirmed the Radeon allocated that arena
+from host memory and still hit the texture allocation limit. It also recorded a
+descriptor table of 4,194,304 slots for approximately 30,000 keys in the older
+FNV-1a pack. Small eligible render and depth targets now share Vulkan allocations
+with streamed textures, and new shader packs use the mixed hash.
+Gameplay, the in-game performance overlay and 30 FPS
 remain unverified.
 
 ## Components and provenance

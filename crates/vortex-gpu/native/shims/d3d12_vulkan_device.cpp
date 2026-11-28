@@ -9367,7 +9367,7 @@ public:
         } else if (origin != TitleImageOrigin::ordinary) {
             // A title image (placed or streamed) takes the title image pool or an allocation of its own, of the memory
             // types its placement allows; the shared texture blocks below are for the layer's ordinary textures.
-            if (!bind_texture_memory(stream, allowed, requirements, type)) {
+            if (!bind_texture_memory(allowed, requirements, type)) {
                 if (staged_title_) return retry_host();
                 std::fprintf(stderr,
                              "[rt] d3d12: texture memory unavailable: %llu bytes, alignment %llu, type bits 0x%x (vk "
@@ -9382,8 +9382,8 @@ public:
             // Some drivers advertise VK_EXT_host_image_copy yet allow no memory type for a HOST_TRANSFER image
             // (NVIDIA Pascal / 582.78: memoryTypeBits == 0), or fail to allocate one. Staging copies do not need
             // that usage, so recreate the image without it and continue on that path, as for a refused format above.
-            // Render targets and depth buffers keep their own allocations: there are few of them, and a driver may
-            // give one a better place.
+            // Small render and depth attachments can share the same optimal-image pool as title placements.
+            // The driver's dedicated-allocation requirement still decides which images must bind separately.
             constexpr D3D12_RESOURCE_FLAGS attachment =
                 D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
             for (;;) {
@@ -9403,9 +9403,7 @@ public:
                     return E_OUTOFMEMORY;
                 }
                 if (!retry) {
-                    memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_);
-                    if (memory_ && vk.vkBindImageMemory(device_.info.device, image_, memory_, 0) == VK_SUCCESS) break;
-                    if (memory_) { vk.vkFreeMemory(device_.info.device, memory_, nullptr); memory_ = VK_NULL_HANDLE; }
+                    if (bind_texture_memory(UINT32_MAX, requirements, type)) break;
                     retry = host_transfer_;  // a failed allocation/bind retries on the staging path too
                 }
                 if (!retry) return E_OUTOFMEMORY;
@@ -9504,9 +9502,9 @@ public:
         if (!image_backing_bytes_) {
             VkMemoryRequirements requirements{};
             std::uint32_t type = UINT32_MAX;
-            if (!bind_texture_memory(true, deferred_types_, requirements, type) &&
+            if (!bind_texture_memory(deferred_types_, requirements, type) &&
                 (deferred_types_ == UINT32_MAX || !(requirements.memoryTypeBits & ~deferred_types_) ||
-                 !bind_texture_memory(true, ~deferred_types_, requirements, type))) return false;
+                 !bind_texture_memory(~deferred_types_, requirements, type))) return false;
         }
         if (FAILED(register_bound_texture())) return false;
         deferred_bytes_ = 0;
@@ -9533,9 +9531,9 @@ private:
     bool bind_placed_memory() {
         VkMemoryRequirements requirements{};
         std::uint32_t type = UINT32_MAX;
-        if (!image_backing_bytes_ && !bind_texture_memory(false, deferred_types_, requirements, type)) {
+        if (!image_backing_bytes_ && !bind_texture_memory(deferred_types_, requirements, type)) {
             if (!(requirements.memoryTypeBits & ~deferred_types_) ||
-                !bind_texture_memory(false, ~deferred_types_, requirements, type)) return false;
+                !bind_texture_memory(~deferred_types_, requirements, type)) return false;
         }
         if (shared_zero_) {
             if (host_transfer_ && !host_initialize()) return false;
@@ -9544,22 +9542,21 @@ private:
         return true;
     }
 
-    bool bind_texture_memory(bool stream, std::uint32_t allowed_types, VkMemoryRequirements& requirements,
-                             std::uint32_t& type) {
+    bool bind_texture_memory(std::uint32_t allowed_types, VkMemoryRequirements& requirements, std::uint32_t& type) {
         auto& vk = device_.context->vk;
         static const bool pool_images = [] {
             wchar_t value[2]{};
             return !(GetEnvironmentVariableW(L"LEONIDA_TITLE_IMAGE_POOL", value, 2) == 1 && value[0] == L'0');
         }();
         VkMemoryDedicatedRequirements dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
-        if (stream && pool_images && device_.bound_image_requirements) {
+        if (device_.bound_image_requirements) {
             VkImageMemoryRequirementsInfo2 query{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2};
             query.image = image_;
             VkMemoryRequirements2 result{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
             result.pNext = &dedicated;
             device_.bound_image_requirements(device_.info.device, &query, &result);
             requirements = result.memoryRequirements;
-            if (!dedicated.requiresDedicatedAllocation) {
+            if (pool_images && !dedicated.requiresDedicatedAllocation) {
                 auto pool_requirements = requirements;
                 pool_requirements.memoryTypeBits &= allowed_types;
                 pooled_image_ = device_.title_image_pool.bind(device_.info.device, image_, pool_requirements,

@@ -3,6 +3,7 @@
 #include "../src/title_va_alias.h"
 #include "../src/title_page_watch.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/descriptor_table.h"
 
 #include <cstdio>
 #include <filesystem>
@@ -16,6 +17,22 @@ static_assert(leonida::gfx10::format_from_vulkan(VK_FORMAT_D16_UNORM_S8_UINT) ==
 static_assert(leonida::gfx10::vulkan_view_format(VK_FORMAT_D16_UNORM_S8_UINT, 7) == VK_FORMAT_D16_UNORM_S8_UINT);
 
 int main() {
+    using namespace leonida;
+    DescriptorTable legacy;
+    DescriptorTable mixed(16, DescriptorHashKind::fnv1a_fmix32);
+    // Placed image descriptors differ by page-aligned GPU address.
+    constexpr std::uint32_t keys = 8192;
+    for (std::uint32_t i = 1; i <= keys; ++i) {
+        const DescriptorKey key{i << 8, 1, 2, 3, 4, 5, 6, 7};
+        legacy.insert(key, i);
+        mixed.insert(key, i);
+    }
+    if (mixed.capacity() >= legacy.capacity()) return 13;
+    for (std::uint32_t i = 1; i <= keys; ++i) {
+        const DescriptorKey key{i << 8, 1, 2, 3, 4, 5, 6, 7};
+        if (mixed.lookup(key) != i || legacy.lookup(key) != i) return 13;
+    }
+
     constexpr std::size_t bytes = 1 << 16;
     void* memory = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
     if (!memory) return 1;
