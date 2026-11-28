@@ -3,7 +3,8 @@
 The title is loaded by Vortex's Rust PE loader and runs in the Vortex process. The Xbox imports are resolved
 by Vortex HLE. The graphics device is built statically into that executable from the repository. Xbox COM
 interfaces remain visible to the title, including the format and method names in those interfaces.
-The graphics implementation issues Vulkan commands.
+The Windows x64 MSVC runtime selects Vulkan at build time. Its executable imports neither a
+Direct3D device nor Direct3D shader compiler. The graphics implementation issues Vulkan commands.
 
 The experimental branch started from `31474b8`, which opened a Vulkan device but stopped before its first
 present. A previous integration at `97c1fa0` opened Settings with an external runtime, which is historical
@@ -16,6 +17,7 @@ Use Windows x64, the pinned Rust toolchain, Visual Studio 2022 C++ Build Tools, 
 `LLVM_MC` to an LLVM 21+ `llvm-mc` with AMDGPU support. Set `VORTEX_PYTHON` or `CMAKE` if the defaults
 do not resolve to the installed tools. The CMake component generates the COM declarations from the Windows
 SDK and links the graphics component into Vortex. A source checkout is used for shader preparation.
+If the MSVC file tracker runs out of path length, set Cargo's `--target-dir` to a short writable path.
 
 ```powershell
 cargo build -p vortex --release --locked --features diagnostics

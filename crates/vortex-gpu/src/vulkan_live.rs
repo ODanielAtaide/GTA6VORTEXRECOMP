@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Initial live guest GPU backend. All unsupported calls stop with a concrete
 //! error instead of falling back to host D3D12 or acknowledging fake draws.
-use std::sync::{Mutex,OnceLock,atomic::{AtomicBool,Ordering}};
+use std::sync::{Mutex, OnceLock};
+#[cfg(any(test, not(all(target_arch = "x86_64", target_env = "msvc"))))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use crate::object::{self,This};
 use vortex_vulkan::live::{ImageSpec,Live,Reply,Task};
-static ENABLED:AtomicBool=AtomicBool::new(false);
+#[cfg(any(test, not(all(target_arch = "x86_64", target_env = "msvc"))))]
+static ENABLED: AtomicBool = AtomicBool::new(false);
 static WORKER:OnceLock<Result<Live,String>>=OnceLock::new();
 static SUBMIT:Mutex<()>=Mutex::new(());
 // CPU-side provenance only. Registered resource spans are not Vulkan GPU
@@ -65,8 +68,23 @@ mod address_tests{
     }
 }
 
-pub fn enable(){ENABLED.store(true,Ordering::Release);}
-pub fn enabled()->bool{ENABLED.load(Ordering::Acquire)}
+pub fn enable() {
+    #[cfg(any(test, not(all(target_arch = "x86_64", target_env = "msvc"))))]
+    ENABLED.store(true, Ordering::Release);
+}
+
+// The shipped native runtime selects Vulkan at build time. Tests can still
+// switch paths to exercise the historical device independently of title runs.
+#[cfg(all(not(test), target_arch = "x86_64", target_env = "msvc"))]
+#[inline(always)]
+pub const fn enabled() -> bool {
+    true
+}
+
+#[cfg(any(test, not(all(target_arch = "x86_64", target_env = "msvc"))))]
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Acquire)
+}
 pub(crate) fn stop(message:impl std::fmt::Display)->!{
     eprintln!("VULKAN_RUNTIME_BLOCKER: {message}; no D3D12 fallback");
     tracing::error!(%message,"VULKAN_RUNTIME_BLOCKER");
