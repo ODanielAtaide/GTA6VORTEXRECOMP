@@ -213,7 +213,7 @@ impl Drop for Image<'_> {
     }
 }
 impl<'a> Image<'a> {
-    fn new(d:&'a ash::Device,mem:&vk::PhysicalDeviceMemoryProperties,width:u32,height:u32,kind:ImageKind,mips:u32) -> Result<Self> {
+    fn new(d:&'a ash::Device,mem:&vk::PhysicalDeviceMemoryProperties,width:u32,height:u32,kind:ImageKind,mips:u32,usage:vk::ImageUsageFlags) -> Result<Self> {
         let mut image = Self { d,handle:vk::Image::null(),memory:vk::DeviceMemory::null(),
             view:vk::ImageView::null(),kind,width,height,mips,initialized:false };
         unsafe {
@@ -221,7 +221,7 @@ impl<'a> Image<'a> {
                 .image_type(vk::ImageType::TYPE_2D).format(kind.format())
                 .extent(vk::Extent3D { width,height,depth:1 }).mip_levels(mips).array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1).tiling(vk::ImageTiling::OPTIMAL)
-                .usage(kind.usage()).sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .initial_layout(vk::ImageLayout::UNDEFINED),None)?;
             let req = d.get_image_memory_requirements(image.handle);
             use vk::MemoryPropertyFlags as F;
@@ -657,28 +657,34 @@ impl<'a> Session<'a> {
         self.create_image_kind(width,height,ImageKind::Rgba8)
     }
 
+    #[cfg(windows)]
+    pub(crate) fn create_storage_target(&mut self, width: u32, height: u32) -> Result<ImageId> {
+        self.create_image_levels(width, height, ImageKind::Rgba8, 1, vk::ImageUsageFlags::STORAGE)
+    }
+
     pub fn create_depth_image(&mut self,width:u32,height:u32) -> Result<ImageId> {
         self.create_image_kind(width,height,ImageKind::Depth32)
     }
 
     fn create_image_kind(&mut self,width:u32,height:u32,kind:ImageKind) -> Result<ImageId> {
-        self.create_image_levels(width,height,kind,1)
+        self.create_image_levels(width,height,kind,1,vk::ImageUsageFlags::empty())
     }
     /// Allocate a sampled RGBA8 mip chain. Multi-mip views may not be bound
     /// as render attachments. Each level is initialized before exposure.
     pub fn create_mip_texture(&mut self,width:u32,height:u32,mips:u32)->Result<ImageId>{
-        self.create_image_levels(width,height,ImageKind::Rgba8,mips)
+        self.create_image_levels(width,height,ImageKind::Rgba8,mips,vk::ImageUsageFlags::empty())
     }
-    fn create_image_levels(&mut self,width:u32,height:u32,kind:ImageKind,mips:u32)->Result<ImageId>{
+    fn create_image_levels(&mut self,width:u32,height:u32,kind:ImageKind,mips:u32,extra_usage:vk::ImageUsageFlags)->Result<ImageId>{
         if kind.block_bytes().is_some(){return Err("compressed textures require explicit initial block data".into());}
         self.ready()?;
         if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
             return Err("invalid image dimensions".into());
         }
         if mips==0||mips>32-width.max(height).leading_zeros()||(kind==ImageKind::Depth32&&mips!=1){return Err("invalid mip chain length".into());}
+        let usage = kind.usage() | extra_usage;
         let properties = unsafe { self.instance.get_physical_device_image_format_properties(
             self.physical,kind.format(),vk::ImageType::TYPE_2D,vk::ImageTiling::OPTIMAL,
-            kind.usage(),vk::ImageCreateFlags::empty())? };
+            usage,vk::ImageCreateFlags::empty())? };
         let limits = unsafe { self.instance.get_physical_device_properties(self.physical) }.limits;
         if mips>properties.max_mip_levels||width > properties.max_extent.width || height > properties.max_extent.height
             || width > limits.max_framebuffer_width || height > limits.max_framebuffer_height {
@@ -686,7 +692,7 @@ impl<'a> Session<'a> {
         }
         let id = ImageId(self.next_id);
         self.next_id = self.next_id.checked_add(1).ok_or("image ID exhausted")?;
-        let image = Image::new(self.d,&self.memory,width,height,kind,mips)?;
+        let image = Image::new(self.d,&self.memory,width,height,kind,mips,usage)?;
         self.images.insert(id,image);
         // The ID is not exposed until this one-command initial clear completes.
         let clear = match kind {
@@ -727,7 +733,7 @@ impl<'a> Session<'a> {
         let staging=self.create_buffer(bytes,MemoryKind::HostVisible)?;
         for ((offset,_),level) in copies.iter().zip(levels){self.write_words(staging,*offset,level)?;}
         let id=ImageId(self.next_id);self.next_id=self.next_id.checked_add(1).ok_or("image ID exhausted")?;
-        let image=Image::new(self.d,&self.memory,width,height,kind,levels.len() as u32)?;
+        let image=Image::new(self.d,&self.memory,width,height,kind,levels.len() as u32,kind.usage())?;
         self.images.insert(id,image);
         // First upload transitions the whole chain; subsequent uploads use GENERAL.
         for (mip,(offset,region)) in copies.into_iter().enumerate(){

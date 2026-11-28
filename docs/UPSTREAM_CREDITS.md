@@ -215,3 +215,13 @@ title's data folder.
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
+
+# Native graphics and shader compiler
+
+The files in `crates/vortex-gpu/native` and `crates/vortex-shader/native/tools` retain the authorship and
+GPL-3.0-or-later licensing of ProjectLeonida and its contributors. The source baseline is
+[ProjectLeonida/mandy at 39f52f3](https://github.com/ProjectLeonida/mandy/tree/39f52f39c435e04273bc822f258f2c4bb1b7fec0).
+The repository's [GPL license](../LICENSE) applies. The offline orchestration in
+`crates/vortex-shader/native/shader_build.py` adapts the shader stages of upstream `make_game.py`.
+CMake builds the graphics sources into Vortex. Vortex owns the PE loader, HLE, guest memory allocator and page
+mapping. The support sources include only the dependencies used by the graphics build.

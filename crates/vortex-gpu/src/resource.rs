@@ -2143,13 +2143,28 @@ pub(crate) fn release_live(this:This){let _=resource_release(this);}
 pub(crate) fn live_image_spec(this:This)->Option<vortex_vulkan::live::ImageSpec>{
     if !crate::vulkan_live::registered(this){return None;}
     let r=resource(this);let d=r.desc;
+    let rejected = || {
+        let backing = match r.backing {
+            Backing::Committed(_) => "committed",
+            Backing::Placed { .. } => "placed",
+            Backing::Address(_) => "address",
+        };
+        tracing::error!(?d, backing, "VULKAN_UNSUPPORTED_IMAGE");
+        None
+    };
     // Real target contents can be represented without guest swizzle or
     // aliasing only for this small initial committed-image subset.
     if !matches!(&r.backing,Backing::Committed(_))||d.dimension!=3||d.width==0||d.height==0
         ||d.width>i32::MAX as u64||d.height>i32::MAX as u32||d.depth_or_array_size!=1
-        ||d.mip_levels!=1||d.sample_count!=1||d.sample_quality!=0||d.flags&4!=0{return None;}
-    let depth=match d.format{28 if d.flags&1!=0&&d.flags&2==0=>false,40 if d.flags&2!=0&&d.flags&1==0=>true,_=>return None};
-    Some(vortex_vulkan::live::ImageSpec{key:this as usize,width:d.width as u32,height:d.height,depth})
+        ||d.mip_levels!=1||d.sample_count!=1||d.sample_quality!=0{return rejected();}
+    let depth=match d.format{28 if d.flags&1!=0&&d.flags&2==0=>false,40 if d.flags&2!=0&&d.flags&5==0=>true,_=>return rejected()};
+    Some(vortex_vulkan::live::ImageSpec {
+        key: this as usize,
+        width: d.width as u32,
+        height: d.height,
+        depth,
+        storage: d.flags & 4 != 0,
+    })
 }
 
 extern "system" fn resource_release(this: This) -> u32 {

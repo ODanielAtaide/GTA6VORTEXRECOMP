@@ -698,6 +698,47 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
+#[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+pub(super) extern "C" fn gpu_copy_pages(to: *mut c_void, from: *const c_void, pages: u64, repeat: bool) -> bool {
+    let to = to as u64;
+    let from = from as u64;
+    let page = PAGE as u64;
+    let Some(bytes) = pages.checked_mul(page) else { return false };
+    if to % page != 0 || from % page != 0 || to.checked_add(bytes).is_none() {
+        return false;
+    }
+    if bytes == 0 || to == from && !repeat {
+        return true;
+    }
+    if repeat && from != 0 {
+        return (0..pages).all(|i| map_alias(to + i * page, from, page));
+    }
+    from.checked_add(bytes).is_some() && map_alias(to, from, bytes)
+}
+
+#[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+pub(super) unsafe extern "C" fn gpu_page_aliases(address: usize, out: *mut usize, capacity: usize) -> usize {
+    let memory = physical();
+    let Some((&base, (_, source))) = memory.views.range(..=address).next_back()
+        .filter(|(base, (bytes, _))| address - **base < *bytes)
+    else { return 0 };
+    let offset = address - base;
+    let source_page = source.index + offset / PAGE;
+    let mut count = 0;
+    for (&target, (bytes, view)) in &memory.views {
+        if view.section.0 != source.section.0 || source_page < view.index {
+            continue;
+        }
+        let aliased_offset = (source_page - view.index) * PAGE + offset % PAGE;
+        if aliased_offset < *bytes && target + aliased_offset != address && count < capacity {
+            // SAFETY: the C++ caller supplies room for capacity addresses.
+            unsafe { out.add(count).write(target + aliased_offset) };
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {

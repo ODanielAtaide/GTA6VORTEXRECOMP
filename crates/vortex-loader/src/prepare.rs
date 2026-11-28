@@ -106,11 +106,68 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         }
     }
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if let Some(optimized) = host_cache_writeback() {
+        let mut loops = 0;
+        for section in &info.sections {
+            const EXECUTE: u32 = 0x2000_0000;
+            if section.characteristics & EXECUTE == 0 {
+                continue;
+            }
+            let start = section.file_offset as usize;
+            let len = section.file_size.min(section.virtual_size) as usize;
+            if let Some(end) = start.checked_add(len)
+                && let Some(code) = bytes.get_mut(start..end)
+            {
+                loops += lower_cache_writeback_loops(code, optimized);
+            }
+        }
+        if loops != 0 {
+            tracing::info!(loops, optimized, "mapped cache write-back loops use native CLFLUSH instructions");
+        }
+    }
+
     Ok(PreparedImage {
         info,
         bytes,
         original_hash: blake3::hash(original),
     })
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn host_cache_writeback() -> Option<bool> {
+    use std::arch::x86_64::{__cpuid, __cpuid_count};
+    // SAFETY: CPUID is available in x86-64. Check the supported leaf before reading it.
+    let cpu = unsafe { __cpuid(0) };
+    if cpu.eax < 1 {
+        return None;
+    }
+    let basic = unsafe { __cpuid(1) };
+    if basic.edx & (1 << 19) == 0 || (basic.ebx >> 8) & 0xff != 8 {
+        return None;
+    }
+    let cache = if cpu.eax >= 7 { unsafe { __cpuid_count(7, 0) }.ebx } else { 0 };
+    (cache & (1 << 24) == 0).then_some(cache & (1 << 23) != 0)
+}
+
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+fn lower_cache_writeback_loops(code: &mut [u8], optimized: bool) -> usize {
+    // CLWB [rax]; ADD rax, 64; CMP rax, rcx; JBE back to CLWB.
+    // Preserve the exact operand and branch displacement. The native replacements
+    // write back dirty data and also invalidate the cache line.
+    const LOOP: [u8; 13] = [0x66, 0x0f, 0xae, 0x30, 0x48, 0x83, 0xc0, 0x40, 0x48, 0x39, 0xc8, 0x76, 0xf3];
+    let mut count = 0;
+    let mut bytes = code;
+    while let Some(offset) = bytes.windows(LOOP.len()).position(|candidate| candidate == LOOP) {
+        let instruction = &mut bytes[offset..offset + 4];
+        if !optimized {
+            instruction[0] = 0x90; // NOP; CLFLUSH. The prefix remains for CLFLUSHOPT.
+        }
+        instruction[3] = 0x38;
+        count += 1;
+        bytes = &mut bytes[offset + LOOP.len()..];
+    }
+    count
 }
 
 /// Size of an IMAGE_IMPORT_DESCRIPTOR in the PE file.
@@ -176,6 +233,21 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_writeback_patch_preserves_control_flow() {
+        let original = [0x66, 0x0f, 0xae, 0x30, 0x48, 0x83, 0xc0, 0x40, 0x48, 0x39, 0xc8, 0x76, 0xf3];
+        for optimized in [false, true] {
+            let mut code = original;
+            assert_eq!(lower_cache_writeback_loops(&mut code, optimized), 1);
+            assert_eq!(code[0], if optimized { 0x66 } else { 0x90 });
+            assert_eq!(code[3], 0x38);
+            assert_eq!(&code[4..], &original[4..]);
+        }
+        let mut truncated = original;
+        assert_eq!(lower_cache_writeback_loops(&mut truncated[..12], true), 0);
+        assert_eq!(truncated, original);
+    }
 
     #[test]
     fn patches_own_test_binary() {

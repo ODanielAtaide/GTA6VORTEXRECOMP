@@ -288,7 +288,16 @@ pub fn wait_for_previous() {
 fn end() {
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
-    vortex_gpu::pipeline::save_pipeline_cache();
+    {
+        #[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+        if vortex_gpu::vulkan_live::enabled() {
+            vortex_gpu::native_device::save_cache();
+        } else {
+            vortex_gpu::pipeline::save_pipeline_cache();
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan")))]
+        vortex_gpu::pipeline::save_pipeline_cache();
+    }
     // SAFETY: ends this process, as the console ends a suspended title.
     unsafe { TerminateProcess(GetCurrentProcess(), 0) };
 }

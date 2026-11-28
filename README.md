@@ -4,7 +4,7 @@
 
 [![Windows CI](https://github.com/ODanielAtaide/GTA6VORTEXRECOMP/actions/workflows/ci.yml/badge.svg)](https://github.com/ODanielAtaide/GTA6VORTEXRECOMP/actions/workflows/ci.yml) [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
 
-Vortex is an experimental compatibility layer investigating native x86-64 execution, high-level runtime services, Direct3D 12 graphics translation, shader recompilation and hardware compatibility. Our initial performance research target is **30 FPS with correct rendering**, not simply a higher frame counter. This is not a complete recompilation or an official PC port of any commercial game.
+Vortex is an experimental Windows x64 compatibility layer. It maps Xbox title code in its own process, provides Xbox system services and translates the console graphics interface to Vulkan. The performance target is **30 FPS during correctly rendered gameplay**. See [native Vulkan build and runtime status](docs/LIVE_VULKAN.md).
 
 Based on [VIctory](https://github.com/Marvisak/VIctory) by Marvisak and contributors and [victory-gta6](https://github.com/fxceless/victory-gta6). Their public source history, authorship and GPL-3.0-or-later licensing are preserved. See [upstream credits](docs/UPSTREAM_CREDITS.md) and [BCPack table provenance](docs/BCPACK_PROVENANCE.md).
 
@@ -23,7 +23,7 @@ Based on [VIctory](https://github.com/Marvisak/VIctory) by Marvisak and contribu
 | Correct rendering and stable gameplay | Not established |
 | 30 FPS in complex 3D scenes | Research target, not achieved |
 
-These are preliminary observations on a single machine (Intel Core i5-9400, Radeon RX 6600 XT 8 GB, 16 GB RAM). They are not an independently reproduced compatibility claim, and the source/provenance of the workload has not been independently verified. Only original or otherwise authorized workloads should be used for reproducible testing. No proprietary executable, assets, private logs or title-specific binary data are provided in this report.
+These measurements are from the earlier Direct3D development path on an Intel Core i5-9400, Radeon RX 6600 XT 8 GB and 16 GB of RAM. The native Vulkan path has its own [validation record](docs/LIVE_VULKAN.md).
 
 ## What we are working on
 
@@ -36,7 +36,7 @@ The [development report](docs/DEVELOPMENT_STATUS.md) records actual changes, mea
 
 ## Build and test
 
-Windows x64, the pinned Rust toolchain, MSVC build tools and Windows SDK are required.
+The native executable builds from this repository on Windows x64 with the pinned Rust toolchain, Visual Studio 2022 C++ Build Tools, the Windows SDK, Vulkan SDK, CMake and Python 3.12 or newer.
 
 ```powershell
 cargo test --workspace --locked
@@ -60,7 +60,7 @@ Start with [CONTRIBUTING.md](CONTRIBUTING.md), the [roadmap](docs/ROADMAP.md), o
 
 ## Technology and project credits
 
-The runtime, loader, graphics backend and shader compiler are written in **Rust**. Python is used only for auxiliary inspection, telemetry and regression tools. At the November 24, 2026 source snapshot, the repository held 139 Rust files (4,175,366 bytes) and six Python files (9,299 bytes): approximately 99.78% Rust by combined Rust/Python source bytes.
+The loader, Xbox system services and CLI use Rust. The graphics component is linked statically from C++ source and the offline shader compiler uses Python. The component sources and their provenance are documented in [upstream credits](docs/UPSTREAM_CREDITS.md).
 
 **Vortex maintainer and project lead:** [@ODanielAtaide](https://github.com/ODanielAtaide). The project-specific work and inherited upstream contributions are documented separately in [AUTHORS.md](AUTHORS.md). GitHub's automatic contributor graph also includes authors of the imported Git history; their appearance does not establish direct participation in Vortex.
 

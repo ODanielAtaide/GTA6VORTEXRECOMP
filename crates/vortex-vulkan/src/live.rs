@@ -5,7 +5,13 @@ use std::{collections::BTreeMap,sync::mpsc};
 use crate::{Context,commands::{self,BufferId,Command,ImageId,ImageRegion,MemoryKind},present::Presenter};
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub struct ImageSpec { pub key:usize,pub width:u32,pub height:u32,pub depth:bool }
+pub struct ImageSpec {
+    pub key: usize,
+    pub width: u32,
+    pub height: u32,
+    pub depth: bool,
+    pub storage: bool,
+}
 #[derive(Debug)]
 pub enum Task {
     Sync,
@@ -55,7 +61,12 @@ fn image(s:&mut commands::Session<'_>,map:&mut BTreeMap<usize,(ImageSpec,ImageId
         return Ok(id);
     }
     if !create{return Err("guest image has not been produced by Vulkan commands".into());}
-    let id=if spec.depth{s.create_depth_image(spec.width,spec.height)?}else{s.create_image(spec.width,spec.height)?};
+    let id = match (spec.depth, spec.storage) {
+        (true, true) => return Err("depth storage target has no supported Vulkan format".into()),
+        (true, false) => s.create_depth_image(spec.width, spec.height)?,
+        (false, true) => s.create_storage_target(spec.width, spec.height)?,
+        (false, false) => s.create_image(spec.width, spec.height)?,
+    };
     map.insert(spec.key,(spec,id));Ok(id)
 }
 fn run<'a>(context:&'a Context,s:&mut commands::Session<'_>,presenter:&mut Option<Presenter<'a>>,

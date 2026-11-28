@@ -11,6 +11,7 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
+    shader_pack: Option<&Path>,
 ) -> Result<()> {
     use std::sync::Arc;
     use vortex_hle::{HleResolver, HostPolicy};
@@ -19,6 +20,23 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     vortex_hle::modules::lifecycle::wait_for_previous();
     let cfg = vortex_core::Config::load()?;
+    vortex_core::ensure_outside_repo(exe)?;
+    if execute {
+        #[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+        {
+            let default = cfg.cache_subdir("native-shaders/shaders/spirv")?;
+            let pack = shader_pack.unwrap_or(&default);
+            vortex_core::ensure_outside_repo(pack)?;
+            anyhow::ensure!(pack.join("index.json").is_file(),
+                "shader pack missing at {}. Run compile-title-shaders and pass --shader-pack", pack.display());
+            vortex_hle::modules::d3d12x::use_native_paths(
+                &std::path::absolute(pack)?,
+                &std::path::absolute(cfg.cache_subdir("vulkan-pipelines")?)?,
+            )?;
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan")))]
+    let _ = shader_pack;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = vortex_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -339,6 +357,6 @@ mod tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console, _: Option<&Path>) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }

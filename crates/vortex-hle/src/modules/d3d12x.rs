@@ -17,11 +17,32 @@ extern "system" fn create_device(
     iid: *const Iid,
     out: *mut *const Object,
 ) -> HRESULT {
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+    if vortex_gpu::vulkan_live::enabled() {
+        use vortex_gpu::native_device;
+        static CONFIGURE: std::sync::Once = std::sync::Once::new();
+        CONFIGURE.call_once(|| native_device::configure(
+            crate::runtime::is_guest_code, allocate_guest, free_guest,
+            super::xmem::gpu_copy_pages, super::xmem::gpu_page_aliases,
+        ));
+        // SAFETY: this is the guest's DeviceX import, whose IID and result are live for the call.
+        return unsafe { native_device::create(iid, out) };
+    }
     vortex_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     vortex_gpu::resource::use_page_mapper(super::xmem::map_alias);
     #[cfg(windows)]
     vortex_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)
+}
+
+#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+extern "C" fn allocate_guest(size: usize, attributes: u64) -> *mut c_void {
+    super::xmem::XMemAlloc(size, attributes)
+}
+
+#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+extern "C" fn free_guest(address: *mut c_void, attributes: u64) {
+    super::xmem::XMemFree(address, attributes);
 }
 
 /// A host GPU failure ends the run like a crash: reported to the crash log,
@@ -41,6 +62,11 @@ fn host_gpu_failed(what: &str) -> ! {
 /// (`pipelines`).
 #[cfg(all(windows,feature = "vulkan"))]
 pub fn enable_native_vulkan(){vortex_gpu::vulkan_live::enable();}
+
+#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+pub fn use_native_paths(shaders: &std::path::Path, pipelines: &std::path::Path) -> std::io::Result<()> {
+    vortex_gpu::native_device::use_paths(shaders, pipelines)
+}
 
 pub fn use_shader_cache(dir: std::path::PathBuf) {
     #[cfg(all(windows,feature = "vulkan"))]

@@ -46,6 +46,24 @@ pub fn image_path(base: usize) -> Option<PathBuf> {
         .map(|(_, p)| p.clone())
 }
 
+#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+pub(crate) extern "C" fn is_guest_code(address: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ,
+        PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, VirtualQuery,
+    };
+    let mut region = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: VirtualQuery reads mapping metadata without dereferencing the supplied address.
+    if unsafe { VirtualQuery(address as *const _, &mut region, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0
+        || region.State != MEM_COMMIT
+        || region.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY) == 0
+    {
+        return false;
+    }
+    IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner())
+        .iter().any(|(base, _)| *base == region.AllocationBase as usize)
+}
+
 /// The title image whose original file is called `file` (any case).
 pub fn image_named(file: &str) -> Option<usize> {
     let paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());

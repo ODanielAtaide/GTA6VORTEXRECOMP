@@ -150,13 +150,15 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     // Permit the original diagnostic scripts and the Vulkan probe's GLSL source.
     let probe_shader = path.starts_with("tools/amd-vulkan-probe/shaders/")
         && matches!(ext.as_deref(), Some("comp" | "frag" | "vert"));
+    let native_graphics = path.starts_with("crates/vortex-gpu/native/")
+        && matches!(ext.as_deref(), Some("cpp" | "h" | "inc" | "py"));
+    let native_shader_compiler = path.starts_with("crates/vortex-shader/native/")
+        && ext.as_deref() == Some("py");
     let allowed = matches!(path,
         "vortex_inspect.py" | "vortex_metrics.py" | "vortex_compare.py"
         | "test_inspect.py" | "test_metrics.py" | "test_compare.py"
         | "tools/rdna2-commons-offline.py" | "tools/test-rdna2-commons-offline.py"
-        | "tools/leonida-vulkan-only.patch"
-        | "tools/leonida-cache-writeback.patch"
-    ) || probe_shader
+    ) || probe_shader || native_graphics || native_shader_compiler
         || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
@@ -164,9 +166,16 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     if !allowed {
         problems.push("file type not on the allowlist".to_owned());
     }
-    if content.len() > MAX_FILE_SIZE {
+    // These are algorithm sources imported under GPL, not generated title data.
+    // Keep the text, encoded-run and binary checks for both files.
+    let limit = match path {
+        "crates/vortex-gpu/native/shims/d3d12_vulkan_device.cpp"
+        | "crates/vortex-shader/native/tools/rdna2spirv.py" => 2 * 1024 * 1024,
+        _ => MAX_FILE_SIZE,
+    };
+    if content.len() > limit {
         problems.push(format!(
-            "{} bytes exceeds the {MAX_FILE_SIZE}-byte limit",
+            "{} bytes exceeds the {limit}-byte limit",
             content.len()
         ));
     }

@@ -10,8 +10,8 @@ mod shader;
 mod translate;
 #[cfg(feature = "vulkan")]
 mod precompile;
-#[cfg(all(windows, feature = "vulkan"))]
-mod vulkan_title;
+#[cfg(feature = "vulkan")]
+mod title_shaders;
 
 use std::path::PathBuf;
 
@@ -106,6 +106,18 @@ enum Command {
         #[arg(long)]
         code_only: bool,
     },
+    /// Compile the game's RDNA2 shader pack for the native Vulkan renderer.
+    #[cfg(feature = "vulkan")]
+    CompileTitleShaders {
+        #[arg(long)]
+        game_dir: PathBuf,
+        #[arg(long)]
+        work: PathBuf,
+        #[arg(long, default_value_t = 4)]
+        jobs: usize,
+        #[arg(long)]
+        wave64_emulate: bool,
+    },
     /// Verify the shared Vulkan host library from the main executable.
     #[cfg(feature = "vulkan")]
     VulkanCheck {
@@ -144,11 +156,11 @@ enum Command {
     Run {
         exe: PathBuf,
         /// Graphics backend used to run the title.
-        #[arg(long, value_enum, default_value_t = Backend::D3d12)]
+        #[arg(long, value_enum, default_value_t = Backend::Vulkan)]
         backend: Backend,
-        /// Use a Leonida runtime built with Vulkan and prepared for this title.
+        /// Local SPIR-V pack created by compile-title-shaders.
         #[arg(long, value_name = "DIRECTORY", requires = "execute")]
-        vulkan_runtime: Option<PathBuf>,
+        shader_pack: Option<PathBuf>,
         /// What unimplemented imports do when called.
         #[arg(long, value_enum, default_value_t = Unimplemented::Trap)]
         unimplemented: Unimplemented,
@@ -172,7 +184,6 @@ enum Command {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Backend {
-    D3d12,
     Vulkan,
 }
 
@@ -295,47 +306,33 @@ fn main() -> Result<()> {
         }
         Command::Run {
             exe,
-            backend,
-            vulkan_runtime,
+            backend: Backend::Vulkan,
+            shader_pack,
             unimplemented,
             strict,
             execute,
             console,
             title_args,
         } => {
-            if let Some(runtime) = vulkan_runtime {
-                anyhow::ensure!(
-                    matches!(backend, Backend::Vulkan),
-                    "--vulkan-runtime requires --backend vulkan"
-                );
-                anyhow::ensure!(
-                    !strict,
-                    "--strict applies to Vortex's in-process import resolver"
-                );
+            let _ = title_args;
+            if execute {
                 anyhow::ensure!(
                     matches!(unimplemented, Unimplemented::Trap),
-                    "the Vulkan runtime stops on unimplemented imports"
+                    "execution requires --unimplemented trap"
                 );
-                #[cfg(all(windows, feature = "vulkan"))]
-                return vulkan_title::run(&exe, &runtime, console, &title_args);
-                #[cfg(not(all(windows, feature = "vulkan")))]
-                {
-                    let _ = runtime;
-                    anyhow::bail!("--vulkan-runtime requires Windows and --features vulkan");
-                }
-            }
-            let _ = title_args;
-            if matches!(backend, Backend::Vulkan) {
-                #[cfg(all(windows, feature = "vulkan"))]
+                #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
                 {
                     vortex_hle::modules::d3d12x::enable_native_vulkan();
-                    println!("LIVE_VULKAN_REQUESTED: guest runtime, no host D3D12 fallback");
+                    println!("LIVE_VULKAN_REQUESTED: in-process Vortex runtime");
                 }
-                #[cfg(not(all(windows, feature = "vulkan")))]
-                anyhow::bail!("Live Vulkan requires Windows and --features vulkan");
+                #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc", feature = "vulkan")))]
+                anyhow::bail!("Live Vulkan requires Windows x64 MSVC and --features vulkan");
             }
-            run::run(&exe, unimplemented, strict, execute, console)
+            run::run(&exe, unimplemented, strict, execute, console, shader_pack.as_deref())
         }
+        #[cfg(feature = "vulkan")]
+        Command::CompileTitleShaders { game_dir, work, jobs, wave64_emulate } =>
+            title_shaders::compile(&game_dir, &work, jobs, wave64_emulate),
         Command::Config => show_config(),
     }
 }
