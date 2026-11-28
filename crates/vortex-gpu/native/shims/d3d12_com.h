@@ -512,6 +512,7 @@ public:
     bool enable_capture();
     // See VulkanPresenter::set_abort: polled while a present waits for a swapchain image.
     void set_abort(std::function<bool()> abort);
+    void set_present_observer(std::function<void()> observer);
     // See VulkanPresenter::read_back: false after a present skipped while the window is minimised, too.
     bool read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format);
     VkExtent2D extent() const;

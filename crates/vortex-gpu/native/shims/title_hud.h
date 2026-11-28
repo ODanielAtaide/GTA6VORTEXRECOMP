@@ -1,12 +1,9 @@
 #pragma once
-// LEONIDA_TITLE_HUD=1 shows live counters in the title bar of the window the title presents in:
-//   frame rate and frame time from PresentX (average and worst frame of the last half second), or how long
+// VORTEX_TITLE_HUD=1 shows live counters in the title bar of the Vulkan window:
+//   rate and timing of accepted Vulkan presents (average and worst frame in the last half second), or how long
 //   since the last frame when there was none;
 //   the process's private memory (its commit charge) and working set;
-//   its GPU memory: in use and the budget over the device-local heaps, and in use in the other heaps, from the
-//   device's VK_EXT_memory_budget; without it, DXGI's QueryVideoMemoryInfo (local and non-local segments), which
-//   Wine leaves at 0; "n/a" when neither has a figure. Both memory figures and their text come from
-//   src/memory_figures.h, which the dev overlay (src/dev_overlay.h) shows as well;
+//   its GPU memory usage and budget from VK_EXT_memory_budget; "n/a" when the Vulkan driver has no figures;
 //   graphics and compute pipelines created, and the seconds spent in vkCreate*Pipelines in the last interval,
 //   which is where an inline compile shows up as a hitch (needs LEONIDA_MEM_PROBE, src/mem_probe.h; else "-");
 //   time since the first present.
@@ -14,9 +11,7 @@
 // the present path.
 
 #include <windows.h>
-#include <dxgi1_4.h>
 #include <psapi.h>
-#include <wrl/client.h>
 
 #include <algorithm>
 #include <atomic>
@@ -39,13 +34,12 @@ public:
     static bool enabled() {
         static const bool on = [] {
             char v[2] = {};
-            return GetEnvironmentVariableA("LEONIDA_TITLE_HUD", v, sizeof v) == 1 && v[0] != '0';
+            return GetEnvironmentVariableA("VORTEX_TITLE_HUD", v, sizeof v) == 1 && v[0] != '0';
         }();
         return on;
     }
 
-    // The VRAM figure's source, called once per refresh on the HUD's thread. Empty: the figure the device publishes
-    // (memory_figures::latest_vram). A budget that is not available: DXGI's figures, else "n/a". Tests pass their own.
+    // The VRAM figure's source is called on the HUD thread. By default, use the last Vulkan budget published by the device.
     using VramSource = std::function<leonida::VramBudget()>;
 
     explicit TitleHud(HWND window, VramSource vram = {}) : window_(window), vram_(std::move(vram)) {
@@ -61,7 +55,7 @@ public:
         if (stop_) CloseHandle(stop_);
     }
 
-    // On every successful PresentX.
+    // On every accepted Vulkan present.
     void note_present() {
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
@@ -76,23 +70,10 @@ public:
         presents_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // DXGI's figures as a budget. A local segment with no usage or no budget is how Wine's stub answers (a process
-    // that presents through a GPU always has some memory there), so that is not available rather than a 0.
-    static leonida::VramBudget dxgi_budget(const DXGI_QUERY_VIDEO_MEMORY_INFO& local,
-                                           const DXGI_QUERY_VIDEO_MEMORY_INFO& non_local) {
-        leonida::VramBudget out;
-        out.local_usage = local.CurrentUsage;
-        out.local_budget = local.Budget;
-        out.shared_usage = non_local.CurrentUsage;
-        out.available = local.CurrentUsage != 0 && local.Budget != 0;
-        return out;
-    }
-
 private:
     static constexpr DWORD interval_ms = 500;
 
     void run() {
-        Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter = gpu_adapter();
         std::uint64_t last_presents = 0, last_compile_ns = 0;
         LARGE_INTEGER last;
         QueryPerformanceCounter(&last);
@@ -113,11 +94,6 @@ private:
             namespace mf = leonida::memory_figures;
             const std::wstring memory = widen(mf::ram_text(mf::process_memory()));
             leonida::VramBudget vram = vram_ ? vram_() : mf::latest_vram();
-            DXGI_QUERY_VIDEO_MEMORY_INFO local{}, shared{};
-            if (!vram.available && adapter &&
-                SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
-                SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared)))
-                vram = dxgi_budget(local, shared);
             const std::wstring video = widen(mf::vram_text(vram));
 
             wchar_t pipelines[128] = L"PSO -";
@@ -143,12 +119,12 @@ private:
             wchar_t frame[96];
             const std::int64_t last_present = last_present_.load(std::memory_order_relaxed);
             if (frames || !last_present)
-                std::swprintf(frame, 96, L"%.0f fps %.1f ms (worst %.0f)", fps, frame_ms, worst_ms);
+                std::swprintf(frame, 96, L"%.0f queued/s %.1f ms (worst %.0f)", fps, frame_ms, worst_ms);
             else
-                std::swprintf(frame, 96, L"0 fps, no frame for %.1f s",
+                std::swprintf(frame, 96, L"no Vulkan present for %.1f s",
                               double(now.QuadPart - last_present) / double(frequency_.QuadPart));
             wchar_t text[512];
-            std::swprintf(text, 512, L"Leonida | %ls | %ls | %ls | %ls | %u:%02u", frame, memory.c_str(),
+            std::swprintf(text, 512, L"Vortex Vulkan | %ls | %ls | %ls | %ls | %u:%02u", frame, memory.c_str(),
                           video.c_str(), pipelines, up / 60, up % 60);
             DWORD_PTR ignored = 0;
             SendMessageTimeoutW(window_, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(text), SMTO_ABORTIFHUNG,
@@ -158,29 +134,6 @@ private:
 
     // memory_figures' text is ASCII.
     static std::wstring widen(const std::string& text) { return std::wstring(text.begin(), text.end()); }
-
-    // The hardware adapter with the most dedicated memory: the one LEONIDA_VK_DEVICE picks on a machine with a
-    // discrete GPU. The host's own dxgi.dll, not the title's shim.
-    static Microsoft::WRL::ComPtr<IDXGIAdapter3> gpu_adapter() {
-        using Create = HRESULT(WINAPI*)(REFIID, void**);
-        HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
-        auto create = dxgi ? reinterpret_cast<Create>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
-        Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
-        Microsoft::WRL::ComPtr<IDXGIAdapter3> best;
-        if (!create || FAILED(create(IID_PPV_ARGS(&factory)))) return best;
-        SIZE_T most = 0;
-        Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
-        for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
-            DXGI_ADAPTER_DESC1 desc{};
-            if (FAILED(adapter->GetDesc1(&desc)) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) continue;
-            Microsoft::WRL::ComPtr<IDXGIAdapter3> three;
-            if (desc.DedicatedVideoMemory > most && SUCCEEDED(adapter.As(&three))) {
-                most = desc.DedicatedVideoMemory;
-                best = three;
-            }
-        }
-        return best;
-    }
 
     HWND window_;
     VramSource vram_;

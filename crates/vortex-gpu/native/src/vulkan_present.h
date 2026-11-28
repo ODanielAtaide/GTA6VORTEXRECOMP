@@ -208,6 +208,14 @@ public:
                 std::fprintf(stderr, "[rt] present-probe: source capture on\n");
             }
         }
+        if (const wchar_t* path = _wgetenv(L"VORTEX_BENCHMARK_CSV"); path && *path) {
+            benchmark_.open(std::filesystem::path(path), std::ios::app | std::ios::ate);
+            if (!benchmark_) {
+                std::fprintf(stderr, "[rt] present: could not open VORTEX_BENCHMARK_CSV\n");
+            } else if (benchmark_.tellp() == 0) {
+                benchmark_ << "run_unix_us,output,frame,elapsed_us,interval_us,width,height\n";
+            }
+        }
         ok_ = offscreen_ ? make_offscreen_target() : recreate(true, false);
         if (!ok_ && capture_to_disk_ && !offscreen_) {
             // The surface refused a TRANSFER_SRC swapchain, or the staging buffer could not be made: present
@@ -259,6 +267,10 @@ public:
     }
     VkFormat format() const { return format_; }
     std::uint64_t presented() const { return presented_; }
+    void set_present_observer(std::function<void()> observer) {
+        std::lock_guard lock(present_mutex_);
+        present_observer_ = std::move(observer);
+    }
     // The present mode a tearing present uses (IMMEDIATE, else FIFO_RELAXED) while the current swapchain was created
     // for it, else VK_PRESENT_MODE_MAX_ENUM_KHR: ImmediateThresholdPercent cannot be honoured then.
     VkPresentModeKHR tear_mode() const { return tear_mode_; }
@@ -697,6 +709,7 @@ private:
         ++frame_index_;
         if (offscreen_) {
             ++offscreen_frames_;
+            benchmark_frame("offscreen_submit", offscreen_frames_);
             if (disk_sample) {
                 captured_ = true;
                 captured_extent_ = extent_;
@@ -709,6 +722,8 @@ private:
         // is recreated next time, and the caller sees VK_SUCCESS, since its work was submitted.
         if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
             const auto shown = ++presented_;
+            benchmark_frame("present_queued", shown);
+            if (present_observer_) present_observer_();
             submit_phases::totals().presents.fetch_add(1, std::memory_order_relaxed);  // frames a second, phase line
             submit_phases::totals().present_serial.fetch_add(1, std::memory_order_relaxed);
             if (dump_.due(shown - 1)) {
@@ -1452,6 +1467,28 @@ private:
 
     std::uint64_t output_frames() const { return offscreen_ ? offscreen_frames_ : presented_.load(); }
 
+    void benchmark_frame(const char* output, std::uint64_t frame) {
+        if (!benchmark_.is_open()) return;
+        using Clock = std::chrono::steady_clock;
+        using Micros = std::chrono::microseconds;
+        using std::chrono::duration_cast;
+        const auto now = Clock::now();
+        if (frame == 1) {
+            benchmark_run_ = duration_cast<Micros>(std::chrono::system_clock::now().time_since_epoch()).count();
+            benchmark_start_ = now;
+        }
+        benchmark_ << benchmark_run_ << ',' << output << ',' << frame << ','
+                   << duration_cast<Micros>(now - benchmark_start_).count() << ',';
+        if (frame > 1) benchmark_ << duration_cast<Micros>(now - benchmark_previous_).count();
+        benchmark_ << ',' << extent_.width << ',' << extent_.height << '\n';
+        benchmark_previous_ = now;
+        if (frame % 64 == 1) benchmark_.flush();
+        if (!benchmark_) {
+            std::fprintf(stderr, "[rt] present: could not write VORTEX_BENCHMARK_CSV\n");
+            benchmark_.close();
+        }
+    }
+
     // (Re)creates the capture buffer for the current output extent: host visible, coherent, persistently mapped.
     bool make_capture_buffer() {
         release_capture();
@@ -1890,6 +1927,10 @@ private:
     VkInstance instance_;
     VkPhysicalDevice physical_;
     VkQueue queue_;
+    std::function<void()> present_observer_;
+    std::ofstream benchmark_;
+    std::chrono::steady_clock::time_point benchmark_start_{}, benchmark_previous_{};
+    std::int64_t benchmark_run_ = 0;
     mutable std::recursive_mutex present_mutex_;  // all presenter state: submit(), a deferred present, the accessors
     mutable std::mutex abort_mutex_;               // abort_ alone: set_abort() must work while a present waits
     std::deque<PendingPresent> deferred_;  // presents queued behind held work, in call order

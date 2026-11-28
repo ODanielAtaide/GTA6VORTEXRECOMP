@@ -21731,6 +21731,10 @@ bool WindowPresenter::enable_capture() { return presenter_->enable_capture(); }
 
 void WindowPresenter::set_abort(std::function<bool()> abort) { presenter_->set_abort(std::move(abort)); }
 
+void WindowPresenter::set_present_observer(std::function<void()> observer) {
+    presenter_->set_present_observer(std::move(observer));
+}
+
 bool WindowPresenter::read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format) {
     return presenter_->read_back(pixels, extent, format);
 }

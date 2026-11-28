@@ -2,9 +2,9 @@
 #include "../shims/d3d12_com.h"
 #include "../src/title_va_alias.h"
 
-#include <algorithm>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 
 extern "C" HRESULT vortex_native_gpu_create(const IID*, void**);
 extern "C" void vortex_native_gpu_track_guest_memory(std::uintptr_t, std::size_t, bool);
@@ -31,19 +31,32 @@ int main() {
     if (FAILED(vortex_native_gpu_create(&iid, reinterpret_cast<void**>(&device))) || !device) return 4;
     const auto folder = std::filesystem::temp_directory_path() /
                         ("vortex-vulkan-probe-" + std::to_string(GetCurrentProcessId()));
+    const auto csv = folder / "frames.csv";
+    if (_wputenv_s(L"VORTEX_BENCHMARK_CSV", csv.c_str()) != 0) return 5;
     auto presenter = rt::d3d12::create_window_presenter(device, nullptr, true, folder.string().c_str());
     device->Release();
-    if (!presenter || FAILED(presenter->present_blank(1))) return 5;
+    if (!presenter) return 5;
+    bool notified = false;
+    presenter->set_present_observer([&] { notified = true; });
+    if (FAILED(presenter->present_blank(1)) || notified) return 5;
     std::vector<std::uint8_t> pixels;
     VkExtent2D extent{};
     VkFormat format{};
     const bool copied = presenter->read_back(pixels, &extent, &format);
     const bool no_presents = presenter->presented() == 0;
     presenter.reset();
+    std::ifstream benchmark(csv);
+    std::string header, row;
+    std::getline(benchmark, header);
+    std::getline(benchmark, row);
+    benchmark.close();
+    const bool logged = header == "run_unix_us,output,frame,elapsed_us,interval_us,width,height" &&
+                        row.find(",offscreen_submit,1,0,,1280,720") != std::string::npos;
+    std::filesystem::remove(csv);
     std::filesystem::remove(folder / "frame_00001.ppm");
     std::filesystem::remove(folder / "index.txt");
     std::filesystem::remove(folder);
-    if (!copied || !no_presents || format != VK_FORMAT_B8G8R8A8_UNORM || !extent.width || !extent.height ||
+    if (!logged || !copied || !no_presents || format != VK_FORMAT_B8G8R8A8_UNORM || !extent.width || !extent.height ||
         pixels.size() != static_cast<std::size_t>(extent.width) * extent.height * 4) return 6;
     for (std::size_t i = 0; i < pixels.size(); i += 4)
         if (pixels[i] || pixels[i + 1] || pixels[i + 2] || pixels[i + 3] != 255) return 7;

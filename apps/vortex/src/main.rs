@@ -3,6 +3,7 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+mod benchmark;
 mod census;
 mod inspect;
 mod run;
@@ -99,6 +100,8 @@ enum Command {
         #[arg(long)]
         wave64_emulate: bool,
     },
+    /// Summarize a Vortex frame timing CSV.
+    Benchmark { samples: PathBuf },
     /// Verify the shared Vulkan host library from the main executable.
     #[cfg(feature = "vulkan")]
     VulkanCheck {
@@ -208,6 +211,7 @@ fn main() -> Result<()> {
         #[cfg(feature = "vulkan")]
         Command::VulkanPrecompile { game_dir, workers, validate, refresh, code_only } =>
             precompile::run(&game_dir, workers, validate, refresh, code_only),
+        Command::Benchmark { samples } => benchmark::summarize(&samples),
         #[cfg(feature = "vulkan")]
         Command::VulkanCheck { bindless_shader, async_check } => {
             let mut host = vortex_vulkan::Context::new()

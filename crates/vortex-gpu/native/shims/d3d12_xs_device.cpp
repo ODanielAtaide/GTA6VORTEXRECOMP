@@ -1769,7 +1769,7 @@ struct PresentState {
     }
     HWND window = nullptr;  // the runtime's own fallback window, when the title has no window to present in
     std::unique_ptr<rt::d3d12::XboxPresentation> xbox;
-    std::unique_ptr<TitleHud> hud;  // LEONIDA_TITLE_HUD: counters in the window's title bar (title_hud.h)
+    std::shared_ptr<TitleHud> hud;
 };
 
 void destroy_present_state(void* present_state) {
@@ -1928,6 +1928,12 @@ PresentState* present_state_for(DeviceProxy* device, bool splash_only = false) {
     // source: with a pacer-owned one every PresentX after the first wait is refused with E_INVALIDARG (#7496, #7685).
     // With LEONIDA_FRAME_PACING=1 the pacer also answers a zero-timeout origin wait with the newest passed origin
     // (current_origin_poll), as the tree that paced these slots was measured; otherwise it is the pacer as it was.
+    if (!offscreen && TitleHud::enabled()) {
+        state->hud = std::make_shared<TitleHud>(target);
+        presenter->set_present_observer([weak = std::weak_ptr<TitleHud>(state->hud)] {
+            if (const auto hud = weak.lock()) hud->note_present();
+        });
+    }
     state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), nullptr, device->frame_tokens,
                                                                 frame_pacing_enabled());
     // The title registers its interval and origin event before the first PresentX builds this.
@@ -1943,7 +1949,6 @@ PresentState* present_state_for(DeviceProxy* device, bool splash_only = false) {
         std::fprintf(stderr, "[rt] d3d12_xs: frame interval %u us replayed (0x%08lx), origin event (0x%08lx)\n",
                      interval, static_cast<unsigned long>(set), static_cast<unsigned long>(armed));
     }
-    if (!offscreen && TitleHud::enabled()) state->hud = std::make_unique<TitleHud>(target);
     if (splash_only) device->present_state = pending.release();
     if (offscreen) {
         std::fprintf(stderr, "[rt] d3d12_xs: PresentX routed to offscreen Vulkan capture\n");
@@ -1970,7 +1975,6 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
     const HRESULT result = state->xbox->PresentX(
         static_cast<UINT>(plane_count), reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
         reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params));
-    if (SUCCEEDED(result) && state->hud) state->hud->note_present();
     return hr_to_u64(result);
 }
 

@@ -50,6 +50,20 @@ and check the source-only publication policy with cargo xtask policy.
 The in-tree graphics probe can also be built by setting
 VORTEX_NATIVE_GRAPHICS_TESTS=ON in the native CMake project and run with CTest.
 
+## Frame timing
+
+Set VORTEX_BENCHMARK_CSV to a path to append timing samples. Each row has a
+run identifier, a monotonic elapsed time and interval in microseconds, and
+the Vulkan output extent. The app records separate output classes for an
+accepted window present and an offscreen submission. Neither field measures
+display scanout, and capture diagnostics are not a gameplay benchmark.
+Run vortex benchmark with the CSV path to summarize each run with its average,
+minimum, 1% low and 0.1% low event rates.
+
+Set VORTEX_TITLE_HUD=1 to display accepted Vulkan presents, host memory,
+Vulkan VRAM budget and available pipeline creation counts in the window
+title bar. VRAM is unavailable when the driver does not report a budget.
+
 ## Local runtime evidence
 
 On the Radeon RX 6600 XT with AMD driver 26.11.2, the Vortex executable loaded
@@ -69,7 +83,8 @@ modules. On-screen presentation remains pending because the Win32 surface
 query returned VK_ERROR_UNKNOWN on this system, including in vulkaninfo.
 One other run stopped with an access violation on a title CMPXCHG16B that
 received an address aligned to eight bytes. That case remains unresolved.
-Gameplay, the performance overlay and 30 FPS remain unverified.
+The game reached its Terms of Service confirmation with readable text.
+Gameplay, the in-game performance overlay and 30 FPS remain unverified.
 
 ## Components and provenance
 
