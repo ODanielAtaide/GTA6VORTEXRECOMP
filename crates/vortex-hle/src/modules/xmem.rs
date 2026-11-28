@@ -61,6 +61,8 @@ const PAGES_64K: u32 = PAGES_2M | PAGES_64K_BIT;
 /// adds GPU access bits (0x800-0x40000). Write-combining and uncached are
 /// dropped too: our GPU side reads this memory through the CPU.
 const HOST_PROTECTION: u32 = 0x1ff;
+#[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+const GPU_PROTECTION: u32 = 0x0007_f800;
 /// XMem flags of memory both processors reach: all of ours.
 const GRAPHICS: u64 = 3;
 /// XMem flag bit of 32-bit graphics memory.
@@ -101,6 +103,8 @@ pub extern "system" fn XMemVirtualAlloc(
             0
         },
     };
+    #[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+    let gpu_only = protect & GPU_PROTECTION != 0 && protect & HOST_PROTECTION == PAGE_NOACCESS;
     let mut protect = match protect & HOST_PROTECTION {
         0 => PAGE_NOACCESS,
         p => p,
@@ -157,6 +161,9 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && vortex_gpu::vulkan_live::enabled() {
         let watched = kind & (MEM_RESERVE | MEM_WRITE_WATCH) == (MEM_RESERVE | MEM_WRITE_WATCH);
         vortex_gpu::native_device::track_guest_memory(at as usize, size, watched);
+        if kind & (MEM_RESERVE | MEM_COMMIT) == MEM_RESERVE {
+            vortex_gpu::native_device::note_guest_reservation(at as usize, size, gpu_only);
+        }
     }
     if base.is_null() {
         tracing::debug!(
@@ -553,6 +560,43 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     Some(runs)
 }
 
+/// Reports a completed storage write at every active title view of the same section pages.
+#[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+pub(super) fn note_physical_write(pages: &[usize], offset: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let Some(runs) = runs(pages, offset, len) else {
+        return;
+    };
+    let mut written = 0;
+    let mut within = offset % PAGE;
+    let memory = physical();
+    let mut ranges = Vec::new();
+    for (slice, n) in runs {
+        let bytes = (n * PAGE - within).min(len - written);
+        let start = slice.index * PAGE + within;
+        let end = start + bytes;
+        for (&base, (size, view)) in &memory.views {
+            if !Arc::ptr_eq(&view.section, &slice.section) {
+                continue;
+            }
+            let view_start = view.index * PAGE;
+            let first = start.max(view_start);
+            let last = end.min(view_start + size);
+            if first < last {
+                ranges.push((base + first - view_start, last - first));
+            }
+        }
+        written += bytes;
+        within = 0;
+    }
+    drop(memory);
+    for (base, bytes) in ranges {
+        vortex_gpu::native_device::note_texel_write(base, bytes);
+    }
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
@@ -727,10 +771,15 @@ pub(super) extern "C" fn gpu_copy_pages(to: *mut c_void, from: *const c_void, pa
     if bytes == 0 || to == from && !repeat {
         return true;
     }
-    if repeat && from != 0 {
-        return (0..pages).all(|i| map_alias(to + i * page, from, page));
+    let mapped = if repeat && from != 0 {
+        (0..pages).all(|i| map_alias(to + i * page, from, page))
+    } else {
+        from.checked_add(bytes).is_some() && map_alias(to, from, bytes)
+    };
+    if mapped && from != 0 {
+        vortex_gpu::native_device::note_gpu_mappings(to as usize, bytes as usize);
     }
-    from.checked_add(bytes).is_some() && map_alias(to, from, bytes)
+    mapped
 }
 
 #[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]

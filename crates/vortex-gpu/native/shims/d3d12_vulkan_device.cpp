@@ -3245,14 +3245,8 @@ struct DeviceState {
     std::mutex title_write_back_mutex;  // its own: taken under shadow_mutex, never the other way round
     std::map<std::uint64_t, std::uint64_t> title_write_back;  // start -> end, of the submission about to run
     std::deque<std::pair<std::uint64_t, std::map<std::uint64_t, std::uint64_t>>> title_write_back_pending;  // by ticket
-    std::uint64_t title_write_back_refused = 0;               // ranges past the caps, logged once
-    std::uint64_t title_write_back_bytes = 0;                 // queued for this submission
     std::uint64_t title_write_back_total = 0;                 // copied back, all submissions
     std::uint64_t title_write_back_calls = 0;                 // log line count
-    std::uint64_t title_write_back_unfenced = 0;
-    static constexpr std::size_t kTitleWriteBackBatches = 64; // pending batches before the oldest goes back unfenced
-    static constexpr std::size_t kTitleWriteBackRanges = 8192;         // ranges kept per submission
-    static constexpr std::uint64_t kTitleWriteBackBytes = 64ull << 20; // bytes copied back per submission
     // The stream pools' mappings (title_gpu_views): one per readable run of a pool. A window is kept for the device's
     // life; a geometry copy goes when its view is retired (the pages were freed, unmapped or remapped:
     // drain_geometry_releases), and the next request for those pages makes a new one.
@@ -3472,31 +3466,23 @@ struct DeviceState {
             return getenv_s(&length, value, sizeof(value), "LEONIDA_TITLE_WRITEBACK") != 0 || value[0] != '0';
         }();
         if (!on || !va || !bytes) return;
-        std::uint64_t lo = 0, hi = 0;
-        if (!leonida::title_va_aliases().title_memory(va, lo, hi) || va >= hi) return;
-        const std::uint64_t end = va + std::min(bytes, hi - va);
+        // Only bytes in the GPU copy can have changed. An unresolved descriptor
+        // or a binding spanning a large reservation cannot claim that reservation.
+        std::uint64_t shader = 0, available = 0;
+        if (!leonida::title_va_aliases().range_of(va, shader, available)) return;
+        const std::uint64_t span = std::min(bytes, available);
+        va = leonida::title_gpu_views::to_cpu(va, span);
+        auto end = va + span;
         std::lock_guard lock(title_write_back_mutex);
         auto it = title_write_back.lower_bound(va);
-        if (it != title_write_back.begin()) {
-            auto previous = std::prev(it);
-            if (previous->second >= va) {
-                if (previous->second < end) previous->second = end;
-                return;
-            }
+        if (it != title_write_back.begin() && std::prev(it)->second >= va)
+            --it;
+        while (it != title_write_back.end() && it->first <= end) {
+            va = std::min(va, it->first);
+            end = std::max(end, it->second);
+            it = title_write_back.erase(it);
         }
-        if (it != title_write_back.end() && it->first <= end) {
-            it->second = std::max(it->second, end);
-            return;
-        }
-        if (title_write_back.size() >= kTitleWriteBackRanges || title_write_back_bytes >= kTitleWriteBackBytes) {
-            if (!title_write_back_refused++)
-                log_once("past LEONIDA_TITLE_WRITEBACK's caps: reached ranges are not copied back this submission; "
-                         "ranges refused:",
-                         1);
-            return;
-        }
-        title_write_back_bytes += end - va;
-        title_write_back.emplace(va, end);
+        title_write_back.emplace_hint(it, va, end);
     }
 
     // What the GPU wrote into those copies goes back to the title's pages, so a later read by the title or the next
@@ -3515,22 +3501,12 @@ struct DeviceState {
                 title_write_back_pending.push_back({context->submitted_retire_ticket() + 1,
                                                     std::move(title_write_back)});
                 title_write_back.clear();
-                title_write_back_bytes = 0;
             }
-            bool forced = false;
-            while (!title_write_back_pending.empty() &&
-                   (title_write_back_pending.front().first <= done ||
-                    title_write_back_pending.size() > kTitleWriteBackBatches)) {
-                forced = forced || title_write_back_pending.front().first > done;
+            while (!title_write_back_pending.empty() && title_write_back_pending.front().first <= done) {
                 for (const auto& [begin, end] : title_write_back_pending.front().second)
                     finished.push_back({begin, end});
                 title_write_back_pending.pop_front();
             }
-            // A queue held deep (console ordering) can leave batches waiting: the oldest go back anyway, once each.
-            if (forced && !title_write_back_unfenced++)
-                log_once("more than 64 title write-back batches wait on their submissions: the oldest are copied "
-                         "back without their ticket; batches:",
-                         1);
         }
         if (finished.empty()) return;
         std::uint64_t written = 0, ranges = 0;

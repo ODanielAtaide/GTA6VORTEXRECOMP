@@ -87,7 +87,22 @@ extern "C" void vortex_native_gpu_track_guest_memory(std::uintptr_t base, std::s
 extern "C" void vortex_native_gpu_release_guest_memory(std::uintptr_t base) {
     leonida::title_write_watch::remove(base);
     leonida::title_va_aliases().remove_title_memory(base);
+    leonida::title_gpu_views::forget_reservation(base);
     leonida::title_memory_map::changed();
+}
+
+extern "C" void vortex_native_gpu_note_guest_reservation(std::uintptr_t base, std::size_t bytes, bool gpu_only) {
+    if (!base || !bytes || bytes > UINTPTR_MAX - base) return;
+    if (leonida::title_gpu_views::note_reservation(base, bytes, gpu_only))
+        std::fprintf(stderr, "[rt] xmem: paired GPU reservation %p with CPU reservation %p (%zu MiB)\n",
+                     reinterpret_cast<void*>(base),
+                     reinterpret_cast<void*>(leonida::title_gpu_views::other_view(base)), bytes >> 20);
+}
+
+extern "C" void vortex_native_gpu_note_gpu_mappings(std::uintptr_t base, std::size_t bytes) {
+    if (!base || !bytes || bytes > UINTPTR_MAX - base) return;
+    for (const auto& [begin, end] : leonida::title_gpu_views::note_gpu_mappings(base, base + bytes))
+        leonida::title_va_aliases().forget_guest_copies(begin, end);
 }
 
 extern "C" void vortex_native_gpu_remap_guest_memory(std::uintptr_t base, std::size_t bytes) {
@@ -95,6 +110,7 @@ extern "C" void vortex_native_gpu_remap_guest_memory(std::uintptr_t base, std::s
     leonida::title_memory_map::changed(base, base + bytes);
     leonida::title_write_watch::mark(base, base + bytes);
     leonida::geometry_writes::notify(base, base + bytes, leonida::geometry_writes::Event::replaced);
+    leonida::title_texel_writes::note(reinterpret_cast<const void*>(base), bytes);
 }
 
 extern "C" std::uint64_t vortex_native_gpu_begin_host_write(std::uintptr_t base, std::size_t size,
@@ -111,6 +127,11 @@ extern "C" void vortex_native_gpu_note_texture_layout(std::uint32_t dimension, s
                                                         std::uint64_t width, std::uint32_t height,
                                                         std::uint32_t depth, std::uint32_t mips, std::uint32_t layout) {
     leonida::title_xg_layouts::note({dimension, format, height, depth, mips, width}, layout);
+}
+
+extern "C" void vortex_native_gpu_note_texel_write(std::uintptr_t base, std::size_t bytes) {
+    if (bytes <= UINTPTR_MAX - base)
+        leonida::title_texel_writes::note(reinterpret_cast<const void*>(base), bytes);
 }
 
 extern "C" void vortex_native_gpu_save_cache() {

@@ -85,6 +85,17 @@ public:
         count_.store(ranges_.size(), std::memory_order_release);
     }
 
+    // A GPU reservation acquired physical pages of its own. A copy
+    // provisionally built from its CPU peer no longer answers there.
+    void forget_guest_copies(std::uint64_t begin, std::uint64_t end) {
+        std::unique_lock lock(mutex_);
+        const auto before = ranges_.size();
+        erase_overlapping(begin, end);
+        if (ranges_.size() == before) return;
+        count_.store(ranges_.size(), std::memory_order_release);
+        generation_.fetch_add(1, std::memory_order_release);
+    }
+
     // A copy that answered for [title_va, title_va + bytes) at shader_va went, whether or not it had a range here (a
     // geometry copy that vsharp_address or a placed view reached through GeometryViews directly has none): what was
     // translated through it is stale. Told as a removal is: the console heaps fix the slots that resolved through

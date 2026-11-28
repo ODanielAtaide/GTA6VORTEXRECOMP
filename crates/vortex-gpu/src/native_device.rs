@@ -22,9 +22,12 @@ unsafe extern "C" {
     fn vortex_native_gpu_save_cache();
     fn vortex_native_gpu_track_guest_memory(base: usize, bytes: usize, watched: bool);
     fn vortex_native_gpu_release_guest_memory(base: usize);
+    fn vortex_native_gpu_note_guest_reservation(base: usize, bytes: usize, gpu_only: bool);
+    fn vortex_native_gpu_note_gpu_mappings(base: usize, bytes: usize);
     fn vortex_native_gpu_remap_guest_memory(base: usize, bytes: usize);
     fn vortex_native_gpu_begin_host_write(base: usize, bytes: usize, request: *const c_void) -> u64;
     fn vortex_native_gpu_end_host_write(pin: u64, pending: bool);
+    fn vortex_native_gpu_note_texel_write(base: usize, bytes: usize);
     fn vortex_native_gpu_note_texture_layout(
         dimension: u32, format: u32, width: u64, height: u32, depth: u32, mips: u32, layout: u32,
     );
@@ -68,6 +71,16 @@ pub fn release_guest_memory(base: usize) {
     unsafe { vortex_native_gpu_release_guest_memory(base) };
 }
 
+pub fn note_guest_reservation(base: usize, bytes: usize, gpu_only: bool) {
+    // SAFETY: only address metadata crosses the bridge.
+    unsafe { vortex_native_gpu_note_guest_reservation(base, bytes, gpu_only) };
+}
+
+pub fn note_gpu_mappings(base: usize, bytes: usize) {
+    // SAFETY: only address metadata crosses the bridge.
+    unsafe { vortex_native_gpu_note_gpu_mappings(base, bytes) };
+}
+
 pub fn remap_guest_memory(base: usize, bytes: usize) {
     // SAFETY: the renderer receives only an address-range notification.
     unsafe { vortex_native_gpu_remap_guest_memory(base, bytes) };
@@ -85,6 +98,11 @@ pub unsafe fn begin_host_write(base: usize, bytes: usize, request: *const c_void
 pub fn end_host_write(pin: u64, pending: bool) {
     // SAFETY: this releases or transfers a pin created by begin_host_write.
     unsafe { vortex_native_gpu_end_host_write(pin, pending) };
+}
+
+pub fn note_texel_write(base: usize, bytes: usize) {
+    // SAFETY: the renderer records the dirty address span without accessing it here.
+    unsafe { vortex_native_gpu_note_texel_write(base, bytes) };
 }
 
 pub fn note_texture_layout(

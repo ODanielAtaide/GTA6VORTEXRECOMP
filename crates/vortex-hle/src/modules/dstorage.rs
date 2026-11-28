@@ -951,7 +951,21 @@ fn into_destination(
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first.
-        vortex_gpu::kernel_will_write(request.destination as usize, len);
+        let address = request.destination as usize;
+        #[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+        if vortex_gpu::vulkan_live::enabled() {
+            use vortex_gpu::native_device;
+            // SAFETY: this request owns its destination throughout this synchronous fill.
+            let pin = unsafe { native_device::begin_host_write(address, len, std::ptr::null()) };
+            let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
+            let result = fill(out);
+            native_device::end_host_write(pin, false);
+            if let Ok(bytes) = result {
+                native_device::note_texel_write(address, bytes);
+            }
+            return result.map(drop);
+        }
+        vortex_gpu::kernel_will_write(address, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
@@ -969,11 +983,20 @@ fn into_destination(
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        let _bytes = fill(window.bytes())?;
+        #[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+        if vortex_gpu::vulkan_live::enabled() {
+            super::xmem::note_physical_write(pages, offset, _bytes);
+        }
+        return Ok(());
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
+        #[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+        if vortex_gpu::vulkan_live::enabled() {
+            super::xmem::note_physical_write(pages, offset, n);
+        }
         Ok(())
     } else {
         // Said aloud: Grand Theft Auto VI never reads a request's result

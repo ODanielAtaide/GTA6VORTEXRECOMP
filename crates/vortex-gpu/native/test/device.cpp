@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "../shims/d3d12_com.h"
 #include "../src/title_va_alias.h"
+#include "../src/title_page_watch.h"
 
 #include <cstdio>
 #include <filesystem>
@@ -24,6 +25,16 @@ int main() {
     VirtualFree(memory, 0, MEM_RELEASE);
     vortex_native_gpu_release_guest_memory(base);
     if (!tracked || ranges.title_memory(base, first, last)) return 2;
+
+    namespace views = leonida::title_gpu_views;
+    constexpr std::uintptr_t cpu = 0x20000000, gpu = 0x30000000;
+    if (views::note_reservation(cpu, bytes, false) || !views::note_reservation(gpu, bytes, true) ||
+        views::to_cpu(gpu + 32) != cpu + 32 || views::other_view(cpu + 32) != gpu + 32) return 9;
+    views::note_gpu_mappings(gpu + 4096, gpu + 8192);
+    if (views::to_cpu(gpu + 32) != gpu + 32 || views::other_view(cpu + 32) ||
+        views::to_host_view(gpu + 32) != gpu + 32 || !views::independently_mapped(gpu + 32, 16)) return 10;
+    vortex_native_gpu_release_guest_memory(cpu);
+    if (views::count() || views::independently_mapped(gpu + 32, 16)) return 11;
 
     if (vortex_native_gpu_create(nullptr, nullptr) != E_POINTER) return 3;
     const IID iid = __uuidof(ID3D12Device);

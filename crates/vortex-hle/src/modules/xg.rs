@@ -416,6 +416,10 @@ extern "system" fn copy_into(
     if r.is_err() {
         tracing::warn!(?r, desc = ?c.desc, subresource, "copy into a texture failed");
     }
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+    if r.is_ok() && vortex_gpu::vulkan_live::enabled() {
+        vortex_gpu::native_device::note_texel_write(tiled.as_ptr() as usize, tiled.len());
+    }
     result(r)
 }
 

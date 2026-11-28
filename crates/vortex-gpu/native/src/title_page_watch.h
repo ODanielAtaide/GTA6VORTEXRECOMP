@@ -271,6 +271,30 @@ inline bool note_reservation(std::uintptr_t base, std::uintptr_t size, bool gpu_
     return true;
 }
 
+// Both reservations must remain live for either address to retain its alias.
+inline void forget_reservation(std::uintptr_t base) {
+    State& s = state();
+    std::unique_lock lock(s.mutex);
+    if (s.last_cpu == base) s.last_cpu = s.last_cpu_size = 0;
+    std::erase_if(s.views, [&](const View& v) { return v.gpu == base || v.cpu == base; });
+    s.count.store(s.views.size(), std::memory_order_release);
+}
+
+// Physical page copies made by the graphics queue at a GPU reservation
+// establish GPU-side backing there. Do not import the CPU view for it.
+inline auto note_gpu_mappings(std::uintptr_t begin, std::uintptr_t end) {
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> changed;
+    State& s = state();
+    if (!s.count.load(std::memory_order_acquire)) return changed;
+    std::unique_lock lock(s.mutex);
+    for (View& v : s.views) {
+        if (v.independent_pages || begin >= v.gpu + v.size || end <= v.gpu) continue;
+        v.independent_pages = true;
+        changed.emplace_back(v.gpu, v.gpu + v.size);
+    }
+    return changed;
+}
+
 // Both addresses of every pair, as [start, end) ranges (LEONIDA_CONSOLE_HEAP_GPU's ask table); `count()` changes
 // with them.
 inline void spans(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) {
@@ -344,12 +368,13 @@ inline bool view_at(std::uintptr_t va, std::uintptr_t bytes, Range& out) {
 }
 
 // The other address of memory in a paired range: the CPU view's address for a GPU-only one and the GPU-only
-// address for a CPU view's; 0 outside every pair.
-inline std::uintptr_t other_view(std::uintptr_t va) {
+// address for a CPU view's. Independent backing has no address alias.
+inline std::uintptr_t other_view(std::uintptr_t va, bool include_independent = false) {
     State& s = state();
     if (!s.count.load(std::memory_order_acquire)) return 0;
     std::shared_lock lock(s.mutex);
     for (const View& v : s.views) {
+        if (v.independent_pages && !include_independent) continue;
         if (va >= v.gpu && va - v.gpu < v.size) return va - v.gpu + v.cpu;
         if (va >= v.cpu && va - v.cpu < v.size) return va - v.cpu + v.gpu;
     }
@@ -363,7 +388,7 @@ inline std::uintptr_t other_view(std::uintptr_t va) {
 // the CPU view has no committed page and the GPU-only one has (queue slot 31 maps the frames at the alias).
 inline std::uintptr_t to_host_view(std::uintptr_t va, std::uintptr_t bytes = 1) {
     Range range{};
-    if (!view_at(va, bytes, range)) return va;
+    if (!view_at(va, bytes, range) || range.independent_pages) return va;
     const auto offset = va >= range.gpu && va - range.gpu < range.size ? va - range.gpu : va - range.cpu;
     const auto cpu = range.cpu + offset, gpu = range.gpu + offset;
     const auto readable = [](std::uintptr_t address) {

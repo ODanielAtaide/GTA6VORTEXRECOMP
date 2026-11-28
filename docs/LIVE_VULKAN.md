@@ -83,8 +83,14 @@ modules. On-screen presentation remains pending because the Win32 surface
 query returned VK_ERROR_UNKNOWN on this system, including in vulkaninfo.
 One other run stopped with an access violation on a title CMPXCHG16B that
 received an address aligned to eight bytes. That case remains unresolved.
-The game reached its Terms of Service confirmation with readable text.
-Gameplay, the in-game performance overlay and 30 FPS remain unverified.
+The title rendered the Terms of Service and accepted the confirmation through
+its Xbox input path. In a later launch, after the storage writes and texture
+dirty notifications were connected, the title displayed the story-loading
+artwork and the storage log recorded successful reads and BCPack decoding
+while the graphics queue remapped pages. That run ended on a guest access
+violation while following a noncanonical pointer. The captures and game
+files remain local. Gameplay, the in-game performance overlay and 30 FPS
+remain unverified.
 
 ## Components and provenance
 
@@ -93,6 +99,10 @@ Gameplay, the in-game performance overlay and 30 FPS remain unverified.
 - `vortex-gpu/native` contains the statically linked Vulkan implementation, including Xbox PSO slots,
   resource and descriptor handling, command replay and multi-plane presentation. Its ABI bridges to
   Vortex's allocator, page mapping, guest module registry and private root-signature encoder.
+  The graphics device distinguishes GPU reservations backed by their CPU peer
+  from GPU reservations mapped by the graphics queue. It receives dirty
+  notifications for title texture copies and storage writes to mapped physical pages.
+  GPU shadow writes become visible to the title after the Vulkan submission retires.
 - `vortex-shader/native` contains the offline package shader compiler used by the Vulkan device.
   Its tool sources are distinct from the smaller Rust ISA coverage and differential tests.
 - Rendering and compiler source lineage and licenses are in [Upstream credits](UPSTREAM_CREDITS.md).
