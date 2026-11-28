@@ -5,7 +5,9 @@
 #include "../src/gfx10_descriptors.h"
 #include "../src/descriptor_table.h"
 
+#include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 
@@ -15,6 +17,66 @@ extern "C" void vortex_native_gpu_release_guest_memory(std::uintptr_t);
 
 static_assert(leonida::gfx10::format_from_vulkan(VK_FORMAT_D16_UNORM_S8_UINT) == 7);
 static_assert(leonida::gfx10::vulkan_view_format(VK_FORMAT_D16_UNORM_S8_UINT, 7) == VK_FORMAT_D16_UNORM_S8_UINT);
+
+namespace {
+PFN_vkGetInstanceProcAddr driver_instance_proc = nullptr;
+PFN_vkGetDeviceProcAddr driver_device_proc = nullptr;
+std::atomic<bool> reject_allocation{false};
+std::atomic<unsigned> rejected_allocations{0};
+
+VKAPI_ATTR VkResult VKAPI_CALL allocate_memory(VkDevice device, const VkMemoryAllocateInfo* info,
+                                               const VkAllocationCallbacks* callbacks, VkDeviceMemory* memory) {
+    if (reject_allocation) {
+        ++rejected_allocations;
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
+    const auto allocate = reinterpret_cast<PFN_vkAllocateMemory>(driver_device_proc(device, "vkAllocateMemory"));
+    return allocate(device, info, callbacks, memory);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL device_proc(VkDevice device, const char* name) {
+    if (std::strcmp(name, "vkAllocateMemory") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(&allocate_memory);
+    return driver_device_proc(device, name);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL instance_proc(VkInstance instance, const char* name) {
+    if (std::strcmp(name, "vkGetDeviceProcAddr") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(&device_proc);
+    return driver_instance_proc(instance, name);
+}
+
+bool check_upload(ID3D12Device* device) {
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    heap.CreationNodeMask = heap.VisibleNodeMask = 1;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = 800 * 1024;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    const auto state = static_cast<D3D12_RESOURCE_STATES>(
+        D3D12_RESOURCE_STATE_GENERIC_READ & ~D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    ID3D12Resource* upload = nullptr;
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state,
+                                               nullptr, IID_PPV_ARGS(&upload))) || !upload)
+        return false;
+    void* bytes = nullptr;
+    const D3D12_RANGE no_reads{0, 0};
+    const bool mapped = SUCCEEDED(upload->Map(0, &no_reads, &bytes)) && bytes;
+    const bool correct = mapped && upload->GetGPUVirtualAddress() && upload->GetDesc().Width == desc.Width;
+    if (mapped) {
+        static_cast<unsigned char*>(bytes)[desc.Width - 1] = 0x5a;
+        const D3D12_RANGE written{static_cast<SIZE_T>(desc.Width - 1), static_cast<SIZE_T>(desc.Width)};
+        upload->Unmap(0, &written);
+    }
+    upload->Release();
+    return correct;
+}
+}  // namespace
 
 int main() {
     using namespace leonida;
@@ -74,6 +136,24 @@ int main() {
     void* placement = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!placement) return 12;
     const auto methods = *reinterpret_cast<void* const* const*>(device);
+    if (!check_upload(device)) return 14;
+    // Borrow the real AMD/other Vulkan device, then fail only the dedicated allocation
+    // after the test device has set up its arena. The returned range must still map.
+    const auto* baseline = rt::d3d12::vulkan_device_info(device);
+    if (!baseline) return 15;
+    auto fault_info = *baseline;
+    driver_instance_proc = fault_info.get_instance_proc;
+    driver_device_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+        driver_instance_proc(fault_info.instance, "vkGetDeviceProcAddr"));
+    if (!driver_device_proc) return 15;
+    fault_info.get_instance_proc = instance_proc;
+    ID3D12Device* fault_device = nullptr;
+    if (FAILED(rt::d3d12::create_vulkan_device(fault_info, IID_PPV_ARGS(&fault_device)))) return 15;
+    reject_allocation = true;
+    const bool recovered = check_upload(fault_device);
+    reject_allocation = false;
+    fault_device->Release();
+    if (!recovered || !rejected_allocations) return 15;
     using Place = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, std::uint64_t, const D3D12_RESOURCE_DESC*,
                                               std::uint32_t, const D3D12_CLEAR_VALUE*, const IID*, void**);
     const auto place = reinterpret_cast<Place>(methods[133]); // Xbox CreatePlacedResourceX

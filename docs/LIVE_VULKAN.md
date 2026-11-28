@@ -103,9 +103,14 @@ local. A follow-up with a 1024 MiB arena confirmed the Radeon allocated that are
 from host memory and still hit the texture allocation limit. It also recorded a
 descriptor table of 4,194,304 slots for approximately 30,000 keys in the older
 FNV-1a pack. Small eligible render and depth targets now share Vulkan allocations
-with streamed textures, and new shader packs use the mixed hash.
-Gameplay, the in-game performance overlay and 30 FPS
-remain unverified.
+with streamed textures, and new shader packs use the mixed hash. The warm
+cache run reached FidelityFX's Xbox root signatures and created compute
+pipelines before staging timed out and the title's FidelityFX library raised
+an exception from its committed upload call. The native device probe now
+forces the dedicated Vulkan allocation of an upload buffer to fail and checks
+that the buffer can still be created and mapped from an existing coherent
+Vulkan memory range.
+Gameplay, the in-game performance overlay and 30 FPS remain unverified.
 
 ## Components and provenance
 

@@ -8621,6 +8621,27 @@ public:
     // Default-heap buffers are ranges of the GPU address arena: console VA = offset, zeroed through the arena's host
     // mapping. Upload and readback buffers keep their own host memory; with buffer device addresses their console
     // VA is their device address minus heap_base, so a shader's heap_base + VA still lands on them (section 3.3).
+    HRESULT recover_committed_upload() {
+        // A private upload buffer can use the existing coherent mapping when the driver cannot
+        // allocate a dedicated buffer. Keep shared heaps and the padded tail of unaligned buffers
+        // on the dedicated path, since their backing has different requirements.
+        if (heap_.Type != D3D12_HEAP_TYPE_UPLOAD || heap_flags_ != D3D12_HEAP_FLAG_NONE ||
+            desc_.Width % sizeof(std::uint32_t) || !device_.arena.mapped ||
+            !device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+                                    arena_offset_, DeviceState::arena_buffer))
+            return E_OUTOFMEMORY;
+
+        // The failed attempt was never published to the resource table or a command list.
+        auto& vk = device_.context->vk;
+        if (buffer_) vk.vkDestroyBuffer(device_.info.device, std::exchange(buffer_, VK_NULL_HANDLE), nullptr);
+        if (memory_) vk.vkFreeMemory(device_.info.device, std::exchange(memory_, VK_NULL_HANDLE), nullptr);
+        in_arena_ = true;
+        va_ = arena_offset_;
+        memory_flags_ = device_.memory.memoryTypes[device_.arena.memory_type].propertyFlags;
+        log_once("committed upload recovered in the mapped Vulkan arena, size in KiB:", int(desc_.Width / 1024));
+        return create_placed_buffer({});
+    }
+
     HRESULT create_buffer(D3D12_RESOURCE_STATES initial_state = D3D12_RESOURCE_STATE_COMMON) {
         auto& vk = device_.context->vk;
         // A buffer has at least one byte, and its size must survive alignment to 64 KiB without wrapping.
@@ -8701,7 +8722,12 @@ public:
                           VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
         }
         device_.share(info);
-        if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
+        const VkResult created = vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_);
+        if (created != VK_SUCCESS) {
+            if (created == VK_ERROR_OUT_OF_HOST_MEMORY || created == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+                return recover_committed_upload();
+            return E_OUTOFMEMORY;
+        }
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
         // Readback buffers prefer cached memory, which the CPU reads quickly. Upload buffers prefer VRAM the CPU
@@ -8717,8 +8743,13 @@ public:
                                           host_preferred, &memory_flags_, addressable || need_bda)
                        : device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_,
                                           addressable || need_bda);
-        if (!memory_ || vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS)
+        if (!memory_) return recover_committed_upload();
+        const VkResult bound = vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0);
+        if (bound != VK_SUCCESS) {
+            if (bound == VK_ERROR_OUT_OF_HOST_MEMORY || bound == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+                return recover_committed_upload();
             return E_OUTOFMEMORY;
+        }
         if (addressable) {
             VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             address.buffer = buffer_;
@@ -8727,8 +8758,13 @@ public:
             device_.log_va(host ? name : "default buffer", va_, desc_.Width);
         }
         if (host) {
-            if (vk.vkMapMemory(device_.info.device, memory_, 0, VK_WHOLE_SIZE, 0, &mapped_) != VK_SUCCESS)
+            const VkResult mapped = vk.vkMapMemory(device_.info.device, memory_, 0, VK_WHOLE_SIZE, 0, &mapped_);
+            if (mapped != VK_SUCCESS) {
+                if (mapped == VK_ERROR_OUT_OF_HOST_MEMORY || mapped == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
+                    mapped == VK_ERROR_MEMORY_MAP_FAILED)
+                    return recover_committed_upload();
                 return E_OUTOFMEMORY;
+            }
             std::memset(mapped_, 0, std::size_t(info.size));  // committed resources and private padding start zeroed
         }
         if (need_bda && vk.vkGetBufferDeviceAddress) {
@@ -20718,8 +20754,16 @@ private:
                      int(desc->Dimension));
             return finish(E_INVALIDARG);
         }
-        return finish(create_committed(heap, heap_flags, desc, state, castable_count, castable, riid, out,
-                                       storage_heap_flags, origin));
+        const HRESULT result = create_committed(heap, heap_flags, desc, state, castable_count, castable, riid, out,
+                                                storage_heap_flags, origin);
+        if (FAILED(result) && heap->Type == D3D12_HEAP_TYPE_UPLOAD &&
+            desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            static std::atomic<unsigned> reports{0};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
+                std::fprintf(stderr, "[rt] vulkan: committed upload of %llu bytes failed, HRESULT 0x%08x\n",
+                             static_cast<unsigned long long>(desc->Width), static_cast<unsigned>(result));
+        }
+        return finish(result);
     }
 
     // Shared by CreateCommittedResource, CreateCommittedResource3 and CreateReservedResource*. A castable-format list
