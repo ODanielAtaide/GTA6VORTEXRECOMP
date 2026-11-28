@@ -84,6 +84,8 @@ struct RootParameter {
     uint32_t descriptor_space = 0;
     // Descriptor table:
     std::vector<DescriptorRange> ranges;
+    // Original D3D12_ROOT_PARAMETER_TYPE for a root descriptor (CBV, SRV or UAV).
+    uint32_t descriptor_type = 2;
 };
 
 struct RootSignature {

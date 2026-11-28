@@ -15118,27 +15118,33 @@ public:
         features.partially_bound = state_.info.bindless_partially_bound;
         features.null_descriptor = state_.info.null_descriptor;
         // The descriptor-table hash kind every shader of this device probes with, chosen once here, before the table's
-        // first key: each loaded module's index.json meta may say `descriptor_hash` (descriptor_table.h), and when the
-        // library mixes kinds the majority wins; LEONIDA_DESCRIPTOR_HASH overrides. The module index is read here
-        // rather than at the first pipeline so the choice is fixed before any descriptor can be registered.
+        // first key. Every loaded module must probe with the same hash, which its index.json records.
+        // Choosing the majority would make another shader read the wrong slots in the table.
         leonida::DescriptorHashCensus hash_modules{};
         leonida::DescriptorHashKind descriptor_hash = leonida::DescriptorHashKind::fnv1a;
         if (const leonida::ShaderLibrary* library = state_.library()) {
             hash_modules = library->descriptor_hash_census();
             descriptor_hash = library->descriptor_hash_kind();
         }
+        if (hash_modules.fnv1a_fmix32 && hash_modules.fnv1a) {
+            std::fprintf(stderr, "[rt] d3d12: incompatible descriptor hashes in the shader pack: %zu mixed-hash "
+                                 "and %zu legacy-hash modules. Build one complete pack.\n",
+                         hash_modules.fnv1a_fmix32, hash_modules.fnv1a);
+            return false;
+        }
         leonida::DescriptorHashKind override_kind = descriptor_hash;
         if (leonida::descriptor_hash_kind_from_env(std::getenv("LEONIDA_DESCRIPTOR_HASH"), &override_kind)) {
+            if (hash_modules.total() && override_kind != descriptor_hash) {
+                std::fprintf(stderr, "[rt] d3d12: descriptor hash override conflicts with the shader pack.\n");
+                return false;
+            }
             std::fprintf(stderr,
                          "[rt] d3d12: descriptor hash: %s (LEONIDA_DESCRIPTOR_HASH; %zu fnv1a_fmix32 / %zu fnv1a "
                          "modules)\n",
                          leonida::descriptor_hash_kind_name(override_kind), hash_modules.fnv1a_fmix32,
                          hash_modules.fnv1a);
             descriptor_hash = override_kind;
-        } else if (hash_modules.fnv1a_fmix32 && hash_modules.fnv1a) {
-            std::fprintf(stderr, "[rt] d3d12: descriptor hash: %zu fnv1a_fmix32 / %zu fnv1a modules; using %s\n",
-                         hash_modules.fnv1a_fmix32, hash_modules.fnv1a,
-                         leonida::descriptor_hash_kind_name(descriptor_hash));
+
         } else {
             std::fprintf(stderr, "[rt] d3d12: descriptor hash: %s (all %zu modules)\n",
                          leonida::descriptor_hash_kind_name(descriptor_hash), hash_modules.total());
@@ -15161,14 +15167,10 @@ public:
                          leonida::descriptor_table_layout_name(override_table), table_modules.tagged,
                          table_modules.plain);
             descriptor_table = override_table;
-            // Under a plain table a tagged module reads no kind at all, so every image an instruction reads through
-            // another dimension's array takes that array's fallback. That is what the override asks for; say so.
-            if (override_table == leonida::DescriptorTableLayout::plain && table_modules.tagged)
-                std::fprintf(stderr,
-                             "[rt] d3d12: LEONIDA_DESCRIPTOR_TABLE forces the plain descriptor table while %zu "
-                             "module(s) read the kind word; their image lookups through another dimension's array "
-                             "take the fallback\n",
-                             table_modules.tagged);
+            if (override_table == leonida::DescriptorTableLayout::plain && table_modules.tagged) {
+                std::fprintf(stderr, "[rt] d3d12: the shader pack needs descriptor kind records in its table.\n");
+                return false;
+            }
         } else if (table_modules.tagged && table_modules.plain) {
             std::fprintf(stderr, "[rt] d3d12: descriptor table: %zu tagged / %zu plain modules; using %s\n",
                          table_modules.tagged, table_modules.plain,
@@ -15281,8 +15283,8 @@ public:
             // Under tracker_mutex_ (held from here to the submit) no other ExecuteCommandLists has recorded work that
             // is not yet submitted, so every submission that can have bound the set being replaced has a ticket up to
             // the one read here.
-            // A generation that cannot be made (VRAM full) does not fail the submission: the set frees what completed
-            // and retries, rewrites the table in place when nothing runs, or keeps the previous table (vulkan_bindless.h).
+            // Flush first tries retiring finished generations and updating the table in place.
+            // The guest batch can only run once its descriptor table reflects its keys.
             auto& set = *state_.bindless;
             const std::uint64_t host_fallbacks = set.table_host_fallbacks();
             const bool flushed = set.flush(command_buffer, context.submitted_retire_ticket(),
@@ -15310,10 +15312,11 @@ public:
                 const std::uint64_t n = set.degraded_flushes();
                 if ((n & (n - 1)) == 0)
                     std::fprintf(stderr, "[rt] d3d12: bindless table generation not made (%s: %d), %llu times: the "
-                                         "batch runs with the previous table, keys added since read the fallback "
+                                         "guest batch was refused because its descriptor table could not be updated "
                                          "(%s)\n",
                                  set.last_failure() ? set.last_failure() : "?", int(set.last_failure_result()),
                                  static_cast<unsigned long long>(n), table_state().c_str());
+                return false;
             }
             return flushed;
         });
@@ -15623,7 +15626,9 @@ public:
         if (owned_.instance) owned_.destroy_instance(owned_.instance, nullptr);
     }
 
-    bool ok() const { return state_.context && state_.context->loaded(); }
+    bool ok() const {
+        return state_.context && state_.context->loaded() && (!state_.info.bindless || state_.bindless);
+    }
     // gta6rt --precompile-pipelines builds against the device's own state (precompile_compute_pipelines).
     DeviceState& build_state() { return state_; }
     const VulkanDeviceInfo& info() const { return state_.info; }

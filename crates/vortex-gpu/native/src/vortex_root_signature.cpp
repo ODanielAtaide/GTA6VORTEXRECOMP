@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "vortex_root_signature.h"
 
+#include <algorithm>
 #include <bit>
+#include <new>
 #include <cstring>
 #include <span>
 #include <utility>
@@ -85,6 +87,7 @@ DecodeResult decode_vortex_root(const uint8_t* data, size_t size) {
             break;
         default:
             param.type = ParamType::Descriptor;
+            param.descriptor_type = type;
             param.descriptor_register = word(parameter, 2);
             param.descriptor_space = word(parameter, 3);
             break;
@@ -110,3 +113,50 @@ DecodeResult decode_vortex_root(const uint8_t* data, size_t size) {
     return result;
 }
 }  // namespace rt::rootsig
+
+// The unversioned guest interface returns a 1.0 description. Keep the
+// original serialized blob for device-side pipeline layout and flags.
+extern "C" size_t vortex_native_gpu_decode_legacy_root(const uint8_t* bytes, size_t size,
+                                                        uint32_t* out, size_t capacity) {
+    if (!bytes || size > 4 * 1048576) return 0;
+    using rt::rootsig::ParamType;
+    try {
+        const auto decoded = rt::rootsig::decode_vortex_root(bytes, size);
+        if (!decoded.ok) return 0;
+        const auto& root = decoded.sig;
+        std::vector<uint32_t> fields{0x31535256, 1, root.flags, uint32_t(root.params.size()),
+                                     uint32_t(root.static_samplers.size())};
+        for (const auto& p : root.params) {
+            const auto stage = static_cast<uint32_t>(p.visibility);
+            switch (p.type) {
+            case ParamType::Table:
+                fields.insert(fields.end(), {0, stage, uint32_t(p.ranges.size()), 0, 0});
+                for (const auto& r : p.ranges)
+                    fields.insert(fields.end(), {r.range_type, r.num_descriptors, r.base_shader_register,
+                                                 r.register_space, r.offset_in_table});
+                break;
+            case ParamType::Constants:
+                fields.insert(fields.end(), {1, stage, p.shader_register, p.register_space, p.num_values});
+                break;
+            case ParamType::Descriptor:
+                fields.insert(fields.end(), {p.descriptor_type, stage, p.descriptor_register, p.descriptor_space, 0});
+                break;
+            }
+        }
+        for (const auto& s : root.static_samplers) {
+            // Legacy samplers cannot represent unsigned borders or unnormalized coordinates.
+            if (s.flags) return 0;
+            fields.insert(fields.end(), {s.filter, s.address_u, s.address_v, s.address_w,
+                                         std::bit_cast<uint32_t>(s.mip_lod_bias), s.max_anisotropy,
+                                         s.comparison_func, s.border_color, std::bit_cast<uint32_t>(s.min_lod),
+                                         std::bit_cast<uint32_t>(s.max_lod), s.shader_register, s.register_space,
+                                         static_cast<uint32_t>(s.visibility)});
+        }
+        if (!out) return fields.size();
+        if (fields.size() > capacity) return 0;
+        std::copy(fields.begin(), fields.end(), out);
+        return fields.size();
+    } catch (const std::bad_alloc&) {
+        return 0;
+    }
+}

@@ -154,10 +154,9 @@ pub extern "system" fn serialize_versioned(
 type Deserialize =
     unsafe extern "system" fn(*const u8, usize, *const Iid, *mut *mut c_void) -> HRESULT;
 
-/// `d3d12_xs!D3D12CreateRootSignatureDeserializer`: our blobs are the
-/// host's serialization, so the host's deserializer reads them, and its
-/// object (IUnknown, then the description getter) is laid out as the
-/// console's. Grand Theft Auto VI's upscaler asks with the PC interface id.
+/// `d3d12_xs!D3D12CreateRootSignatureDeserializer` returns the console-compatible
+/// IUnknown and description getter. The live Vulkan device decodes both
+/// Vortex's private format and the title's serialized RTS0 chunks in-process.
 pub extern "system" fn create_deserializer(
     blob: *const u8,
     size: usize,

@@ -30,6 +30,8 @@ The application does not emit DXIL in this path. The driver cache is stored unde
 SHA-256 fingerprint and checks the translator fingerprint and settings before reusing translated files.
 New packs mix the full descriptor hash before indexing the Vulkan table. The mode is recorded in each
 module and applied consistently across the title, compute libraries and executable shaders.
+Vortex rejects packs with incompatible descriptor hash modes and refuses a guest submission when
+its descriptor table cannot be updated after Vulkan retries the allocation.
 
 ## Validate the Vulkan output
 
@@ -113,6 +115,9 @@ remain unverified.
   from GPU reservations mapped by the graphics queue. It receives dirty
   notifications for title texture copies and storage writes to mapped physical pages.
   GPU shadow writes become visible to the title after the Vulkan submission retires.
+  The guest root signature deserializer reads DXBC/RTS0 through the same
+  native layout decoder used for pipeline creation. The unversioned interface
+  exposes a version 1.0 description while the Vulkan pipeline retains the original metadata.
   The Xbox resource path backs writable 32-bit depth with a separate Vulkan
   color image and synchronizes it on transitions. The sampled depth aspect of
   a 16-bit depth and stencil image retains its normalized GFX10 format.

@@ -95,9 +95,8 @@ fn decode(bytes:&[u8])->R<Vec<u32>>{
 }
 pub(super) fn inspect(bytes:&[u8])->R<()>{
     if bytes.starts_with(b"DXBC"){
-        // Keep externally supplied standard blobs opaque until RTS0 decoding
-        // is implemented. They are not usable as translated pipeline layouts.
-        tracing::debug!("external root signature retained, RTS0 lowering pending");
+        // The in-process graphics device decodes RTS0 from the original blob.
+        tracing::debug!("external root signature retained for Vulkan pipeline layout");
         return Ok(());
     }
     let w=decode(bytes)?;
@@ -136,8 +135,8 @@ pub(super) fn serialize(desc:Desc,version:u32,out:*mut *mut c_void,error:*mut *m
         }
     }
 }
-// The unversioned legacy deserializer is supported only for private 1.0
-// metadata. A 1.1/1.2 downgrade would discard resource/sampler flags.
+// The unversioned deserializer owns a 1.0 ABI description. The original
+// serialized root used by the graphics device can have newer metadata.
 #[repr(C)]
 struct Parameter{kind:u32,_padding:u32,payload:[u64;2],visibility:u32,_padding2:u32}
 const _:()=assert!(std::mem::size_of::<Parameter>()==32);
@@ -167,12 +166,48 @@ fn restore(words:&[u32])->R<Box<Deserialized>>{
         sampler_count:words[4],samplers:if samplers.is_empty(){std::ptr::null()}else{samplers.as_ptr().cast()},flags:words[2]};
     Ok(Box::new(Deserialized{object:Object::new(&DES_TABLE),desc,_params:params,_ranges:ranges,_samplers:samplers}))
 }
+#[cfg(all(target_arch = "x86_64", target_env = "msvc"))]
+fn legacy_words(source: &[u32]) -> R<Vec<u32>> {
+    unsafe extern "C" {
+        fn vortex_native_gpu_decode_legacy_root(
+            data: *const u8, bytes: usize, out: *mut u32, capacity: usize,
+        ) -> usize;
+    }
+    let data = source.as_ptr().cast();
+    let bytes = std::mem::size_of_val(source);
+    // SAFETY: source is a length-checked copy. Null output asks for the size.
+    let count = unsafe { vortex_native_gpu_decode_legacy_root(data, bytes, std::ptr::null_mut(), 0) };
+    if count == 0 || count > LIMIT {
+        return Err("invalid or unrepresentable serialized root signature");
+    }
+    let mut words = vec![0; count];
+    // SAFETY: both arrays are live and the output has exactly count words.
+    let copied = unsafe { vortex_native_gpu_decode_legacy_root(data, bytes, words.as_mut_ptr(), count) };
+    if copied != count {
+        return Err("serialized root signature could not be converted");
+    }
+    Ok(words)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_env = "msvc")))]
+fn legacy_words(_: &[u32]) -> R<Vec<u32>> {
+    Err("the native root decoder needs Windows x64 MSVC")
+}
+
 pub(super) fn deserialize(data:*const u8,size:usize,iid:*const Iid,out:*mut *mut c_void)->HRESULT{
     if out.is_null(){return E_POINTER;}
     unsafe{out.write(std::ptr::null_mut());}
     if data.is_null()||size%4!=0||size/4>LIMIT{return E_INVALIDARG;}
     if !object::is(iid,&[UNKNOWN,DESERIALIZER]){return E_NOINTERFACE;}
-    let result=guest_words(data as usize,size/4).and_then(|w|restore(&w));
+    let result = guest_words(data as usize, size / 4).and_then(|words| {
+        if words.starts_with(&[MAGIC, 1]) {
+            return restore(&words);
+        }
+        let result = restore(&legacy_words(&words)?)?;
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| tracing::info!("serialized root signature decoded through the native layout parser"));
+        Ok(result)
+    });
     match result{
         Ok(value)=>{let p=Box::into_raw(value).cast::<Object>();object::add_ref(p);unsafe{out.write(p.cast());}S_OK}
         Err(e)=>{tracing::error!(reason=e,"native root deserialization unsupported");E_NOTIMPL}
@@ -195,6 +230,37 @@ mod tests{
         assert!(validate(&w[..w.len()-1]).is_err());
         let mut bad=w.clone();bad.push(0);assert!(validate(&bad).is_err());
     }
+    #[cfg(all(target_arch = "x86_64", target_env = "msvc"))]
+    #[test]
+    fn serialized_rts0_returns_legacy_descriptor_layout() {
+        let payload = [
+            2, 2, 24, 0, 0, 0x02000001, // 1.1, parameters and Xbox flags
+            0, 5, 48, 4, 0, 80,       // pixel table and root UAV
+            1, 56,                     // one range at byte 56
+            1, 12, 4, 3, 4, u32::MAX, // UAV range with version 1.1 flags
+            8, 2, 4,                   // root UAV register, space and flags
+        ];
+        let mut container = vec![
+            u32::from_le_bytes(*b"DXBC"), 0, 0, 0, 0, 1,
+            (11 + payload.len() as u32) * 4, 1, 36,
+            u32::from_le_bytes(*b"RTS0"), std::mem::size_of_val(&payload) as u32,
+        ];
+        container.extend_from_slice(&payload);
+        let mut output = std::ptr::null_mut();
+        let size = std::mem::size_of_val(container.as_slice());
+        assert_eq!(deserialize(container.as_ptr().cast(), size, &DESERIALIZER, &mut output), S_OK);
+        let this = output.cast();
+        // SAFETY: the successful COM call owns an instance until the release below.
+        let desc = unsafe { *des_desc(this) };
+        assert_eq!(encode(desc, 1).unwrap(), [
+            MAGIC, 1, 0x02000001, 2, 0,
+            0, 5, 1, 0, 0, 1, 12, 4, 3, u32::MAX,
+            4, 0, 8, 2, 0,
+        ]);
+        assert_eq!(des_release(this), 0);
+        assert!(legacy_words(&container[..container.len() - 1]).is_err());
+    }
+
     #[test]fn versioned_descriptor_flags_preserved(){
         let ranges=[1u32,5,7,2,4,0xffff_ffff];
         let p=Parameter{kind:0,_padding:0,payload:[1,ranges.as_ptr() as u64],visibility:0,_padding2:0};
