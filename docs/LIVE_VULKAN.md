@@ -40,7 +40,10 @@ VORTEX_CAPTURE_OFFSCREEN to an absolute directory outside the repository. The sa
 Vulkan composition and blit paths then target a device-local image, copied to
 binary PPM files after the Vulkan completion fence. This mode reports zero
 window presents. Use VORTEX_CAPTURE_EVERY (default 30) and VORTEX_CAPTURE_LIMIT
-(default 24) to control disk output.
+(default 24) to control disk output. In a diagnostics build, set
+VORTEX_KEYS_FILE to an empty text file for one run. Append one key per line
+to feed that run's existing diagnostic GameInput device, using names such
+as Enter, Back, Up or Down.
 
 Run Rust regression tests with cargo test --workspace --release --locked
 and check the source-only publication policy with cargo xtask policy.

@@ -1209,20 +1209,7 @@ mod host {
             let list = std::env::var("VORTEX_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
+                let vk = scripted_virtual_key(key)?;
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
                     vk,
@@ -1235,7 +1222,88 @@ mod host {
         keys.iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
+            .chain(live_key())
             .collect()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn scripted_virtual_key(key: &str) -> Option<u8> {
+        Some(match key.trim() {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        })
+    }
+
+    // For headless checks, append one key per line to VORTEX_KEYS_FILE.
+    // Poll only when configured. Individual keys have a release interval,
+    // so two consecutive lines for the same button still produce two presses.
+    #[cfg(feature = "diagnostics")]
+    fn live_key() -> Option<u8> {
+        use std::collections::VecDeque;
+        use std::io::Read;
+
+        struct LiveKeys {
+            path: std::path::PathBuf,
+            next_poll: Instant,
+            lines_seen: usize,
+            queue: VecDeque<u8>,
+            current: Option<(Instant, u8)>,
+        }
+
+        static INPUT: LazyLock<Option<Mutex<LiveKeys>>> = LazyLock::new(|| {
+            let path = std::env::var_os("VORTEX_KEYS_FILE")?;
+            if path.is_empty() {
+                return None;
+            }
+            Some(Mutex::new(LiveKeys {
+                path: path.into(),
+                next_poll: Instant::now(),
+                lines_seen: 0,
+                queue: VecDeque::new(),
+                current: None,
+            }))
+        });
+        let mut input = INPUT.as_ref()?.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if now >= input.next_poll {
+            input.next_poll = now + Duration::from_millis(250);
+            let mut text = String::new();
+            if let Ok(file) = std::fs::File::open(&input.path)
+                && file.take(65_537).read_to_string(&mut text).is_ok()
+                && text.len() <= 65_536
+            {
+                for line in text.split_inclusive('\n').skip(input.lines_seen) {
+                    if !line.ends_with('\n') {
+                        break;
+                    }
+                    input.lines_seen += 1;
+                    if let Some(key) = scripted_virtual_key(line) {
+                        input.queue.push_back(key);
+                    }
+                }
+            }
+        }
+        if let Some((started, key)) = input.current {
+            let age = now.saturating_duration_since(started);
+            if age < Duration::from_millis(400) {
+                return (age < Duration::from_millis(300)).then_some(key);
+            }
+        }
+        input.current = input.queue.pop_front().map(|key| {
+            tracing::info!(virtual_key = key, "Vortex diagnostic input pulse");
+            (now, key)
+        });
+        input.current.map(|(_, key)| key)
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
