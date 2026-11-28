@@ -20,11 +20,14 @@ SDK and links the graphics component into Vortex. A source checkout is used for 
 ```powershell
 cargo build -p vortex --release --locked --features diagnostics
 .\target\release\vortex.exe compile-title-shaders --game-dir $game --work $work --jobs 4
+.\target\release\vortex.exe precompile-vulkan-pipelines --shader-pack (Join-Path $work 'shaders/spirv') --jobs 4
 .\target\release\vortex.exe run $exe --console series-s --execute --shader-pack (Join-Path $work 'shaders/spirv')
 ```
 
 Keep the title, shader outputs, caches and captures outside the repository. The offline compiler reads the
 user's package, extracts RDNA2 from console shader containers, uses the AMDGPU disassembler and emits SPIR-V.
+Pipeline precompilation uses the same Vulkan device, compute build path and journal
+as a live title dispatch. Use `--filter` and `--limit` to warm a specific group.
 The application does not emit DXIL in this path. The driver cache is stored under
 `<VORTEX_CACHE_DIR>/vulkan-pipelines`. The work directory binds its cache to the package shader archive's
 SHA-256 fingerprint and checks the translator fingerprint and settings before reusing translated files.

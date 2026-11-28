@@ -22897,6 +22897,11 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
         }
         jobs.push_back({entry, bytes});
     }
+    if (!options.dry_run && jobs.empty()) {
+        std::fprintf(stderr, "[precompile] no buildable compute pipelines match the selection (%zu unsupported).\n",
+                     not_buildable);
+        return 2;
+    }
     std::stable_sort(jobs.begin(), jobs.end(), [&](const Job& a, const Job& b) {
         return options.smallest_first ? a.bytes < b.bytes : a.bytes > b.bytes;
     });
@@ -22989,7 +22994,7 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
                  compiled + hits, compiled, hits, journaled, elsewhere, failed, listed_left_out, listed,
                  options.skip_listed ? " (--skip-listed)" : "", not_buildable, filtered,
                  std::chrono::duration<double>(Clock::now() - began).count());
-    return failed ? 2 : 0;
+    return failed || not_buildable ? 2 : 0;
 }
 
 // What a compute pipeline's journal name depends on besides its module: a name remembered for a module is good for

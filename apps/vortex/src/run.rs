@@ -4,6 +4,35 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+fn native_paths(cfg: &vortex_core::Config, shader_pack: Option<&Path>) -> Result<()> {
+    let default;
+    let pack = match shader_pack {
+        Some(pack) => pack,
+        None => {
+            default = cfg.cache_subdir("native-shaders/shaders/spirv")?;
+            &default
+        }
+    };
+    vortex_core::ensure_outside_repo(pack)?;
+    anyhow::ensure!(pack.join("index.json").is_file(),
+        "shader pack missing at {}. Run compile-title-shaders and pass --shader-pack", pack.display());
+    vortex_hle::modules::d3d12x::use_native_paths(
+        &std::path::absolute(pack)?,
+        &std::path::absolute(cfg.cache_subdir("vulkan-pipelines")?)?,
+    )?;
+    Ok(())
+}
+
+#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+pub fn precompile_vulkan(shader_pack: Option<&Path>, jobs: u32, limit: usize, filter: Option<&str>) -> Result<()> {
+    native_paths(&vortex_core::Config::load()?, shader_pack)?;
+    let filter = filter.map(std::ffi::CString::new).transpose()?;
+    let status = vortex_hle::modules::d3d12x::precompile_native_compute(jobs, limit, filter.as_deref());
+    anyhow::ensure!(status == 0, "Vulkan pipeline precompilation failed with status {status}");
+    Ok(())
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -21,19 +50,9 @@ pub fn run(
     vortex_hle::modules::lifecycle::wait_for_previous();
     let cfg = vortex_core::Config::load()?;
     vortex_core::ensure_outside_repo(exe)?;
+    #[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
     if execute {
-        #[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
-        {
-            let default = cfg.cache_subdir("native-shaders/shaders/spirv")?;
-            let pack = shader_pack.unwrap_or(&default);
-            vortex_core::ensure_outside_repo(pack)?;
-            anyhow::ensure!(pack.join("index.json").is_file(),
-                "shader pack missing at {}. Run compile-title-shaders and pass --shader-pack", pack.display());
-            vortex_hle::modules::d3d12x::use_native_paths(
-                &std::path::absolute(pack)?,
-                &std::path::absolute(cfg.cache_subdir("vulkan-pipelines")?)?,
-            )?;
-        }
+        native_paths(&cfg, shader_pack)?;
     }
     #[cfg(not(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan")))]
     let _ = shader_pack;

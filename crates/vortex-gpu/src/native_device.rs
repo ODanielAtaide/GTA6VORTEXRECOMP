@@ -20,6 +20,7 @@ unsafe extern "C" {
     fn vortex_native_gpu_create(iid: *const Iid, out: *mut This) -> HRESULT;
     fn vortex_native_gpu_paths(shaders: *const u16, pipelines: *const u16) -> bool;
     fn vortex_native_gpu_save_cache();
+    fn vortex_native_gpu_precompile_compute(jobs: u32, limit: usize, filter: *const std::ffi::c_char) -> i32;
     fn vortex_native_gpu_track_guest_memory(base: usize, bytes: usize, watched: bool);
     fn vortex_native_gpu_release_guest_memory(base: usize);
     fn vortex_native_gpu_note_guest_reservation(base: usize, bytes: usize, gpu_only: bool);
@@ -110,6 +111,12 @@ pub fn note_texture_layout(
 ) {
     // SAFETY: the renderer receives a validated shape and swizzle word by value.
     unsafe { vortex_native_gpu_note_texture_layout(dimension, format, width, height, depth, mips, layout) };
+}
+
+pub fn precompile_compute(jobs: u32, limit: usize, filter: Option<&std::ffi::CStr>) -> i32 {
+    let filter = filter.map_or(std::ptr::null(), std::ffi::CStr::as_ptr);
+    // SAFETY: a non-null filter remains a live C string for the call.
+    unsafe { vortex_native_gpu_precompile_compute(jobs, limit, filter) }
 }
 
 pub fn save_cache() {

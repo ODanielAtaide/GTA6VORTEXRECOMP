@@ -100,6 +100,20 @@ enum Command {
         #[arg(long)]
         wave64_emulate: bool,
     },
+    /// Precompile compute pipelines into the native Vulkan cache without launching the title.
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+    PrecompileVulkanPipelines {
+        #[arg(long)]
+        shader_pack: Option<PathBuf>,
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=16))]
+        jobs: u32,
+        /// Limit the number of pipelines built. Zero builds every selected pipeline.
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+        /// Only build entries whose names contain this text.
+        #[arg(long)]
+        filter: Option<String>,
+    },
     /// Summarize a Vortex frame timing CSV.
     Benchmark { samples: PathBuf },
     /// Verify the shared Vulkan host library from the main executable.
@@ -301,6 +315,9 @@ fn main() -> Result<()> {
         #[cfg(feature = "vulkan")]
         Command::CompileTitleShaders { game_dir, work, jobs, wave64_emulate } =>
             title_shaders::compile(&game_dir, &work, jobs, wave64_emulate),
+        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+        Command::PrecompileVulkanPipelines { shader_pack, jobs, limit, filter } =>
+            run::precompile_vulkan(shader_pack.as_deref(), jobs, limit, filter.as_deref()),
         Command::Config => show_config(),
     }
 }

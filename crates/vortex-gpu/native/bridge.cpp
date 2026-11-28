@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "shims/d3d12_com.h"
 #include "shims/d3d12_compile_exit.h"
+#include "shims/d3d12_precompile.h"
 #include "shims/d3d12_xs_device.h"
 #include "shims/shims.h"
 #include "shims/xmem.h"
@@ -11,6 +12,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <vector>
 
 namespace {
@@ -132,6 +134,21 @@ extern "C" void vortex_native_gpu_note_texture_layout(std::uint32_t dimension, s
 extern "C" void vortex_native_gpu_note_texel_write(std::uintptr_t base, std::size_t bytes) {
     if (bytes <= UINTPTR_MAX - base)
         leonida::title_texel_writes::note(reinterpret_cast<const void*>(base), bytes);
+}
+
+extern "C" int vortex_native_gpu_precompile_compute(unsigned jobs, std::size_t limit, const char* filter) {
+    if (!jobs || jobs > 16) return 1;
+    try {
+        rt::d3d12::PrecompileOptions options;
+        options.threads = jobs;
+        options.big_threads = 1;
+        options.limit = limit;
+        if (filter && *filter) options.filters.emplace_back(filter);
+        return rt::d3d12::precompile_compute_pipelines(options);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[precompile] %s\n", error.what());
+        return 1;
+    }
 }
 
 extern "C" void vortex_native_gpu_save_cache() {

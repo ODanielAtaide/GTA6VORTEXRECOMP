@@ -68,6 +68,11 @@ pub fn use_native_paths(shaders: &std::path::Path, pipelines: &std::path::Path) 
     vortex_gpu::native_device::use_paths(shaders, pipelines)
 }
 
+#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+pub fn precompile_native_compute(jobs: u32, limit: usize, filter: Option<&std::ffi::CStr>) -> i32 {
+    vortex_gpu::native_device::precompile_compute(jobs, limit, filter)
+}
+
 pub fn use_shader_cache(dir: std::path::PathBuf) {
     #[cfg(all(windows,feature = "vulkan"))]
     if vortex_gpu::vulkan_live::enabled(){return;}
