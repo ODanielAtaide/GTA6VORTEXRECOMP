@@ -15259,8 +15259,8 @@ public:
                      features.counts[b::sampled_binding(leonida::ImageDimension::dim_3d)],
                      features.counts[b::sampled_binding(leonida::ImageDimension::dim_1d)],
                      features.counts[b::storage_binding(leonida::ImageDimension::dim_2d, 0)]);
-        std::fprintf(stderr, "[rt] d3d12: bindless table policy: spare generations, host-memory fallback, a degraded "
-                             "flush instead of a refused submission\n");
+        std::fprintf(stderr, "[rt] d3d12: bindless table policy: reuse retired generations, try host memory, "
+                             "refuse submissions whose descriptors cannot be updated\n");
         // D3D12 promises a shader holds a full shader-visible sampler heap. Past this many distinct S#s, CreateSampler
         // logs that the array is full and a shader reads the fallback (clamping) sampler.
         if (features.counts[b::sampler_binding] < D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE + 1)
@@ -22708,6 +22708,24 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     // Optional: VK_EXT_memory_budget gives the GPU memory in use and the budget (vulkan_vram_budget, the title HUD).
     info.memory_budget = has_device_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     if (info.memory_budget) device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    // AMD's Windows driver can apply the OS memory policy to allocations above the local
+    // heap size. Keep it an explicit streaming diagnostic until measured with the title.
+    VkDeviceMemoryOverallocationCreateInfoAMD overallocate{VK_STRUCTURE_TYPE_DEVICE_MEMORY_OVERALLOCATION_CREATE_INFO_AMD};
+    char overcommit_setting[2]{};
+    const bool overcommit_requested =
+        GetEnvironmentVariableA("VORTEX_VK_ALLOW_OVERALLOCATION", overcommit_setting, sizeof(overcommit_setting)) == 1 &&
+        overcommit_setting[0] == '1';
+    const bool overcommit_enabled = overcommit_requested &&
+        has_device_extension(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME);
+    if (overcommit_enabled) {
+        device_extensions.push_back(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME);
+        overallocate.overallocationBehavior = VK_MEMORY_OVERALLOCATION_BEHAVIOR_ALLOWED_AMD;
+        overallocate.pNext = device_info.pNext;
+        device_info.pNext = &overallocate;
+    }
+    if (overcommit_requested)
+        std::fprintf(stderr, "[rt] vulkan: AMD heap overallocation %s\n",
+                     overcommit_enabled ? "requested from the driver" : "extension unavailable");
     leonida::DeviceFaultFeatures fault_features;
     const bool aftermath = leonida::aftermath::enable();  // already on, before the instance: see above
     char device_fault[2]{};

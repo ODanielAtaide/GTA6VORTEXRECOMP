@@ -40,7 +40,10 @@ its descriptor table cannot be updated after Vulkan retries the allocation.
 
 When the Windows session has an active display, launch with the command above.
 The renderer logs the first surface or swapchain error. The Vulkan SDK's
-vulkaninfo can independently check Win32 surface support.
+vulkaninfo can independently check Win32 surface support. For an AMD memory
+pressure diagnostic, `VORTEX_VK_ALLOW_OVERALLOCATION=1` asks the driver to
+permit overallocation where the platform allows it. Allocation errors still
+propagate through the renderer.
 
 For diagnostics on a machine without an output, explicitly set
 VORTEX_CAPTURE_OFFSCREEN to an absolute directory outside the repository. The same
