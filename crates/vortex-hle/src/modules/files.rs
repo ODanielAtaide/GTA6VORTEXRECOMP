@@ -528,18 +528,39 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
+    let host_read = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32);
+    #[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+    if vortex_gpu::vulkan_live::enabled() {
+        use vortex_gpu::native_device;
+        use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, SetLastError};
+        // SAFETY: ReadFile's buffer and OVERLAPPED belong to the guest's I/O request.
+        let pin = unsafe { native_device::begin_host_write(buffer as usize, len as usize, overlapped) };
+        let result = host_read(file, buffer, len, read, overlapped);
+        // SAFETY: preserve the calling thread's Win32 error across the pin update.
+        let error = unsafe { GetLastError() };
+        native_device::end_host_write(pin, result == 0 && error == ERROR_IO_PENDING);
+        unsafe { SetLastError(error) };
+        return result;
+    }
     vortex_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
-        file, buffer, len, read, overlapped,
-    )
+    host_read(file, buffer, len, read, overlapped)
 }
 
 /// The host CRT reads large requests straight into the caller's buffer.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    vortex_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
-    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
-        buffer, size, count, stream,
-    )
+    let host_read = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize);
+    let bytes = size.saturating_mul(count);
+    #[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+    if vortex_gpu::vulkan_live::enabled() {
+        use vortex_gpu::native_device;
+        // SAFETY: the guest owns the fread buffer through this synchronous call.
+        let pin = unsafe { native_device::begin_host_write(buffer as usize, bytes, std::ptr::null()) };
+        let result = host_read(buffer, size, count, stream);
+        native_device::end_host_write(pin, false);
+        return result;
+    }
+    vortex_gpu::kernel_will_write(buffer as usize, bytes);
+    host_read(buffer, size, count, stream)
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {

@@ -57,11 +57,15 @@ the local Xbox title, accepted its serialized pipeline descriptions and
 submitted the title's graphics work to Vulkan. Connecting the guest XMem
 ranges to the graphics device enabled the first visible title UI. The
 1424×771 offscreen capture includes the Portuguese account and player prompts.
-The background was incomplete in this capture. The runtime audit found the
+One diagnostic controller press reached the title's “Experiência de navegação”
+setup screen. Its heading and choice controls rendered, with corruption in
+some graphics and text. The runtime audit at that screen found the
 Vulkan loader and AMD driver, zero child processes, and no external title
 runtime or Direct3D 12 module. Windows also loaded DXGI and D3D11 interop
 modules. On-screen presentation remains pending because the Win32 surface
 query returned VK_ERROR_UNKNOWN on this system, including in vulkaninfo.
+One other run stopped with an access violation on a title CMPXCHG16B that
+received an address aligned to eight bytes. That case remains unresolved.
 Gameplay, the performance overlay and 30 FPS remain unverified.
 
 ## Components and provenance

@@ -23,6 +23,8 @@ unsafe extern "C" {
     fn vortex_native_gpu_track_guest_memory(base: usize, bytes: usize, watched: bool);
     fn vortex_native_gpu_release_guest_memory(base: usize);
     fn vortex_native_gpu_remap_guest_memory(base: usize, bytes: usize);
+    fn vortex_native_gpu_begin_host_write(base: usize, bytes: usize, request: *const c_void) -> u64;
+    fn vortex_native_gpu_end_host_write(pin: u64, pending: bool);
 }
 
 pub fn configure(guest_address: GuestAddress, alloc: Alloc, free: Free, map_pages: MapPages, aliases: Aliases) {
@@ -66,6 +68,20 @@ pub fn release_guest_memory(base: usize) {
 pub fn remap_guest_memory(base: usize, bytes: usize) {
     // SAFETY: the renderer receives only an address-range notification.
     unsafe { vortex_native_gpu_remap_guest_memory(base, bytes) };
+}
+
+/// # Safety
+///
+/// A non-null request is a live Windows OVERLAPPED. Its caller owns it until
+/// the I/O completes. The buffer must remain live under the host API's contract.
+pub unsafe fn begin_host_write(base: usize, bytes: usize, request: *const c_void) -> u64 {
+    // SAFETY: the caller supplies the lifetime of the buffer and request.
+    unsafe { vortex_native_gpu_begin_host_write(base, bytes, request) }
+}
+
+pub fn end_host_write(pin: u64, pending: bool) {
+    // SAFETY: this releases or transfers a pin created by begin_host_write.
+    unsafe { vortex_native_gpu_end_host_write(pin, pending) };
 }
 
 pub fn save_cache() {

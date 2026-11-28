@@ -97,6 +97,16 @@ extern "C" void vortex_native_gpu_remap_guest_memory(std::uintptr_t base, std::s
     leonida::geometry_writes::notify(base, base + bytes, leonida::geometry_writes::Event::replaced);
 }
 
+extern "C" std::uint64_t vortex_native_gpu_begin_host_write(std::uintptr_t base, std::size_t size,
+                                                           const OVERLAPPED* request) {
+    if (size > UINTPTR_MAX - base) return 0;
+    return leonida::kernel_writes::begin_write(reinterpret_cast<const void*>(base), size, request);
+}
+
+extern "C" void vortex_native_gpu_end_host_write(std::uint64_t pin, bool pending) {
+    leonida::kernel_writes::end_write(pin, pending);
+}
+
 extern "C" void vortex_native_gpu_save_cache() {
     rt::d3d12::stop_pipeline_compiles(250);
     rt::d3d12::save_pipeline_caches_at_exit(250);
