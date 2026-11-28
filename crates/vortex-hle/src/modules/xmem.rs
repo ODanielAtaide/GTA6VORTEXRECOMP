@@ -153,6 +153,11 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    #[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+    if !at.is_null() && vortex_gpu::vulkan_live::enabled() {
+        let watched = kind & (MEM_RESERVE | MEM_WRITE_WATCH) == (MEM_RESERVE | MEM_WRITE_WATCH);
+        vortex_gpu::native_device::track_guest_memory(at as usize, size, watched);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -305,6 +310,10 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
         user.sub(HEADER)
             .cast::<[usize; 2]>()
             .write([layout.size(), layout.align()]);
+        #[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+        if vortex_gpu::vulkan_live::enabled() {
+            vortex_gpu::native_device::track_guest_memory(user as usize, size, false);
+        }
         user.cast()
     }
 }
@@ -318,8 +327,16 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            let _released = VirtualFree(address, 0, MEM_RELEASE);
+            #[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+            if _released != 0 && vortex_gpu::vulkan_live::enabled() {
+                vortex_gpu::native_device::release_guest_memory(address as usize);
+            }
             return;
+        }
+        #[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+        if vortex_gpu::vulkan_live::enabled() {
+            vortex_gpu::native_device::release_guest_memory(address as usize);
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
@@ -779,6 +796,10 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     vortex_gpu::title_memory_remapped(base, len);
+    #[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+    if vortex_gpu::vulkan_live::enabled() {
+        vortex_gpu::native_device::remap_guest_memory(base, len);
+    }
     // What the range shows now, for the GPU side's in-place census.
     vortex_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
     physical.views.insert(base, (len, slice));
@@ -860,6 +881,10 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             continue;
         };
         vortex_gpu::title_memory_remapped(at, size);
+        #[cfg(all(target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+        if vortex_gpu::vulkan_live::enabled() {
+            vortex_gpu::native_device::remap_guest_memory(at, size);
+        }
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(

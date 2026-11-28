@@ -20,6 +20,9 @@ unsafe extern "C" {
     fn vortex_native_gpu_create(iid: *const Iid, out: *mut This) -> HRESULT;
     fn vortex_native_gpu_paths(shaders: *const u16, pipelines: *const u16) -> bool;
     fn vortex_native_gpu_save_cache();
+    fn vortex_native_gpu_track_guest_memory(base: usize, bytes: usize, watched: bool);
+    fn vortex_native_gpu_release_guest_memory(base: usize);
+    fn vortex_native_gpu_remap_guest_memory(base: usize, bytes: usize);
 }
 
 pub fn configure(guest_address: GuestAddress, alloc: Alloc, free: Free, map_pages: MapPages, aliases: Aliases) {
@@ -48,6 +51,21 @@ pub fn use_paths(shaders: &std::path::Path, pipelines: &std::path::Path) -> std:
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+pub fn track_guest_memory(base: usize, bytes: usize, watched: bool) {
+    // SAFETY: the renderer records address ranges without dereferencing an address here.
+    unsafe { vortex_native_gpu_track_guest_memory(base, bytes, watched) };
+}
+
+pub fn release_guest_memory(base: usize) {
+    // SAFETY: the renderer removes the recorded range without accessing its former backing.
+    unsafe { vortex_native_gpu_release_guest_memory(base) };
+}
+
+pub fn remap_guest_memory(base: usize, bytes: usize) {
+    // SAFETY: the renderer receives only an address-range notification.
+    unsafe { vortex_native_gpu_remap_guest_memory(base, bytes) };
 }
 
 pub fn save_cache() {

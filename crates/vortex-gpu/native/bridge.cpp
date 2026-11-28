@@ -4,6 +4,9 @@
 #include "shims/d3d12_xs_device.h"
 #include "shims/shims.h"
 #include "shims/xmem.h"
+#include "src/title_page_watch.h"
+#include "src/title_geometry_watch.h"
+#include "src/title_va_alias.h"
 
 #include <atomic>
 #include <cstdint>
@@ -34,16 +37,23 @@ extern "C" void vortex_native_gpu_configure(GuestAddress guest_address,
     rt::d3d12_xs::set_default_descriptor_heap_allocator(alloc, free);
     rt::xmem::copy_page_mappings_fn = map_pages;
     query_aliases.store(aliases, std::memory_order_release);
+    leonida::geometry_writes::aliases.store(&rt::xmem::geometry_aliases, std::memory_order_release);
     rt::shims::set_unimplemented_policy(rt::shims::UnimplementedPolicy::Stop);
 }
 
 extern "C" bool vortex_native_gpu_paths(const wchar_t* shaders, const wchar_t* pipelines) {
     // These inherited environment names are internal to the graphics sources.
     // The public Vortex CLI sets the paths before creating any devices.
-    SetEnvironmentVariableW(L"LEONIDA_STUB_PIPELINES", nullptr);
-    SetEnvironmentVariableW(L"LEONIDA_SKIP_COMPUTE", nullptr);
-    SetEnvironmentVariableW(L"LEONIDA_ASYNC_PIPELINES", nullptr);
-    SetEnvironmentVariableW(L"LEONIDA_COMPILE_HELPER", nullptr);
+    for (const wchar_t* name : {L"LEONIDA_STUB_PIPELINES", L"LEONIDA_SKIP_COMPUTE",
+                               L"LEONIDA_ASYNC_PIPELINES", L"LEONIDA_COMPILE_HELPER"}) {
+        _wputenv_s(name, L"");
+    }
+    const auto set_default = [](const wchar_t* name, const wchar_t* value) {
+        if (!GetEnvironmentVariableW(name, nullptr, 0)) _wputenv_s(name, value);
+    };
+    set_default(L"LEONIDA_GRAPHICS_STAGE_LAYOUT", L"1");
+    set_default(L"LEONIDA_FRAME_PACING", L"1");
+    set_default(L"LEONIDA_PIPELINE_COMPILE", L"on-demand");
     return SetEnvironmentVariableW(L"LEONIDA_SHADERS", shaders)
         && SetEnvironmentVariableW(L"LEONIDA_PIPELINE_CACHE_DIR", pipelines);
 }
@@ -64,6 +74,27 @@ extern "C" HRESULT vortex_native_gpu_create(const IID* iid, void** out) {
     rt::d3d12::set_device_outer(device, static_cast<IUnknown*>(*out));
     std::fprintf(stderr, "VULKAN_GUEST_DEVICE_READY: in-process native device\n");
     return hr;
+}
+
+extern "C" void vortex_native_gpu_track_guest_memory(std::uintptr_t base, std::size_t bytes, bool watched) {
+    if (!base || !bytes || bytes > UINTPTR_MAX - base) return;
+    leonida::title_memory_map::changed(base, base + bytes);
+    leonida::title_va_aliases().add_title_memory(base, bytes);
+    if (watched) leonida::title_write_watch::add(base, bytes);
+    else leonida::title_write_watch::mark(base, base + bytes);
+}
+
+extern "C" void vortex_native_gpu_release_guest_memory(std::uintptr_t base) {
+    leonida::title_write_watch::remove(base);
+    leonida::title_va_aliases().remove_title_memory(base);
+    leonida::title_memory_map::changed();
+}
+
+extern "C" void vortex_native_gpu_remap_guest_memory(std::uintptr_t base, std::size_t bytes) {
+    if (!base || !bytes || bytes > UINTPTR_MAX - base) return;
+    leonida::title_memory_map::changed(base, base + bytes);
+    leonida::title_write_watch::mark(base, base + bytes);
+    leonida::geometry_writes::notify(base, base + bytes, leonida::geometry_writes::Event::replaced);
 }
 
 extern "C" void vortex_native_gpu_save_cache() {
