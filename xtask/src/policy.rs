@@ -147,11 +147,17 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    // Permit only the six original Vortex diagnostic Python modules.
+    // Permit the original diagnostic scripts and the Vulkan probe's GLSL source.
+    let probe_shader = path.starts_with("tools/amd-vulkan-probe/shaders/")
+        && matches!(ext.as_deref(), Some("comp" | "frag" | "vert"));
     let allowed = matches!(path,
         "vortex_inspect.py" | "vortex_metrics.py" | "vortex_compare.py"
         | "test_inspect.py" | "test_metrics.py" | "test_compare.py"
-    ) || ALLOWED_NAMES.contains(&name)
+        | "tools/rdna2-commons-offline.py" | "tools/test-rdna2-commons-offline.py"
+        | "tools/leonida-vulkan-only.patch"
+        | "tools/leonida-cache-writeback.patch"
+    ) || probe_shader
+        || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
             .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));

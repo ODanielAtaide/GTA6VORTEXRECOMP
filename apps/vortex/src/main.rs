@@ -10,6 +10,8 @@ mod shader;
 mod translate;
 #[cfg(feature = "vulkan")]
 mod precompile;
+#[cfg(all(windows, feature = "vulkan"))]
+mod vulkan_title;
 
 use std::path::PathBuf;
 
@@ -141,9 +143,12 @@ enum Command {
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
-        /// Graphics backend. Vulkan is experimental and stops at unsupported live calls.
+        /// Graphics backend used to run the title.
         #[arg(long, value_enum, default_value_t = Backend::D3d12)]
         backend: Backend,
+        /// Use a Leonida runtime built with Vulkan and prepared for this title.
+        #[arg(long, value_name = "DIRECTORY", requires = "execute")]
+        vulkan_runtime: Option<PathBuf>,
         /// What unimplemented imports do when called.
         #[arg(long, value_enum, default_value_t = Unimplemented::Trap)]
         unimplemented: Unimplemented,
@@ -291,12 +296,35 @@ fn main() -> Result<()> {
         Command::Run {
             exe,
             backend,
+            vulkan_runtime,
             unimplemented,
             strict,
             execute,
             console,
-            title_args: _,
+            title_args,
         } => {
+            if let Some(runtime) = vulkan_runtime {
+                anyhow::ensure!(
+                    matches!(backend, Backend::Vulkan),
+                    "--vulkan-runtime requires --backend vulkan"
+                );
+                anyhow::ensure!(
+                    !strict,
+                    "--strict applies to Vortex's in-process import resolver"
+                );
+                anyhow::ensure!(
+                    matches!(unimplemented, Unimplemented::Trap),
+                    "the Vulkan runtime stops on unimplemented imports"
+                );
+                #[cfg(all(windows, feature = "vulkan"))]
+                return vulkan_title::run(&exe, &runtime, console, &title_args);
+                #[cfg(not(all(windows, feature = "vulkan")))]
+                {
+                    let _ = runtime;
+                    anyhow::bail!("--vulkan-runtime requires Windows and --features vulkan");
+                }
+            }
+            let _ = title_args;
             if matches!(backend, Backend::Vulkan) {
                 #[cfg(all(windows, feature = "vulkan"))]
                 {

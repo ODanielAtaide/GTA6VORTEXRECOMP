@@ -731,7 +731,7 @@ mod tests {
     #[test]
     fn native_fp32_mul_emits_typed_operation() {
         // v_mov_b32 v7, 0.25; v_mul_f32 v7, 1.0, v7; s_endpgm.
-        let code: Vec<u8> = [0x7e0e_02ffu32, 0.25f32.to_bits(), 0x1e0e_0ef2, 0xbf81_0000]
+        let code: Vec<u8> = [0x7e0e_02ffu32, 0.25f32.to_bits(), 0x100e_0ef2, 0xbf81_0000]
             .into_iter().flat_map(u32::to_le_bytes).collect();
         let p = ir::build(&code, false, 8).unwrap();
         let words = emit_cfg(&p).unwrap();
