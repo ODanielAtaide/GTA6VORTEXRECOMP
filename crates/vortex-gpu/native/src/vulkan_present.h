@@ -119,10 +119,11 @@ public:
                     VkPhysicalDevice physical, VkQueue queue, std::uint32_t family, VkSurfaceKHR surface,
                     bool swapchain_maintenance1 = false,
                     std::function<VkExtent2D()> extent_fn = nullptr,
-                    std::function<VkSurfaceKHR()> recreate_surface_fn = nullptr)
+                    std::function<VkSurfaceKHR()> recreate_surface_fn = nullptr,
+                    const char* offscreen_capture = nullptr)
         : context_(context), instance_(instance), physical_(physical), queue_(queue), surface_(surface),
           maintenance1_(swapchain_maintenance1), extent_fn_(std::move(extent_fn)),
-          recreate_surface_fn_(std::move(recreate_surface_fn)) {
+          recreate_surface_fn_(std::move(recreate_surface_fn)), offscreen_(offscreen_capture != nullptr) {
 #define LEONIDA_INSTANCE_FN(name) name##_ = reinterpret_cast<PFN_##name>(get_instance(instance, #name));
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceSupportKHR)
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)
@@ -134,7 +135,8 @@ public:
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceMemoryProperties)
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceFormatProperties)
 #undef LEONIDA_INSTANCE_FN
-        if (!vkGetDeviceProcAddr_ || !vkDestroySurfaceKHR_) return;
+        if (!vkGetDeviceProcAddr_ || !vkGetPhysicalDeviceMemoryProperties_ ||
+            (!offscreen_ && !vkDestroySurfaceKHR_)) return;
         const VkDevice device = context.device();
 #define LEONIDA_DEVICE_FN(name) name##_ = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr_(device, #name));
         LEONIDA_DEVICE_FN(vkCreateSwapchainKHR)
@@ -149,11 +151,21 @@ public:
         LEONIDA_DEVICE_FN(vkWaitForFences)
         LEONIDA_DEVICE_FN(vkResetFences)
 #undef LEONIDA_DEVICE_FN
-        if (!vkCreateSwapchainKHR_ || !vkQueuePresentKHR_ || !vkCmdBlitImage_ || !vkCreateFence_) return;
-
-        VkBool32 supported = VK_FALSE;
-        vkGetPhysicalDeviceSurfaceSupportKHR_(physical, family, surface, &supported);
-        if (!supported) return;
+        if (!vkCmdBlitImage_ || !vkCmdClearColorImage_ || !vkCreateFence_ ||
+            !vkDestroyFence_ || !vkWaitForFences_ || !vkResetFences_) return;
+        if (!offscreen_) {
+            if (!vkCreateSwapchainKHR_ || !vkDestroySwapchainKHR_ || !vkGetSwapchainImagesKHR_ ||
+                !vkAcquireNextImageKHR_ || !vkQueuePresentKHR_ || !vkGetPhysicalDeviceSurfaceSupportKHR_ ||
+                !vkGetPhysicalDeviceSurfaceCapabilitiesKHR_ || !vkGetPhysicalDeviceSurfaceFormatsKHR_ ||
+                !vkGetPhysicalDeviceSurfacePresentModesKHR_) return;
+            VkBool32 supported = VK_FALSE;
+            const auto result = vkGetPhysicalDeviceSurfaceSupportKHR_(physical, family, surface, &supported);
+            if (result != VK_SUCCESS || !supported) {
+                std::fprintf(stderr, "[rt] present: surface support query for queue %u returned %d (supported %d)\n",
+                             family, result, int(supported));
+                return;
+            }
+        }
 
         auto& vk = context.vk;
         VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -170,32 +182,34 @@ public:
             VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
             if (vk.vkAllocateCommandBuffers(device, &allocate, &frame.commands) != VK_SUCCESS ||
                 vkCreateFence_(device, &fence, nullptr, &frame.done) != VK_SUCCESS ||
-                vk.vkCreateSemaphore(device, &semaphore, nullptr, &frame.acquired) != VK_SUCCESS)
+                (!offscreen_ && vk.vkCreateSemaphore(device, &semaphore, nullptr, &frame.acquired) != VK_SUCCESS))
                 return;
         }
         // LEONIDA_CAPTURE=<dir>: besides presenting, copy the swapchain image to host memory and write it out as a
         // binary PPM, every LEONIDA_CAPTURE_EVERY presented frames (default 30), at most LEONIDA_CAPTURE_LIMIT of
         // them (default 24). Off unless the variable is set; a capture that cannot be made shows nothing and is
         // reported here instead of failing the presenter.
-        if (const char* dir = std::getenv("LEONIDA_CAPTURE"); dir && *dir) {
+        if (const char* dir = offscreen_ ? offscreen_capture : std::getenv("LEONIDA_CAPTURE"); dir && *dir) {
             capture_dir_ = dir;
             // Create the folder: a capture run names its own output folder and should not have to make it first.
             std::error_code created;
             std::filesystem::create_directories(capture_dir_, created);
             capture_to_disk_ = true;
             capture_ = true;  // provision TRANSFER_SRC and staging; disk-only copies follow the requested cadence
-            if (const char* every = std::getenv("LEONIDA_CAPTURE_EVERY")) capture_every_ = std::max(1, std::atoi(every));
-            if (const char* limit = std::getenv("LEONIDA_CAPTURE_LIMIT")) capture_limit_ = std::max(1, std::atoi(limit));
-            std::fprintf(stderr, "[rt] present: capture on: every %d presented frame(s), at most %d, into %s\n",
-                         capture_every_, capture_limit_, capture_dir_.c_str());
+            if (const char* every = std::getenv(offscreen_ ? "VORTEX_CAPTURE_EVERY" : "LEONIDA_CAPTURE_EVERY"))
+                capture_every_ = std::max(1, std::atoi(every));
+            if (const char* limit = std::getenv(offscreen_ ? "VORTEX_CAPTURE_LIMIT" : "LEONIDA_CAPTURE_LIMIT"))
+                capture_limit_ = std::max(1, std::atoi(limit));
+            std::fprintf(stderr, "[rt] present: capture every %d %s frame(s), at most %d, into %s\n",
+                         capture_every_, offscreen_ ? "offscreen" : "presented", capture_limit_, capture_dir_.c_str());
             // LOCAL DIAGNOSTIC: LEONIDA_CAPTURE_SOURCE=1 also reads back the presented source texture itself.
             if (const char* source = std::getenv("LEONIDA_CAPTURE_SOURCE"); source && *source && *source != '0') {
                 probe_source_ = true;
                 std::fprintf(stderr, "[rt] present-probe: source capture on\n");
             }
         }
-        ok_ = recreate(true, false);
-        if (!ok_ && capture_to_disk_) {
+        ok_ = offscreen_ ? make_offscreen_target() : recreate(true, false);
+        if (!ok_ && capture_to_disk_ && !offscreen_) {
             // The surface refused a TRANSFER_SRC swapchain, or the staging buffer could not be made: present
             // without the capture rather than not at all.
             std::fprintf(stderr, "[rt] present: capture is unavailable on this surface; presenting without it\n");
@@ -217,6 +231,8 @@ public:
             // A WSI layer may perform a device-wide idle while destroying the swapchain.
             // Keep that implicit idle serialized with submits from every context queue.
             release(swapchain_);
+            if (offscreen_image_) vk.vkDestroyImage(device, offscreen_image_, nullptr);
+            if (offscreen_memory_) vk.vkFreeMemory(device, offscreen_memory_, nullptr);
         }
         swapchain_ = VK_NULL_HANDLE;
         // A capture still pending has its copy complete once the queue is idle: write it before the buffer goes.
@@ -501,12 +517,12 @@ private:
             want_hdr = (planes->plane[0].hdr10) || (planes->count > 1 && planes->plane[1].hdr10);
         else if (binding)
             want_hdr = false;
-        if (vsync != vsync_ || stale_ || srgb != swapchain_srgb_ || want_hdr != swapchain_hdr_req_) {
+        if (!offscreen_ && (vsync != vsync_ || stale_ || srgb != swapchain_srgb_ || want_hdr != swapchain_hdr_req_)) {
             // The swapchain's colour encoding is only recorded once the new swapchain exists, so a failed
             // recreate is tried again at the next present.
             if (!recreate_for_present(vsync, srgb, want_hdr)) return VK_ERROR_OUT_OF_DATE_KHR;
         }
-        if (!swapchain_) {  // minimised: try again next frame
+        if (!offscreen_ && !swapchain_) {  // minimised: try again next frame
             stale_ = true;
             captured_ = false;  // nothing was shown: read_back() must not hand out the frame before
             return VK_SUCCESS;
@@ -516,7 +532,8 @@ private:
             return VK_ERROR_FORMAT_NOT_SUPPORTED;
         if (planes && !prepare_compose()) return VK_ERROR_FORMAT_NOT_SUPPORTED;
         const VkDevice device = context_.device();
-        Frame& frame = frames_[frame_index_ % frames_.size()];
+        const std::size_t slot = offscreen_ ? 0 : frame_index_ % frames_.size();
+        Frame& frame = frames_[slot];
         if (const VkResult waited = context_.observe_result(
                 vkWaitForFences_(device, 1, &frame.done, VK_TRUE, UINT64_MAX), "vkWaitForFences (present)");
             waited != VK_SUCCESS)
@@ -525,7 +542,7 @@ private:
         if (const VkResult r = finish_pending_capture(); r != VK_SUCCESS) return stop(r);
 
         std::uint32_t image = 0;
-        VkResult acquired = acquire(frame.acquired, &image);
+        VkResult acquired = offscreen_ ? VK_SUCCESS : acquire(frame.acquired, &image);
         if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
             if (!recreate_for_present(vsync, swapchain_srgb_, swapchain_hdr_req_)) return acquired;
             if (!swapchain_) {  // minimised since the last present: skipped, as above
@@ -547,11 +564,12 @@ private:
         // The ordinal counts accepted presents, not submissions or deferred requests. Decide after
         // draining the previous disk sample and any acquire/recreate retry; an unshown attempt consumes no slot.
         const bool disk_sample = capture_to_disk_ && capture_written_ < capture_limit_ &&
-                                 presented_ % std::uint64_t(capture_every_) == 0;
-        const bool inspect = splash_owner_ && capture_ptr_;
+                                 output_frames() % std::uint64_t(capture_every_) == 0;
+        const bool inspect = !offscreen_ && splash_owner_ && capture_ptr_;
         // Merely allocating a temporary splash buffer does not require a copy. In particular, a minimized
         // initial splash can return before taking ownership; later ordinary frames must not become continuous.
-        const bool copy_frame = capture_buffer_ && ((capture_ && (disk_sample || continuous_readback_ || inspect)) || dump_.due(presented_));
+        const bool copy_frame = capture_buffer_ && ((capture_ && (disk_sample || continuous_readback_ || inspect)) ||
+                                                     (!offscreen_ && dump_.due(presented_)));
         captured_ = false;  // never expose a stale sample after an unsampled or unshown frame
         bool recorded = false;
         std::unique_lock tracker_lock(context_.tracker_mutex_, std::defer_lock);
@@ -577,7 +595,7 @@ private:
                         plane_rollbacks[i].tracked = context_.tracker_.tracked(plane_rollbacks[i].id);
                         if (plane_rollbacks[i].tracked) plane_rollbacks[i].layout = context_.tracker_.layout(plane_rollbacks[i].id, 0);
                     }
-                    recorded = record_planes(frame, std::uint32_t(frame_index_ % frames_.size()), current, *planes,
+                    recorded = record_planes(frame, std::uint32_t(slot), current, *planes,
                                              image, copy_frame);
                 }
             }
@@ -615,19 +633,21 @@ private:
         }
         const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         VkSubmitInfo submit_info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        submit_info.waitSemaphoreCount = 1;
-        submit_info.pWaitSemaphores = &frame.acquired;
-        submit_info.pWaitDstStageMask = &wait_stage;
         submit_info.commandBufferCount = 1;
         submit_info.pCommandBuffers = &frame.commands;
-        submit_info.signalSemaphoreCount = 1;
-        submit_info.pSignalSemaphores = &ready_[image];  // one per image: reused only once that image comes back
         VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
-        present.waitSemaphoreCount = 1;
-        present.pWaitSemaphores = &ready_[image];
-        present.swapchainCount = 1;
-        present.pSwapchains = &swapchain_;
-        present.pImageIndices = &image;
+        if (!offscreen_) {
+            submit_info.waitSemaphoreCount = 1;
+            submit_info.pWaitSemaphores = &frame.acquired;
+            submit_info.pWaitDstStageMask = &wait_stage;
+            submit_info.signalSemaphoreCount = 1;
+            submit_info.pSignalSemaphores = &ready_[image];  // reused only once the image is acquired again
+            present.waitSemaphoreCount = 1;
+            present.pWaitSemaphores = &ready_[image];
+            present.swapchainCount = 1;
+            present.pSwapchains = &swapchain_;
+            present.pImageIndices = &image;
+        }
 #ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
         // The swapchain was created with FIFO and tear_mode_ (both come from the same recreate).
         VkSwapchainPresentModeInfoEXT present_mode{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT};
@@ -662,7 +682,7 @@ private:
                 if (result != VK_SUCCESS) return stop(result);
             }
             if (tracker_lock.owns_lock()) tracker_lock.unlock();
-            if (submitted == VK_SUCCESS)
+            if (submitted == VK_SUCCESS && !offscreen_)
                 result = context_.observe_result(vkQueuePresentKHR_(queue_, &present), "vkQueuePresentKHR");
         }
         if (show_title && (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)) {
@@ -675,6 +695,16 @@ private:
         }
         if (submitted != VK_SUCCESS) return give_back(frame, submitted);
         ++frame_index_;
+        if (offscreen_) {
+            ++offscreen_frames_;
+            if (disk_sample) {
+                captured_ = true;
+                captured_extent_ = extent_;
+                captured_format_ = format_;
+                pending_capture_ = frame.done;
+            }
+            return VK_SUCCESS;
+        }
         // Only a present the engine took counts (SUBOPTIMAL is shown too). OUT_OF_DATE was not shown: the swapchain
         // is recreated next time, and the caller sees VK_SUCCESS, since its work was submitted.
         if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
@@ -800,12 +830,12 @@ private:
                          static_cast<unsigned long long>(probe_blank_), static_cast<unsigned long long>(probe_unresolved_));
         // The same frames the swapchain capture takes: the one presented_ becomes when this present is shown.
         if (probe_source_ && resolved && found.image && probe_written_ < capture_limit_ &&
-            presented_ % std::uint64_t(capture_every_) == 0)
+            output_frames() % std::uint64_t(capture_every_) == 0)
         {
-            probe_read_source(id, presented_ + 1, path);
+            probe_read_source(id, output_frames() + 1, path);
             // LOCAL DIAGNOSTIC (fsdraw): the render targets of the frame's fullscreen draws, read back with it.
             for (const std::uint64_t target : fsdraw::targets())
-                if (target != id) probe_read_source(target, presented_ + 1, "fullscreen-draw target", "target");
+                if (target != id) probe_read_source(target, output_frames() + 1, "fullscreen-draw target", "target");
         }
     }
 
@@ -1041,6 +1071,7 @@ private:
     // semaphore and signals the frame's fence, so both are usable again; the swapchain is recreated on the next
     // present, which gives back the image that was never presented. Returns `failure`, the error to report.
     VkResult give_back(Frame& frame, VkResult failure) {
+        if (offscreen_) return stop(failure);
         const VkDevice device = context_.device();
         if (context_.observe_result(vkResetFences_(device, 1, &frame.done), "vkResetFences (present)") != VK_SUCCESS)
             return stop(failure);
@@ -1369,11 +1400,59 @@ private:
             layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             access = VK_ACCESS_TRANSFER_READ_BIT;
         }
+        if (offscreen_) return;
         detail::image_barrier(fn, commands, target_of(image), range, layout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, access,
                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     }
 
-    // (Re)creates the capture buffer for the current swapchain size: host visible, coherent, persistently mapped.
+    bool make_offscreen_target() {
+        auto& vk = context_.vk;
+        const VkDevice device = context_.device();
+        format_ = VK_FORMAT_B8G8R8A8_UNORM;
+        extent_ = extent_fn_ ? extent_fn_() : VkExtent2D{};
+        if (!extent_.width || !extent_.height) extent_ = {1280, 720};
+        constexpr VkFormatFeatureFlags features = VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                                  VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+        if ((format_features(format_) & features) != features) return false;
+
+        VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        info.imageType = VK_IMAGE_TYPE_2D;
+        info.format = format_;
+        info.extent = {extent_.width, extent_.height, 1};
+        info.mipLevels = 1;
+        info.arrayLayers = 1;
+        info.samples = VK_SAMPLE_COUNT_1_BIT;
+        info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vk.vkCreateImage(device, &info, nullptr, &offscreen_image_) != VK_SUCCESS) return false;
+        VkMemoryRequirements requirements{};
+        vk.vkGetImageMemoryRequirements(device, offscreen_image_, &requirements);
+        VkPhysicalDeviceMemoryProperties properties{};
+        vkGetPhysicalDeviceMemoryProperties_(physical_, &properties);
+        VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocate.allocationSize = requirements.size;
+        allocate.memoryTypeIndex = UINT32_MAX;
+        for (std::uint32_t i = 0; i < properties.memoryTypeCount; ++i) {
+            if ((requirements.memoryTypeBits & (1u << i)) &&
+                (properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                allocate.memoryTypeIndex = i;
+                break;
+            }
+        }
+        if (allocate.memoryTypeIndex == UINT32_MAX ||
+            vk.vkAllocateMemory(device, &allocate, nullptr, &offscreen_memory_) != VK_SUCCESS ||
+            vk.vkBindImageMemory(device, offscreen_image_, offscreen_memory_, 0) != VK_SUCCESS ||
+            !make_capture_buffer()) return false;
+        images_.push_back(offscreen_image_);
+        extent_packed_ = (std::uint64_t(extent_.width) << 32) | extent_.height;
+        return true;
+    }
+
+    std::uint64_t output_frames() const { return offscreen_ ? offscreen_frames_ : presented_.load(); }
+
+    // (Re)creates the capture buffer for the current output extent: host visible, coherent, persistently mapped.
     bool make_capture_buffer() {
         release_capture();
         auto& vk = context_.vk;
@@ -1413,8 +1492,8 @@ private:
     void release_capture() {
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
-        if (capture_memory_) vk.vkFreeMemory(device, capture_memory_, nullptr);  // unmaps
         if (capture_buffer_) vk.vkDestroyBuffer(device, capture_buffer_, nullptr);
+        if (capture_memory_) vk.vkFreeMemory(device, capture_memory_, nullptr);  // unmaps
         capture_memory_ = VK_NULL_HANDLE;
         capture_buffer_ = VK_NULL_HANDLE;
         capture_ptr_ = nullptr;
@@ -1446,7 +1525,7 @@ private:
     void write_capture() {
         const VkExtent2D extent = captured_extent_;
         const VkFormat format = captured_format_;
-        const std::uint64_t number = presented_;
+        const std::uint64_t number = output_frames();
         const std::size_t texels = std::size_t(extent.width) * extent.height;
         if (!capture_ptr_ || !texels || texels > capture_size_ / 4) return;
         std::vector<std::uint8_t> rgb(texels * 3);
@@ -1823,6 +1902,10 @@ private:
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     VkExtent2D extent_{};
+    const bool offscreen_;
+    VkImage offscreen_image_ = VK_NULL_HANDLE;
+    VkDeviceMemory offscreen_memory_ = VK_NULL_HANDLE;
+    std::uint64_t offscreen_frames_ = 0;
     std::vector<VkImage> images_;
     std::vector<VkSemaphore> ready_;  // per swapchain image: blit done, present may start
     std::array<Frame, 2> frames_{};

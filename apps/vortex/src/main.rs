@@ -7,7 +7,6 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
-mod translate;
 #[cfg(feature = "vulkan")]
 mod precompile;
 #[cfg(feature = "vulkan")]
@@ -70,24 +69,6 @@ enum Command {
         /// Also list the decoded native instructions (implies --verbose).
         #[arg(long)]
         disasm: bool,
-    },
-    /// Run every shader found (containers, SGD5 files) through the
-    /// translator and report what it cannot handle yet.
-    Translate {
-        paths: Vec<PathBuf>,
-        /// Check emitted DXIL with dxil.dll's validator (`VORTEX_DXIL`,
-        /// else the newest Windows SDK's).
-        #[arg(long)]
-        validate: bool,
-        /// Also create a host D3D12 pipeline for each emitted shader.
-        #[arg(long)]
-        pipelines: bool,
-        /// Print one line per program and outcome.
-        #[arg(long)]
-        list: bool,
-        /// Worker threads (default: every logical core).
-        #[arg(long)]
-        jobs: Option<usize>,
     },
     /// Read-only inventory and offline Vulkan shader compatibility survey.
     #[cfg(feature = "vulkan")]
@@ -224,23 +205,6 @@ fn main() -> Result<()> {
             verbose,
             disasm,
         } => shader::run(paths, verbose || disasm, disasm),
-        Command::Translate {
-            paths,
-            validate,
-            pipelines,
-            list,
-            jobs,
-        } => {
-            // `VORTEX_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
-            if let Some(n) = std::env::var("VORTEX_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
-                vortex_shader::emit::set_view_heap_limit(n);
-            }
-            // `VORTEX_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
-            if let Some(n) = std::env::var("VORTEX_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
-                vortex_shader::emit::set_host_max_wave(n);
-            }
-            translate::run(paths, validate, pipelines, list, jobs)
-        }
         #[cfg(feature = "vulkan")]
         Command::VulkanPrecompile { game_dir, workers, validate, refresh, code_only } =>
             precompile::run(&game_dir, workers, validate, refresh, code_only),

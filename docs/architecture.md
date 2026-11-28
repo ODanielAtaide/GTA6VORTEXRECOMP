@@ -94,6 +94,6 @@ waterfall loop reads from the first lane (`v_readfirstlane_b32`) is traced
 to the per-lane load or choice that gives each lane its own (a mask's
 `v_cndmask_b32`, or an if/else whose arms each set it: traced on the paths
 the lanes take, from structurisation), and accessed with a non-uniform heap
-index in one pass. `vortex translate`
-runs every shader it finds (containers, SGD5 files) through these and
-lists what they cannot handle yet.
+index in one pass. This describes the historical DXIL translator.
+The title's native compiler and graphics backend are described in
+[Vortex live Vulkan](LIVE_VULKAN.md).

@@ -12,7 +12,7 @@ vortex-core.workspace = true
 vortex-pe.workspace = true
 vortex-loader.workspace = true
 vortex-hle.workspace = true
-vortex-shader = { workspace = true, features = ["host"] }
+vortex-shader.workspace = true
 vortex-game.workspace = true
 vortex-vulkan = { path = "../../crates/vortex-vulkan", optional = true }
 anyhow.workspace = true

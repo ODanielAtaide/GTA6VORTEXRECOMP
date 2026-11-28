@@ -21744,7 +21744,8 @@ bool device_has_swapchain_colorspace(ID3D12Device* device) {
     return d && d->state().info.swapchain_colorspace;
 }
 
-std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window, bool hold_device) {
+std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window, bool hold_device,
+                                                         const char* offscreen_capture) {
     // A title holds the Xbox-ABI proxy, not the layer's device: look behind it, as the helpers above do.
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     Device* d = Device::from<Device>(real ? real : device);
@@ -21752,20 +21753,26 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
         std::fprintf(stderr, "[rt] d3d12: create_window_presenter: %p is neither the Xbox device proxy nor a device of "
                              "this layer; no presenter\n",
                      static_cast<void*>(device));
-    if (!d || !window) return nullptr;
+    if (!d || (!window && !offscreen_capture)) return nullptr;
     const VulkanDeviceInfo& info = d->state().info;
-    if (!info.presentation) {
+    if (!info.presentation && !offscreen_capture) {
         std::fprintf(stderr, "[rt] d3d12: the Vulkan device was created without presentation support\n");
         return nullptr;
     }
     const auto create_surface = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(
         info.get_instance_proc(info.instance, "vkCreateWin32SurfaceKHR"));
-    if (!create_surface) return nullptr;
-    VkWin32SurfaceCreateInfoKHR surface_info{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
-    surface_info.hinstance = GetModuleHandleW(nullptr);
-    surface_info.hwnd = window;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
-    if (create_surface(info.instance, &surface_info, nullptr, &surface) != VK_SUCCESS) return nullptr;
+    if (!offscreen_capture) {
+        if (!create_surface) return nullptr;
+        VkWin32SurfaceCreateInfoKHR surface_info{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+        surface_info.hinstance = GetModuleHandleW(nullptr);
+        surface_info.hwnd = window;
+        const VkResult result = create_surface(info.instance, &surface_info, nullptr, &surface);
+        if (result != VK_SUCCESS) {
+            std::fprintf(stderr, "[rt] present: vkCreateWin32SurfaceKHR failed (%d)\n", result);
+            return nullptr;
+        }
+    }
     // LEONIDA_PRESENT_NO_TEAR=1 keeps the swapchain FIFO-only (ImmediateThresholdPercent then does nothing).
     // Any non-empty value other than "0" turns it off.
     bool tear_allowed = true;
@@ -21803,9 +21810,9 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
                                                                                        &made) != VK_SUCCESS)
                                                                         return VK_NULL_HANDLE;
                                                                     return made;
-                                                                });
+                                                                }, offscreen_capture);
     if (!presenter->ok()) {
-        std::fprintf(stderr, "[rt] d3d12: cannot present to this window from the device's queue family\n");
+        std::fprintf(stderr, "[rt] present: could not initialize Vulkan output\n");
         return nullptr;
     }
     auto window_presenter =

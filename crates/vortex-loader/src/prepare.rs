@@ -137,16 +137,15 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
 #[cfg(all(windows, target_arch = "x86_64"))]
 fn host_cache_writeback() -> Option<bool> {
     use std::arch::x86_64::{__cpuid, __cpuid_count};
-    // SAFETY: CPUID is available in x86-64. Check the supported leaf before reading it.
-    let cpu = unsafe { __cpuid(0) };
+    let cpu = __cpuid(0);
     if cpu.eax < 1 {
         return None;
     }
-    let basic = unsafe { __cpuid(1) };
+    let basic = __cpuid(1);
     if basic.edx & (1 << 19) == 0 || (basic.ebx >> 8) & 0xff != 8 {
         return None;
     }
-    let cache = if cpu.eax >= 7 { unsafe { __cpuid_count(7, 0) }.ebx } else { 0 };
+    let cache = if cpu.eax >= 7 { __cpuid_count(7, 0).ebx } else { 0 };
     (cache & (1 << 24) == 0).then_some(cache & (1 << 23) != 0)
 }
 

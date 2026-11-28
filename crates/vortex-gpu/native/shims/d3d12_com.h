@@ -531,7 +531,8 @@ bool device_has_swapchain_colorspace(ID3D12Device* device);
 // outlive the caller's reference. `hold_device` false takes none: for a presenter that the device proxy owns itself
 // and destroys before its device (the presentation gta6rt's proxy builds, d3d12_xs_device.cpp), where a reference
 // to the proxy would keep the proxy, the presenter and its window alive for good.
-std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window, bool hold_device = true);
+std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window, bool hold_device = true,
+                                                         const char* offscreen_capture = nullptr);
 
 // Where each root parameter's arguments go in the 32 user-data dwords the translated shaders read (docs section
 // 3.5). Built when a Vulkan device creates the root signature. A signature can be bound at either bind point, so it

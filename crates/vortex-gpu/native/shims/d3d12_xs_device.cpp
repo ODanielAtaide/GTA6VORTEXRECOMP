@@ -1808,7 +1808,7 @@ DWORD WINAPI fallback_window_thread(LPVOID parameter) {
     WNDCLASSW window_class{};
     window_class.lpfnWndProc = present_window_proc;
     window_class.hInstance = GetModuleHandleW(nullptr);
-    window_class.lpszClassName = L"LeonidaPresentX";
+    window_class.lpszClassName = L"VortexPresentX";
     window_class.hCursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
     HWND window = nullptr;
     if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
@@ -1817,7 +1817,7 @@ DWORD WINAPI fallback_window_thread(LPVOID parameter) {
         // A 1920x1080 client area where the desktop has room for it; the window manager may still size it.
         RECT frame{0, 0, 1920, 1080};
         AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
-        window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+        window = CreateWindowExW(0, window_class.lpszClassName, L"Vortex", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
                                  CW_USEDEFAULT, frame.right - frame.left, frame.bottom - frame.top, nullptr, nullptr,
                                  window_class.hInstance, nullptr);
         if (!window) std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
@@ -1875,6 +1875,9 @@ PresentState* present_state_for(DeviceProxy* device, bool splash_only = false) {
     if (getenv_s(&mode_length, mode, sizeof(mode), "LEONIDA_PRESENT_WINDOW") != 0) mode[0] = '\0';
     const bool hidden = std::strcmp(mode, "hidden") == 0;
     const bool own = hidden || std::strcmp(mode, "own") == 0;
+    const char* offscreen = std::getenv("VORTEX_CAPTURE_OFFSCREEN");
+    if (offscreen && !*offscreen) offscreen = nullptr;
+    if (offscreen && splash_only) return nullptr;
     HWND target = own ? nullptr : rt::d3d12::find_title_window(GetCurrentProcessId());
     RECT client{};
     if (target && (!GetClientRect(target, &client) || client.right <= client.left || client.bottom <= client.top))
@@ -1900,7 +1903,7 @@ PresentState* present_state_for(DeviceProxy* device, bool splash_only = false) {
                              SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_ASYNCWINDOWPOS);
         }
     }
-    if (!target) {
+    if (!target && !offscreen) {
         state->window = create_fallback_window(!hidden);
         target = state->window;
         if (!target) return state;
@@ -1909,7 +1912,7 @@ PresentState* present_state_for(DeviceProxy* device, bool splash_only = false) {
     // No device reference for this presenter: the device's outer identity is this proxy, which owns the state, so
     // a reference would be a cycle and the proxy, the presenter and the window would never go. The proxy destroys
     // the state before it releases its device (proxy_release).
-    auto presenter = rt::d3d12::create_window_presenter(device->real, target, /*hold_device=*/false);
+    auto presenter = rt::d3d12::create_window_presenter(device->real, target, /*hold_device=*/false, offscreen);
     if (!presenter) {
         if (splash_only) return nullptr;  // ordinary PresentX will still try
         std::fprintf(stderr, "[rt] d3d12_xs: Vulkan presentation could not be initialized\n");
@@ -1940,8 +1943,12 @@ PresentState* present_state_for(DeviceProxy* device, bool splash_only = false) {
         std::fprintf(stderr, "[rt] d3d12_xs: frame interval %u us replayed (0x%08lx), origin event (0x%08lx)\n",
                      interval, static_cast<unsigned long>(set), static_cast<unsigned long>(armed));
     }
-    if (TitleHud::enabled()) state->hud = std::make_unique<TitleHud>(target);
+    if (!offscreen && TitleHud::enabled()) state->hud = std::make_unique<TitleHud>(target);
     if (splash_only) device->present_state = pending.release();
+    if (offscreen) {
+        std::fprintf(stderr, "[rt] d3d12_xs: PresentX routed to offscreen Vulkan capture\n");
+        return state;
+    }
     std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (window %p: %s, client area %ldx%ld)\n",
                  static_cast<void*>(target),
                  titles ? "the title's own window" : hidden ? "the runtime's window, hidden" : "the runtime's window",

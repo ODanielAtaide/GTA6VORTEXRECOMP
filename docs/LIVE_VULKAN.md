@@ -29,6 +29,24 @@ The application does not emit DXIL in this path. The driver cache is stored unde
 `<VORTEX_CACHE_DIR>/vulkan-pipelines`. The work directory binds its cache to the package shader archive's
 SHA-256 fingerprint and checks the translator fingerprint before reusing translated files.
 
+## Validate the Vulkan output
+
+When the Windows session has an active display, launch with the command above.
+The renderer logs the first surface or swapchain error. The Vulkan SDK's
+vulkaninfo can independently check Win32 surface support.
+
+For diagnostics on a machine without an output, explicitly set
+VORTEX_CAPTURE_OFFSCREEN to an absolute directory outside the repository. The same
+Vulkan composition and blit paths then target a device-local image, copied to
+binary PPM files after the Vulkan completion fence. This mode reports zero
+window presents. Use VORTEX_CAPTURE_EVERY (default 30) and VORTEX_CAPTURE_LIMIT
+(default 24) to control disk output.
+
+Run Rust regression tests with cargo test --workspace --release --locked
+and check the source-only publication policy with cargo xtask policy.
+The in-tree graphics probe can also be built by setting
+VORTEX_NATIVE_GRAPHICS_TESTS=ON in the native CMake project and run with CTest.
+
 ## Components and provenance
 
 - `vortex-loader` owns executable mapping and guest CPU instruction handling.
@@ -42,39 +60,3 @@ SHA-256 fingerprint and checks the translator fingerprint before reusing transla
 
 Test results from the in-process build are tracked separately from the old external-runtime experiment.
 A successful build, an accepted PSO or a Vulkan present alone does not verify gameplay or 30 FPS.
-
-## Guest buffer address provenance foundation
-Live resource registration now retains checked linear-buffer spans, removing them at destruction. Root-view diagnostics distinguish null, unmapped, ambiguous/aliased and uniquely registered addresses with remaining byte extent. The registry never dereferences shader-provided addresses and does not fabricate device addresses. The new range regression checks overflow, end boundaries and overlaps. This is CPU-side provenance for a future Vulkan storage-address ABI, not shader pointer translation, buffer residency or completed GPU dispatch. Unknown/aliased addresses remain unsupported. Windows compilation and tests remain pending.
-
-## Follow-up survey: instruction-local and module-level coverage
-The compute emitter permits ordinary VGPR0 destinations (including bounded LDS loads), while ordinary global stores still require the original input SSA value and zero-offset v0 address. A separate symbolic instruction probe collects every locally failing compute instruction, including those hidden behind earlier CFG failures; it generates no executable shader and does not imply full-program support. The offline scanner now reports these counts and writes modules.txt, distinguishing source modules and stage coverage. Guest pointers and real pipeline ABI are still unresolved. Build and validation of this revision are pending.
-
-## Offline coverage-driven compiler increment
-The initial offline scan decoded every discovered native program into IR but no candidate SPIR-V was emitted. The experimental compute emitter now supports the full u8 VGPR numbering range, with separate bounded block/instruction/register limit diagnostics, and a restricted unmodified integer VOP3 arithmetic subset (shift-add/or, add-shift, and-or, three-input add/or/xor, low multiply, unsigned min/max and population count). The unchanged global-index write restriction and guest-dispatch prohibition remain. Increased compile-time limits do not alter the runtime loop watchdog. This change does not implement raw guest pointers, real resource bindings, float-mode semantics or graphics input mapping. Use `--code-only` (PowerShell `-CodeOnly`) to explicitly restrict a follow-up offline survey to EXE/DLL/SGD5 inputs; all other files are excluded and counted, not silently reported as scanned. Compilation, validation and live execution of this increment remain pending.
-
-## Offline precompile coverage survey
-`vulkan-precompile --game-dir <directory> --workers 6 --validate` scans regular local files in 8 MiB blocks, without modifying the input. Recognized unprotected DXBC containers and supported standalone SGD5 files up to 128 MiB are analyzed; opaque archives are not decrypted or unpacked. Unique containers are deduplicated by full BLAKE3 digest. Each is decoded, lowered to IR, surveyed for structured flow, tracked resources, stage I/O and diagnostic SPIR-V emission. Optional spirv-val verifies the diagnostic module's structure only. Cache keys include the running executable hash and validator version. Only aggregate metadata is persisted; temporary validation modules are removed. The configured cache must be outside the game and source trees. Reports include files.tsv, containers.tsv, analysis.toml and report.txt, ranked by failure reason and opcode frequency. The scanner reports zero guest-ready pipelines: there is no safe general guest SPIR-V ABI or complete pipeline state translation yet. Use tools/precompile-vulkan.ps1 to back up, update, build and scan; optional -Launch starts the experimental runtime after analysis. No local build or scan of this revision has been verified.
-
-## Descriptor heap bindings and lane mask population count
-The latest local run compiled and reached SetDescriptorHeaps (0x100). It also reported at least 8192 unsupported 0x1c8 pipeline requests, so the optional failure contract is not evidence of renderer coverage. The live list now retains registered shader-visible view/sampler heaps, rejects duplicate types, invalidates root descriptor tables on heap changes and reports table handle validity. It does not yet publish guest descriptors into Vulkan sets. The experimental CFG emitter now lowers MBCNT low/high to subgroup lane prefix masks and OpBitCount, with EXEC ballot support and unchanged-global-index validation for non-atomic storage writes. This does not solve the real guest ABI or permit title dispatch. Local compilation and tests are pending. Pass the local executable as -Exe to tools/run-live-vulkan.ps1; the script no longer contains a machine-specific path.
-
-## Optional PSO return contract and real compute opcode diagnostics
-
-Live execution reached ComputeX description creation, native shader IR and DirectStorage queue setup, then stopped at device slot 0x218. The original implementation of slots 0x1c8 and 0x218 returns E_NOTIMPL and null (the guest can omit those unsupported pipelines). The live table now uses the same explicit failed-creation contract, with sampled warnings. These methods are NOT implemented; no native pipeline is created for them. Other unsupported methods still stop. The first real compute shader reported local size [32,1,1] and an unsupported operation at offset 0x1c; the new log names the exact opcode and registers, plus hardware input metadata. The fixture compiler is not used to execute guest work. Build and live execution remain unverified. Use tools/run-live-vulkan.ps1 for the backed-up live launch.
-
-## Pipeline description revision
-The owner confirmed actual device initialization, recorded guest synchronization and version 1.1 root signature serialization. The new live device handles Compute/ComputeX, graphics and known pipeline-stream creation by retaining guest descriptions, root metadata and owned shader containers. Pipeline binding and root parameter state are retained separately for graphics/compute. First pipeline creation and first use inspect native GFX10 metadata and build IR. Candidate SPIR-V emitted by the fixture-specific compiler is NOT used for dispatch. Unknown extension contents and actual guest resource/system register mappings remain unimplemented. Nonzero draw/dispatch still stops before execution; no dummy VkPipeline, no host D3D12 path and no claim of a rendered frame. Compilation and GPU execution of this revision are pending. Logs identify native shader ABI and lowering gaps without exporting the original shaders.
-
-This revision removes the unconditional CLI rejection of `run --backend vulkan --execute` on Windows builds with the Vulkan feature. The guest creation interface selects a separate device table and creates the AMD Vulkan 1.3 device and worker at the real device request. The guest interface is retained for ABI compatibility. Host D3D12 device creation, legacy command list access, and root signature host-library conversion are blocked in this mode.
-
-Supported live operations: CPU guest heap/resource and descriptor bookkeeping, list recording/closing/reset, ordered synchronous buffer copies through Vulkan staging/device-local/readback (chunked; retains guest references), committed single-level nonaliased RGBA8/D32 target clears, full image copies between supported targets, and a Win32 Vulkan swapchain blit/present of an actual guest-produced color target. Unsupported commands stop and identify the slot or reason. The presenter does not manufacture a frame or initialize an unknown present source. A successful swapchain present may be a clear-only image, not a rendered scene.
-
-Guest pipeline creation, shader signatures/resource mapping, draw and dispatch state, native root signature conversion, enhanced barriers, general placed/tiled images and pending cross-queue waits are not yet connected. The title is expected to encounter a blocker before a complete rendered frame. No build, title or GPU execution of this revision has been verified here. The legacy renderer remains unchanged in normal mode. No claim of game compatibility or FPS.
-
-Run on a local authorized executable:
-```powershell
-cargo build --release --locked -p vortex --features "vulkan,diagnostics"
-.\target\release\vortex.exe run "PATH_TO_EXECUTABLE" --backend vulkan --execute
-```
-
-Milestones: LIVE_VULKAN_REQUESTED (CLI selection), VULKAN_GUEST_DEVICE_READY (actual native device), VULKAN_GUEST_COPY_OK (live guest buffer copy), FIRST_VULKAN_GUEST_PRESENT_OK (actual accepted Vulkan present), VULKAN_RUNTIME_BLOCKER (first unported call or Vulkan error). Only the last two indicate presentation or its blocker; a successful device is not a game frame.
