@@ -37,6 +37,9 @@ New packs mix the full descriptor hash before indexing the Vulkan table. The mod
 module and applied consistently across the title, compute libraries and executable shaders.
 Vortex rejects packs with incompatible descriptor hash modes and refuses a guest submission when
 its descriptor table cannot be updated after Vulkan retries the allocation.
+An Xbox memory wait keeps its dependent work blocked until the label satisfies
+the requested comparison. The diagnostic threshold records the stalled wait,
+and a lost-device fence value does not retire GPU writes.
 
 ## Validate the Vulkan output
 

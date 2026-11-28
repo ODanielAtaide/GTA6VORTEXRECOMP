@@ -454,9 +454,8 @@ inline constexpr ConsoleValueOp console_value_op(unsigned slot, unsigned char co
     return static_cast<ConsoleValueOp>(slot - first + 1);
 }
 // A wait's comparison codes are the D3D12_COMPARISON_FUNC values, memory OP reference: 2 less, 3 equal, 4 less or
-// equal, 5 greater, 6 not equal, 7 greater or equal (the title's, with a rising reference). 8 (always), 1 (never)
-// and any other code count as met: a wait nothing can meet would only hold the queue to its timeout. A 32-bit wait
-// compares the low 32 bits of both.
+// equal, 5 greater, 6 not equal, 7 greater or equal, 8 always, and 1 never.
+// A 32-bit wait compares the low 32 bits of both. Unknown codes cannot satisfy a wait.
 inline constexpr bool console_value_met(std::uint32_t comparison, std::uint64_t value, std::uint64_t reference,
                                         bool wide) {
     if (!wide) {
@@ -470,7 +469,8 @@ inline constexpr bool console_value_met(std::uint32_t comparison, std::uint64_t 
     case 5: return value > reference;
     case 6: return value != reference;
     case 7: return value >= reference;
-    default: return true;
+    case 8: return true;
+    default: return false;
     }
 }
 struct ListValueStats {

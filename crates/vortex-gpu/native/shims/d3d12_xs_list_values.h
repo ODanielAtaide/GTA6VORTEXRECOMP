@@ -31,7 +31,7 @@
 // - The thread that signals a gate runs the work the layer held behind it (QueueHolds: the held lists' submission,
 //   the shadow refresh, a deferred Present). That is the releaser, a second thread: the pump only decides, so
 //   writes keep landing and other gates keep timing out while held work runs.
-// Bounded: a gate is signalled after LEONIDA_VALUE_WAIT_TIMEOUT_MS (default 200 ms) of idle wait time, counted from
+// Diagnostics: a pending gate is reported after LEONIDA_VALUE_WAIT_TIMEOUT_MS (default 200 ms) of idle time, counted from
 // when the gates before it on its queue opened and paused (up to a finite cap scaled with the gate's own budget) while
 // the releaser is running held work, while an acyclic matching producer write is in flight, or while unrelated
 // unblocked GPU work is running (src/list_value_wait_budget.h); logged once per address. Short timeouts (4 ms) go to an
@@ -237,11 +237,11 @@ inline bool read_value(std::uint64_t address, bool wide, std::uint64_t& value) {
     return true;
 }
 
-// Memory that cannot be read meets the wait: nothing could ever change it for the GPU either.
 inline bool met_now(const Wait& wait) {
+    if (wait.comparison == D3D12_COMPARISON_FUNC_ALWAYS) return true;
     std::uint64_t value = 0;
-    if (!read_value(wait.address, wait.wide, value)) return true;
-    return console_value_met(wait.comparison, value, wait.reference, wait.wide);
+    return read_value(wait.address, wait.wide, value) &&
+           console_value_met(wait.comparison, value, wait.reference, wait.wide);
 }
 
 // One per queue proxy, made at its first submission of a list part with writes or an unmet wait. The fences are the
@@ -349,8 +349,8 @@ private:
 
 // The two threads that land writes and open gates. One pair per process, made on first use; stop() ends them before
 // the process exits, so neither is cut off inside the layer (holding QueueHolds' pump lock, say).
-// - The pump lands writes whose fence was reached and decides which gates open (met, timed out, or an action's
-//   turn). It never signals a gate: it hands them, in each queue's order, to
+// - The pump lands writes whose fence was reached and selects satisfied gates and ready actions.
+//   It hands them, in each queue's order, to
 // - the releaser, which signals them (after running the action of an action gate). The Signal runs the work the
 //   layer held behind the gate, which can take a while; the pump goes on meanwhile.
 class Pump {
@@ -369,11 +369,11 @@ public:
             const std::uint64_t after_gate = max_pending_gate_locked(queue.get());
             writes_.push_back({std::move(queue), value, std::move(writes), after_gate});
         }
-        start_or_settle();
+        wake_pump();
     }
 
-    // The queue waits on `queue->gate` for `value`: signalled once every wait is met, or the gate timed out. Its
-    // time starts when the gates before it on its queue have opened (start_gate).
+    // The queue waits on `queue->gate` for `value` until every condition is met. Its diagnostic clock
+    // starts when the gates before it on its queue have opened (start_gate).
     void add_gate(std::shared_ptr<QueueValues> queue, std::uint64_t value, std::vector<Wait> waits) {
         if (exiting_.load(std::memory_order_relaxed)) return;  // stop(): never signalled, see there
         {
@@ -384,7 +384,7 @@ public:
             gate.waits = std::move(waits);
             gates_.push_back(std::move(gate));
         }
-        start_or_settle();
+        wake_pump();
     }
 
     // The queue waits on `queue->gate` for `value`, which the releaser signals after running `action`, once
@@ -447,10 +447,10 @@ public:
             }
             if (!releaser_)
                 std::fprintf(stderr, "[rt] d3d12_xs: no threads for list memory writes and waits (error %lu): "
-                                     "writes land at submission and waits run on\n", GetLastError());
+                                     "pending writes and waits cannot retire\n", GetLastError());
             else
                 std::fprintf(stderr, "[rt] d3d12_xs: list memory writes land after their part ran, waits hold their "
-                                     "queue (timeout %u ms)\n", timeout_ms_.load(std::memory_order_relaxed));
+                                     "queue (diagnostic threshold %u ms)\n", timeout_ms_.load(std::memory_order_relaxed));
         });
         return releaser_ && !stop_.load(std::memory_order_relaxed);
     }
@@ -517,7 +517,8 @@ private:
         Clock::time_point last_tick{};
         Clock::time_point since{};
         bool started = false;          // the gates before it on its queue have opened: its time runs
-        bool cut_short = false;        // given the short timeout
+        bool cut_short = false;        // given the short diagnostic threshold
+        bool timeout_reported = false;
         std::uint64_t after = 0;       // action gates: the queue's `written` value the action runs behind
         std::function<void()> action;  // null: a memory wait
     };
@@ -552,17 +553,8 @@ private:
         timeout_ms_.store(timeout, std::memory_order_relaxed);
     }
 
-    // Without the threads (none could be made, or stop() ran) nothing could land later: what is queued is settled
-    // right here, writes at once and gates opened, which is the order before this file, not a hang.
-    void start_or_settle() {
-        if (start()) {
-            SetEvent(wake_);
-            return;
-        }
-        if (exiting_.load(std::memory_order_relaxed)) return;
-        // One thread at a time, so that the gates are signalled in order.
-        std::lock_guard settle(settle_mutex_);
-        pass(true);
+    void wake_pump() {
+        if (start()) SetEvent(wake_);
     }
 
     static DWORD WINAPI pump_main(LPVOID self) {
@@ -595,7 +587,7 @@ private:
                 WaitForSingleObject(wake_, polling ? kPollMs : writes ? 50 : releasing ? 500 : INFINITE);
             }
             if (stop_.load(std::memory_order_relaxed)) break;
-            pass(false);
+            pass();
             watch_releaser();
             summarize();
         }
@@ -698,11 +690,11 @@ private:
     // not cover: if a group's work waited for an older group's (on another queue), the older group's reading comes
     // later than the newer one's, so it cannot read as not done while the newer one reads as done. Called with
     // mutex_ held.
-    void take_landed(bool force, std::vector<WriteGroup>& landing) {
+    void take_landed(std::vector<WriteGroup>& landing) {
         const std::size_t count = writes_.size();
         if (!count) return;
-        std::vector<char> reached(count, force ? 1 : 0);
-        if (!force) {
+        std::vector<char> reached(count, 0);
+        {
             struct Reading {
                 const QueueValues* queue;
                 std::uint64_t completed;
@@ -718,7 +710,7 @@ private:
                 } else if (it->completed < group.value) {
                     it->completed = group.queue->written->GetCompletedValue();
                 }
-                reached[i] = it->completed >= group.value;
+                reached[i] = it->completed != UINT64_MAX && it->completed >= group.value;
             }
         }
         std::deque<WriteGroup> rest;
@@ -745,12 +737,10 @@ private:
         return highest;
     }
 
-    // The gates whose waits are met, whose idle time is up or whose action's turn has come, taken off the list in each
-    // queue's order (a queue's gate values rise in submission order, so a later one must not be signalled first: it
-    // would open the earlier one too). A memory gate's timeout clock pauses while held work is being released, while
-    // an acyclic matching producer write is in flight, or (up to a cap) while unrelated unblocked GPU work is running
-    // (src/list_value_wait_budget.h). `force` (no threads): every gate, now. Called with mutex_ held.
-    void take_open(bool force, bool landed_any, std::vector<Release>& opening) {
+    // Retire completed gates in queue order. The diagnostic clock pauses while work is being
+    // released, a matching producer is in flight, or unblocked GPU work is running.
+    // Called with mutex_ held.
+    void take_open(bool landed_any, std::vector<Release>& opening) {
         if (gates_.empty()) return;
         const auto now = Clock::now();
         namespace lvw = leonida::list_value_wait;
@@ -803,15 +793,16 @@ private:
             Gate& gate = gates_[idx];
             const QueueValues* queue = gate.queue.get();
             if (std::find(blocked.begin(), blocked.end(), queue) != blocked.end()) continue;
-            bool open = force;
+            bool open = false;
             if (gate.action) {
-                open = open || queue->written->GetCompletedValue() >= gate.after;
+                const auto completed = queue->written->GetCompletedValue();
+                open = completed != UINT64_MAX && completed >= gate.after;
             } else {
                 if (!gate.started) start_gate(gate, now);
                 bool met = true;
                 for (const Wait& wait : gate.waits) met = met && met_now(wait);
                 bool timed_out = false;
-                if (!open && !met) {
+                if (!met && !gate.timeout_reported) {
                     const std::uint64_t dt_us =
                         now > gate.last_tick
                             ? static_cast<std::uint64_t>(
@@ -829,8 +820,12 @@ private:
                 } else {
                     gate.last_tick = now;
                 }
-                open = open || met || timed_out;
-                if (open) note_outcome(gate, met || force, now);
+                if (timed_out) {
+                    gate.timeout_reported = true;
+                    note_outcome(gate, false, now);
+                }
+                open = met;
+                if (open) note_outcome(gate, true, now);
             }
             if (open) {
                 opening.push_back({std::move(gate.queue), gate.value, std::move(gate.action)});
@@ -847,15 +842,14 @@ private:
         }
     }
 
-    // Writes landed, then gates opened: the pump's one step. `force` runs on the caller's thread when the threads do
-    // not, and signals there too.
-    void pass(bool force) {
+    // Land completed writes before deciding which gates to release.
+    void pass() {
         const auto started = Clock::now();
         std::vector<WriteGroup> landing;
         {
             std::lock_guard lock(mutex_);
             busy_ = true;
-            take_landed(force, landing);
+            take_landed(landing);
         }
         const bool landed_any = !landing.empty();
         for (const WriteGroup& group : landing) land(group);
@@ -863,25 +857,20 @@ private:
         {
             std::lock_guard lock(mutex_);
             watch_late();
-            take_open(force, landed_any, opening);
-            if (!force && !opening.empty())
+            take_open(landed_any, opening);
+            if (!opening.empty())
                 pending_releases_.fetch_add(opening.size(), std::memory_order_release);
         }
         if (!opening.empty()) {
-            if (force) {
-                for (const Release& release : opening) signal(release);
-            } else {
-                {
-                    std::lock_guard release(release_mutex_);
-                    for (Release& r : opening) releases_.push_back(std::move(r));
-                }
-                release_ready_.notify_one();
+            {
+                std::lock_guard release(release_mutex_);
+                for (Release& r : opening) releases_.push_back(std::move(r));
             }
+            release_ready_.notify_one();
         }
-        if (!force)
-            raise_to(counters().pass_us_max,
-                     static_cast<std::uint64_t>(
-                         std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count()));
+        raise_to(counters().pass_us_max,
+                 static_cast<std::uint64_t>(
+                     std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count()));
         std::lock_guard lock(mutex_);
         busy_ = false;
     }
@@ -1104,7 +1093,7 @@ private:
                 if (addresses.fetch_add(1, std::memory_order_relaxed) < 16)
                     std::fprintf(stderr,
                                  "[rt] d3d12_xs: a queue stood %u ms at a wait for 0x%llx (%u-bit, comparison %u, "
-                                 "reference 0x%llx, memory 0x%llx); it runs on (logged once per address)\n",
+                                 "reference 0x%llx, memory 0x%llx); work remains blocked\n",
                                  gate.cut_short ? kDemotedTimeoutMs : full,
                                  static_cast<unsigned long long>(wait.address), wait.wide ? 64u : 32u,
                                  wait.comparison, static_cast<unsigned long long>(wait.reference),
@@ -1146,7 +1135,6 @@ private:
     std::atomic<std::uint64_t> signal_value_{0};
     std::atomic<DWORD> releaser_tid_{0};
     bool stall_logged_ = false;  // the pump thread's only
-    std::mutex settle_mutex_;          // the caller's-thread settling without threads (start_or_settle)
     std::atomic<bool> exiting_{false};  // stop() ran
     std::atomic<bool> stop_{false};    // the threads end
 };

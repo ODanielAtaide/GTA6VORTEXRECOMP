@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "../shims/d3d12_com.h"
+#include "../shims/d3d12_xs_list_values.h"
 #include "../src/title_va_alias.h"
 #include "../src/title_page_watch.h"
 #include "../src/gfx10_descriptors.h"
@@ -44,6 +45,26 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL instance_proc(VkInstance instance, cons
     if (std::strcmp(name, "vkGetDeviceProcAddr") == 0)
         return reinterpret_cast<PFN_vkVoidFunction>(&device_proc);
     return driver_instance_proc(instance, name);
+}
+
+bool check_memory_wait(ID3D12Device* device) {
+    namespace values = rt::d3d12_xs::list_values;
+    const auto queue = values::QueueValues::create(device, nullptr);
+    if (!queue || values::met_now({0, 0, 3, true}) || !values::met_now({0, 0, 8, true}) ||
+        rt::d3d12_xs::console_value_met(1, 1, 1, true) ||
+        rt::d3d12_xs::console_value_met(9, 1, 1, true)) return false;
+    alignas(8) volatile LONG64 label = 0;
+    auto& pump = values::Pump::get();
+    pump.set_timeout_ms(10);
+    const auto prior_reports = values::counters().gates_timed_out.load();
+    pump.add_gate(queue, 1, {{reinterpret_cast<std::uintptr_t>(&label), 1, 3, true}});
+    const auto deadline = GetTickCount64() + 2000;
+    while (values::counters().gates_timed_out.load() == prior_reports && GetTickCount64() < deadline)
+        Sleep(1);
+    const bool held = values::counters().gates_timed_out.load() > prior_reports &&
+                      queue->gate->GetCompletedValue() == 0;
+    InterlockedExchange64(&label, 1);
+    return pump.idle(2000) && queue->gate->GetCompletedValue() == 1 && held;
 }
 
 bool check_upload(ID3D12Device* device) {
@@ -137,6 +158,7 @@ int main() {
     if (!placement) return 12;
     const auto methods = *reinterpret_cast<void* const* const*>(device);
     if (!check_upload(device)) return 14;
+    if (!check_memory_wait(device)) return 16;
     // Borrow the real AMD/other Vulkan device, then fail only the dedicated allocation
     // after the test device has set up its arena. The returned range must still map.
     const auto* baseline = rt::d3d12::vulkan_device_info(device);
