@@ -121,7 +121,15 @@ Vulkan memory range. With the AMD overallocation diagnostic enabled, a
 later run allocated 9,842 MiB on the Vulkan device-local heap and created
 the 4,194,304-slot descriptor table. The story-loading screen remained
 visible until an Xbox GPU signal wait timed out during scene pipeline setup.
-Gameplay, the in-game performance overlay and 30 FPS remain unverified.
+With the corrected Xbox waits, four late signals unblocked the real commands
+after about 376 ms. Vortex emitted 395 indirect graphics commands during
+scene setup on that run. A follow-up with the compute journal warmed still
+stopped on an unmet GPU wait before a world frame was captured.
+
+The runtime validation used the prior local SPIR-V pack. A separate sample
+of 24 game shaders built with the mixed descriptor hash passed SPIR-V
+validation. Validation of the complete new pack, gameplay, the in-game
+performance overlay and 30 FPS remains pending.
 
 ## Components and provenance
 
