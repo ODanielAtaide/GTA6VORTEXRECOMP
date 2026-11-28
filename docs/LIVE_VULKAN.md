@@ -112,7 +112,10 @@ pipelines before staging timed out and the title's FidelityFX library raised
 an exception from its committed upload call. The native device probe now
 forces the dedicated Vulkan allocation of an upload buffer to fail and checks
 that the buffer can still be created and mapped from an existing coherent
-Vulkan memory range.
+Vulkan memory range. With the AMD overallocation diagnostic enabled, a
+later run allocated 9,842 MiB on the Vulkan device-local heap and created
+the 4,194,304-slot descriptor table. The story-loading screen remained
+visible until an Xbox GPU signal wait timed out during scene pipeline setup.
 Gameplay, the in-game performance overlay and 30 FPS remain unverified.
 
 ## Components and provenance

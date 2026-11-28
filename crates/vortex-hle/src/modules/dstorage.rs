@@ -18,14 +18,20 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
-use std::os::windows::fs::FileExt;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use vortex_formats::bcpack::{self, Tables};
+use windows_sys::Win32::Foundation::ERROR_IO_PENDING;
+use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, ReadFile};
+use windows_sys::Win32::System::IO::{
+    GetOverlappedResult, OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0,
+};
+use windows_sys::Win32::System::Threading::CreateEventW;
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
@@ -128,7 +134,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         FILE_SHARE_READ,
         std::ptr::null(),
         OPEN_EXISTING,
-        0,
+        FILE_FLAG_OVERLAPPED,
         std::ptr::null_mut(),
     );
     // SAFETY: the title passes a NUL-terminated path.
@@ -908,6 +914,64 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
     Ok(Cow::Owned(bytes))
 }
 
+thread_local! {
+    // Each worker waits on its own event before accepting the next request, so simultaneous
+    // reads of the same package never wait on the file handle or share an OVERLAPPED.
+    static READ_EVENT: OnceCell<Result<OwnedHandle, HRESULT>> = const { OnceCell::new() };
+}
+
+fn read_file_at(file: &std::fs::File, out: &mut [u8], offset: u64) -> Result<usize, HRESULT> {
+    READ_EVENT.with(|slot| {
+        let event = slot.get_or_init(|| {
+            // SAFETY: create an unnamed manual-reset event with default security.
+            let handle = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+            if handle.is_null() {
+                Err(from_win32(&std::io::Error::last_os_error()))
+            } else {
+                // SAFETY: CreateEventW returned a new handle owned by this thread.
+                Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+            }
+        });
+        let event = event.as_ref().map_err(|&hr| hr)?;
+        let mut operation = OVERLAPPED {
+            Anonymous: OVERLAPPED_0 {
+                Anonymous: OVERLAPPED_0_0 {
+                    Offset: offset as u32,
+                    OffsetHigh: (offset >> 32) as u32,
+                },
+            },
+            hEvent: event.as_raw_handle(),
+            ..Default::default()
+        };
+        let requested = out.len().min(u32::MAX as usize) as u32;
+        let file = file.as_raw_handle();
+        // SAFETY: the handle is opened in overlapped mode. Both the buffer and operation are
+        // valid for the requested range and remain in this function until I/O has completed.
+        let result = unsafe {
+            ReadFile(
+                file,
+                out.as_mut_ptr(),
+                requested,
+                std::ptr::null_mut(),
+                &mut operation,
+            )
+        };
+        if result == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
+                return Err(from_win32(&error));
+            }
+        }
+        let mut bytes = 0;
+        // SAFETY: on success or IO_PENDING this operation belongs to the read above. Retrieve
+        // the byte count and wait for completion before returning the buffer to the worker.
+        if unsafe { GetOverlappedResult(file, &operation, &mut bytes, 1) } == 0 {
+            return Err(from_win32(&std::io::Error::last_os_error()));
+        }
+        Ok(bytes as usize)
+    })
+}
+
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
 
@@ -928,10 +992,13 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         if done == out.len() {
             break Ok(());
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+        let Some(offset) = request.offset.checked_add(done as u64) else {
+            break Err(E_INVALIDARG);
+        };
+        match read_file_at(file, &mut out[done..], offset) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
-            Err(error) => break Err(from_win32(&error)),
+            Err(hr) => break Err(hr),
         }
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
