@@ -9615,7 +9615,8 @@ public:
     HRESULT enable_depth_stencil_uav(D3D12_HEAP_FLAGS storage_heap_flags) {
         const bool narrow_stencil = desc_.Format == xbox_d16s8 || console_d16s8_;
         const bool depth16 = desc_.Format == DXGI_FORMAT_R16_TYPELESS || narrow_stencil;
-        if (!image_ || (!depth16 && desc_.Format != DXGI_FORMAT_R32G8X24_TYPELESS) ||
+        const bool depth32 = desc_.Format == DXGI_FORMAT_R32_TYPELESS;
+        if (!image_ || (!depth16 && !depth32 && desc_.Format != DXGI_FORMAT_R32G8X24_TYPELESS) ||
             !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
             desc_.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc_.MipLevels != 1 ||
             !desc_.DepthOrArraySize || desc_.SampleDesc.Count != 1)
@@ -9642,9 +9643,9 @@ public:
                 const HRESULT hr = conversion->create_texture(device_.texture_format(intermediate));
                 if (FAILED(hr)) return hr;
             }
-            const auto depth_format = widened ? DXGI_FORMAT_R16_TYPELESS : depth16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_FLOAT;
+            const auto depth_format = depth16 ? DXGI_FORMAT_R16_TYPELESS : DXGI_FORMAT_R32_FLOAT;
             const DXGI_FORMAT formats[] = {depth_format, DXGI_FORMAT_R8_UINT};
-            const UINT plane_count = depth16 && !narrow_stencil ? 1 : 2;
+            const UINT plane_count = (depth16 && !narrow_stencil) || depth32 ? 1 : 2;
             for (UINT plane = 0; plane < plane_count; ++plane) {
                 plane_desc.Format = formats[plane];
                 planes[plane] = std::make_unique<Resource>(device_, plane_desc, heap_, storage_heap_flags);
@@ -14867,10 +14868,14 @@ public:
                     return mask;
                 };
                 state_.context->set_compute_copy_aspects(
-                    [d16 = aspects(VK_FORMAT_D16_UNORM), ds = aspects(VK_FORMAT_D32_SFLOAT_S8_UINT)](VkFormat format) {
-                        if (format == VK_FORMAT_D16_UNORM) return d16;
-                        if (format == VK_FORMAT_D32_SFLOAT_S8_UINT) return ds;
-                        return VkImageAspectFlags{};
+                    [d16 = aspects(VK_FORMAT_D16_UNORM), d32 = aspects(VK_FORMAT_D32_SFLOAT),
+                     ds = aspects(VK_FORMAT_D32_SFLOAT_S8_UINT)](VkFormat format) {
+                        switch (format) {
+                            case VK_FORMAT_D16_UNORM: return d16;
+                            case VK_FORMAT_D32_SFLOAT: return d32;
+                            case VK_FORMAT_D32_SFLOAT_S8_UINT: return ds;
+                            default: return VkImageAspectFlags(0);
+                        }
                     });
             }
         }
@@ -18611,9 +18616,9 @@ public:
                 return;
             }
             const Resource* storage = r->depth_stencil_uav(view.plane);
-            const bool raw_narrow = storage && (r->desc().Format == xbox_d16s8 || r->console_d16s8()) && view.plane == 0 &&
-                                    (view.format == DXGI_FORMAT_R16_UINT ||
-                                     (storage->desc().Format == DXGI_FORMAT_R16_TYPELESS && view.format == DXGI_FORMAT_R16_UNORM));
+            const bool raw_narrow = storage && view.plane == 0 &&
+                                    storage->desc().Format == DXGI_FORMAT_R16_TYPELESS &&
+                                    (view.format == DXGI_FORMAT_R16_UINT || view.format == DXGI_FORMAT_R16_UNORM);
             if (!storage || (!raw_narrow && view.format != storage->desc().Format)) {
                 log_once("unsupported Xbox depth-stencil UAV plane or format; format", int(view.format));
                 return;

@@ -2,6 +2,7 @@
 #include "../shims/d3d12_com.h"
 #include "../src/title_va_alias.h"
 #include "../src/title_page_watch.h"
+#include "../src/gfx10_descriptors.h"
 
 #include <cstdio>
 #include <filesystem>
@@ -10,6 +11,9 @@
 extern "C" HRESULT vortex_native_gpu_create(const IID*, void**);
 extern "C" void vortex_native_gpu_track_guest_memory(std::uintptr_t, std::size_t, bool);
 extern "C" void vortex_native_gpu_release_guest_memory(std::uintptr_t);
+
+static_assert(leonida::gfx10::format_from_vulkan(VK_FORMAT_D16_UNORM_S8_UINT) == 7);
+static_assert(leonida::gfx10::vulkan_view_format(VK_FORMAT_D16_UNORM_S8_UINT, 7) == VK_FORMAT_D16_UNORM_S8_UINT);
 
 int main() {
     constexpr std::size_t bytes = 1 << 16;
@@ -40,6 +44,32 @@ int main() {
     const IID iid = __uuidof(ID3D12Device);
     ID3D12Device* device = nullptr;
     if (FAILED(vortex_native_gpu_create(&iid, reinterpret_cast<void**>(&device))) || !device) return 4;
+    D3D12_RESOURCE_DESC depth{};
+    depth.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    depth.Width = 32;
+    depth.Height = 16;
+    depth.DepthOrArraySize = 1;
+    depth.MipLevels = 1;
+    depth.Format = DXGI_FORMAT_R32_TYPELESS;
+    depth.SampleDesc.Count = 1;
+    depth.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    depth.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    void* placement = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!placement) return 12;
+    const auto methods = *reinterpret_cast<void* const* const*>(device);
+    using Place = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, std::uint64_t, const D3D12_RESOURCE_DESC*,
+                                              std::uint32_t, const D3D12_CLEAR_VALUE*, const IID*, void**);
+    const auto place = reinterpret_cast<Place>(methods[133]); // Xbox CreatePlacedResourceX
+    const IID resource_iid = __uuidof(ID3D12Resource);
+    ID3D12Resource* texture = nullptr;
+    const HRESULT placed = place(device, reinterpret_cast<std::uintptr_t>(placement), &depth,
+                                 D3D12_BARRIER_LAYOUT_COMMON, nullptr, &resource_iid,
+                                 reinterpret_cast<void**>(&texture));
+    const bool writable_depth = SUCCEEDED(placed) && texture &&
+                                (texture->GetDesc().Flags & depth.Flags) == depth.Flags;
+    if (texture) texture->Release();
+    VirtualFree(placement, 0, MEM_RELEASE);
+    if (!writable_depth) return 12;
     const auto folder = std::filesystem::temp_directory_path() /
                         ("vortex-vulkan-probe-" + std::to_string(GetCurrentProcessId()));
     const auto csv = folder / "frames.csv";

@@ -88,8 +88,11 @@ its Xbox input path. In a later launch, after the storage writes and texture
 dirty notifications were connected, the title displayed the story-loading
 artwork and the storage log recorded successful reads and BCPack decoding
 while the graphics queue remapped pages. That run ended on a guest access
-violation while following a noncanonical pointer. The captures and game
-files remain local. Gameplay, the in-game performance overlay and 30 FPS
+violation while following a noncanonical pointer. Another run reached the story
+artwork with the revised GPU mappings and write-back ordering. The AMD driver
+returned VK_ERROR_OUT_OF_DEVICE_MEMORY for streamed textures before the title
+faulted while writing to a null address. The captures and game files remain
+local. Gameplay, the in-game performance overlay and 30 FPS
 remain unverified.
 
 ## Components and provenance
@@ -103,6 +106,9 @@ remain unverified.
   from GPU reservations mapped by the graphics queue. It receives dirty
   notifications for title texture copies and storage writes to mapped physical pages.
   GPU shadow writes become visible to the title after the Vulkan submission retires.
+  The Xbox resource path backs writable 32-bit depth with a separate Vulkan
+  color image and synchronizes it on transitions. The sampled depth aspect of
+  a 16-bit depth and stencil image retains its normalized GFX10 format.
 - `vortex-shader/native` contains the offline package shader compiler used by the Vulkan device.
   Its tool sources are distinct from the smaller Rust ISA coverage and differential tests.
 - Rendering and compiler source lineage and licenses are in [Upstream credits](UPSTREAM_CREDITS.md).

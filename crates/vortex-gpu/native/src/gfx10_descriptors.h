@@ -283,6 +283,7 @@ inline constexpr FormatRow format_table[] = {
     {6, VK_FORMAT_R8_SINT, channels_r},                           // GFX10_FORMAT_8_SINT
     {7, VK_FORMAT_R16_UNORM, channels_r},                         // GFX10_FORMAT_16_UNORM
     {7, VK_FORMAT_D16_UNORM, channels_r},                         // GFX10_FORMAT_16_UNORM
+    {7, VK_FORMAT_D16_UNORM_S8_UINT, channels_r},                 // depth aspect, stencil uses its own code
     {8, VK_FORMAT_R16_SNORM, channels_r},                         // GFX10_FORMAT_16_SNORM
     {9, VK_FORMAT_R16_USCALED, channels_r},                       // GFX10_FORMAT_16_USCALED
     {10, VK_FORMAT_R16_SSCALED, channels_r},                      // GFX10_FORMAT_16_SSCALED
