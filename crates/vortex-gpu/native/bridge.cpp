@@ -107,6 +107,12 @@ extern "C" void vortex_native_gpu_end_host_write(std::uint64_t pin, bool pending
     leonida::kernel_writes::end_write(pin, pending);
 }
 
+extern "C" void vortex_native_gpu_note_texture_layout(std::uint32_t dimension, std::uint32_t format,
+                                                        std::uint64_t width, std::uint32_t height,
+                                                        std::uint32_t depth, std::uint32_t mips, std::uint32_t layout) {
+    leonida::title_xg_layouts::note({dimension, format, height, depth, mips, width}, layout);
+}
+
 extern "C" void vortex_native_gpu_save_cache() {
     rt::d3d12::stop_pipeline_compiles(250);
     rt::d3d12::save_pipeline_caches_at_exit(250);

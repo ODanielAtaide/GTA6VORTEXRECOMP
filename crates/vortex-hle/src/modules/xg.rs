@@ -122,6 +122,20 @@ pub extern "system" fn XGCreateTextureComputer(
         "texture computer"
     );
     let mips = texture.planes[0].layout.mips.len() as u32;
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc", feature = "vulkan"))]
+    if vortex_gpu::vulkan_live::enabled() {
+        // A placed resource can omit its layout. A subsequent Map still
+        // reads CPU writes using the layout of this XG computer.
+        let layout = if desc.layout == 0 {
+            SWIZZLED | texture.planes[0].layout.desc.swizzle.0
+        } else {
+            desc.layout
+        };
+        vortex_gpu::native_device::note_texture_layout(
+            desc.dimension, desc.format, desc.width, desc.height,
+            u32::from(desc.depth_or_array), u32::from(desc.mips), layout,
+        );
+    }
     let computer = Box::new(Computer {
         vtable: &VTABLE,
         refs: AtomicU32::new(1),

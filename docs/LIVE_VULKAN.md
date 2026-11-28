@@ -57,9 +57,12 @@ the local Xbox title, accepted its serialized pipeline descriptions and
 submitted the title's graphics work to Vulkan. Connecting the guest XMem
 ranges to the graphics device enabled the first visible title UI. The
 1424×771 offscreen capture includes the Portuguese account and player prompts.
-One diagnostic controller press reached the title's “Experiência de navegação”
-setup screen. Its heading and choice controls rendered, with corruption in
-some graphics and text. The runtime audit at that screen found the
+Diagnostic controller presses reached the title's “Experiência de navegação”,
+text-size, captions, and brightness settings, then “Avisos legais”. The
+headings and choice controls rendered. Wiring XG layout registration into the
+Vulkan renderer restored the linear video planes and glyph atlases. The next
+run rendered the opening animation and the navigation menu with readable
+body text and the expected background. The runtime audit found the
 Vulkan loader and AMD driver, zero child processes, and no external title
 runtime or Direct3D 12 module. Windows also loaded DXGI and D3D11 interop
 modules. On-screen presentation remains pending because the Win32 surface
